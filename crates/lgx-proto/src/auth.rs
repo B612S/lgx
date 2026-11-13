@@ -1,6 +1,8 @@
 //! Pre-shared token handling.
 
-use std::io;
+use std::fs::OpenOptions;
+use std::io::{self, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 
 pub fn config_path() -> PathBuf {
@@ -23,7 +25,16 @@ pub fn save(token: &str) -> io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    std::fs::write(&path, format!("{token}\n"))
+    let mut f = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)?;
+    f.write_all(format!("{token}\n").as_bytes())?;
+    f.sync_all()?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
 }
 
 /// 32 hex characters from /dev/urandom.

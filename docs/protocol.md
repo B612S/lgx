@@ -118,6 +118,15 @@ The total length, chunk index and chunk length are authenticated as AEAD
 associated data. The 12-byte lgx message header and its payload are both
 inside the plaintext, so message types and HEVC frames are not visible.
 
+## Pairing
+
+`lgx-server --pair` opens a temporary listener (default `0.0.0.0:5904`) and
+prints a 32-hex one-time code. The client connects with the same `LGX1`
+handshake, using the code instead of the long-term token as the PSK. After the
+handshake the server sends the long-term token as one secure record; the
+client stores it mode 0600 and answers `ok`. The pairing listener accepts one
+client, expires after three minutes and stops after five failed attempts.
+
 ## Audio
 
 A separate TCP connection on the port following the control port. The first

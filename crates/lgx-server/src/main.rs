@@ -17,6 +17,7 @@ mod dmabuf;
 pub mod glconv;
 mod input;
 mod net;
+mod pair;
 pub mod protocols;
 mod vaenc;
 
@@ -37,6 +38,8 @@ struct Args {
     low_power: bool,
     async_depth: u32,
     vpp: bool,
+    pair: bool,
+    pair_listen: String,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -67,6 +70,11 @@ fn parse_args() -> Result<Args, String> {
         low_power: cfg.get_bool("video.low_power").unwrap_or(true),
         async_depth: cfg.get_u32("video.async_depth").unwrap_or(2),
         vpp: cfg.get_bool("video.vpp").unwrap_or(true),
+        pair: false,
+        pair_listen: cfg
+            .get("network.pair_listen")
+            .unwrap_or("0.0.0.0:5904")
+            .to_string(),
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -90,6 +98,8 @@ fn parse_args() -> Result<Args, String> {
             "--vpp" => a.vpp = true,
             "--no-vpp" => a.vpp = false,
             "--token" => a.token = Some(it.next().ok_or("--token")?),
+            "--pair" => a.pair = true,
+            "--pair-listen" => a.pair_listen = it.next().ok_or("--pair-listen")?,
             "-h" | "--help" => {
                 println!(
                     "lgx-server [--listen ADDR] [--fps N] [--bitrate BPS] [--output NAME]\n\
@@ -97,6 +107,7 @@ fn parse_args() -> Result<Args, String> {
                      \x20          [--no-low-power] [--async-depth N] [--no-input]\n\
                      \x20          [--token T] [--no-audio]\n\
                      \x20          [--audio-listen ADDR] [--vpp|--no-vpp]\n\
+                     \x20          [--pair] [--pair-listen ADDR]\n\
                      \x20          settings: ~/.config/lgx/server.conf"
                 );
                 std::process::exit(0);
@@ -444,6 +455,21 @@ fn main() {
             std::process::exit(2);
         }
     };
+
+    if args.pair {
+        let token = match args.token.clone().or_else(lgx_proto::auth::load) {
+            Some(t) => t,
+            None => {
+                eprintln!("lgx-server: pairing needs an existing token; start the server once first");
+                std::process::exit(1);
+            }
+        };
+        if let Err(e) = pair::run(&args.pair_listen, &token) {
+            eprintln!("lgx-server: pairing: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
 
     let hub = Hub::new();
     let input_tx = if args.no_input {

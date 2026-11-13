@@ -15,6 +15,7 @@ mod inhibit;
 mod instance;
 mod net;
 mod pad;
+mod pair;
 mod protocols;
 
 use std::io::Write;
@@ -39,6 +40,8 @@ struct Args {
     decoder: Option<String>,
     cursor: Option<bool>,
     frames: Option<u64>,
+    pair: Option<String>,
+    pair_code: Option<String>,
 }
 
 struct Settings {
@@ -69,11 +72,15 @@ fn parse_args() -> Result<Args, String> {
         decoder: None,
         cursor: None,
         frames: None,
+        pair: None,
+        pair_code: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--connect" => a.connect = Some(it.next().ok_or("--connect")?),
+            "--pair" => a.pair = Some(it.next().ok_or("--pair")?),
+            "--pair-code" => a.pair_code = Some(it.next().ok_or("--pair-code")?),
             "--no-window" => a.no_window = true,
             "--fullscreen" => a.fullscreen = Some(true),
             "--windowed" => a.fullscreen = Some(false),
@@ -106,7 +113,8 @@ fn parse_args() -> Result<Args, String> {
                      \x20          [--cursor local|remote] [--fullscreen|--windowed]\n\
                      \x20          [--vsync] [--audio] [--audio-connect ADDR]\n\
                      \x20          [--no-window] [--bench SECONDS] [--frames N]\n\
-                     \x20          [--screenshot FILE]"
+                     \x20          [--screenshot FILE]\n\
+                     \x20          [--pair HOST:PORT --pair-code CODE]"
                 );
                 std::process::exit(0);
             }
@@ -200,6 +208,21 @@ fn main() {
             std::process::exit(2);
         }
     };
+
+    if let Some(addr) = args.pair.clone() {
+        let code = match args.pair_code.as_deref() {
+            Some(c) => c,
+            None => {
+                eprintln!("lgx-client: --pair requires --pair-code");
+                std::process::exit(2);
+            }
+        };
+        if let Err(e) = pair::run(&addr, code) {
+            eprintln!("lgx-client: pairing with {addr} failed: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
 
     let cfg = config::Config::load_or_create();
     let s = Settings {

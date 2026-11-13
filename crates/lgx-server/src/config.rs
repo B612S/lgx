@@ -140,6 +140,7 @@ pub fn load_or_create() -> Config {
     let mut cfg = Config::default();
     cfg.set("network.listen", "0.0.0.0:5902");
     cfg.set("network.audio_listen", "0.0.0.0:5903");
+    cfg.set("network.pair_listen", "0.0.0.0:5904");
     cfg.set("video.fps", "auto");
     cfg.set("video.bitrate", 40_000_000u32);
     cfg.set("video.output", "");

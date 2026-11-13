@@ -156,6 +156,21 @@ the Vulkan shader converts full-range BT.709, and the HEVC VUI says
   used: its `--target` auto-connected to `easyeffects_source` (the microphone)
   on the test VM and produced silence.
 
+## Pairing
+
+- `lgx-server --pair` is a local admin action. It binds the pair port
+  (`--pair-listen`, default `0.0.0.0:5904`), prints a 32-hex one-time code,
+  accepts exactly one client for three minutes and exits after five failed
+  attempts. It must not become a remote, always-on endpoint.
+- The pair connection runs the normal `LGX1` handshake with the one-time code
+  as the PSK. The long-term token is sent only after that handshake, inside a
+  secure record; the code itself never crosses the wire.
+- `lgx-client --pair HOST:PORT --pair-code CODE` receives the token, saves it
+  with `auth::save` (mode 0600) and sends an `ok` acknowledgement. Without the
+  code the client cannot decrypt the token and must not write the file.
+- `auth::save` must keep mode 0600; the token is both the auth secret and the
+  long-term transport PSK.
+
 ## Transport
 
 - **No plaintext TCP.** Both the main port and the audio port start with an

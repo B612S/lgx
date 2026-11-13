@@ -209,6 +209,33 @@ transfers are chunked (64 KiB) and interleaved with video.
 Text is synchronised in both directions too. Nothing is pasted automatically:
 copy on one side, then press Ctrl+V in the target application on the other.
 
+## Pairing a new client
+
+A client cannot connect without `~/.config/lgx/token`. To enroll a new client,
+run this **on the server** (locally or over SSH):
+
+```bash
+lgx-server --pair --pair-listen 0.0.0.0:5904
+```
+
+It prints a random 32-hex one-time code and the client command. On the client:
+
+```bash
+lgx-client --pair 192.168.122.25:5904 --pair-code <code>
+```
+
+The pair listener uses the same X25519 + AES-256-GCM layer with the one-time
+code as the PSK. The long-term token is sent only inside that encrypted
+channel, after the code-authenticated handshake, and is stored with mode 0600.
+The code is never sent over the network, is valid for three minutes, accepts
+one client and stops after five failed attempts. A client without the code
+cannot complete the handshake or obtain the token; a fake server without the
+code cannot make a client save one. Pairing must be started locally on the
+server — there is no remote "pair me" endpoint.
+
+`--pair-listen` defaults to `0.0.0.0:5904`; the address printed in the example
+is the server's LAN address.
+
 ## Hotkeys
 
 | key | action |
@@ -222,7 +249,7 @@ directions; no paste shortcut is injected. F9/F10/F11/F12 are ordinary keys
 for the guest.
 
 All traffic — video, input, clipboard, files and audio — is inside AES-256-GCM
-records. AES-NI makes the cost negligible at the stream's few MB/s; only
+records; pairing uses the same channel with a one-time code. AES-NI makes the cost negligible at the stream's few MB/s; only
 record sizes are visible to a passive observer, never HEVC frames or tokens.
 
 ## Measured (VM: Hyprland 1920x1080@160, Intel UHD 770; host RTX 4070 SUPER)
