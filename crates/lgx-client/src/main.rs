@@ -16,6 +16,7 @@ mod instance;
 mod net;
 mod pad;
 mod pair;
+mod osd;
 mod protocols;
 mod reconnect_ui;
 
@@ -737,6 +738,7 @@ fn main() {
     let mut redraw = true;
     let mut swallow_f_keyup = false;
     let mut swallow_m_keyup = false;
+    let mut osd_child: Option<std::process::Child> = None;
     let mut fullscreen_hold: Option<(Instant, (u32, u32))> = None;
     let mut dst = vk::fit_rect(win_w, win_h, win_w, win_h);
     let mut config_saved = s.width.is_some() && s.height.is_some();
@@ -868,6 +870,11 @@ fn main() {
                         "lgx-client: background audio {} (Ctrl+Shift+Alt+M)",
                         if now_mute { "disabled" } else { "enabled" }
                     );
+                    if let Some(mut old) = osd_child.take() {
+                        let _ = old.kill();
+                        let _ = old.wait();
+                    }
+                    osd_child = osd::spawn(!now_mute);
                 }
                 Event::KeyDown {
                     keycode: Some(sdl3::keyboard::Keycode::G),

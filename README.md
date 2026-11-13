@@ -277,7 +277,7 @@ is the server's LAN address.
 | key | action |
 |---|---|
 | Ctrl+Shift+Alt+F | toggle client fullscreen (never forwarded) |
-| Ctrl+Shift+Alt+M | toggle background audio for this run (runtime only) |
+| Ctrl+Shift+Alt+M | toggle background audio for this run (text OSD) |
 | Ctrl+Alt+Q | quit |
 | Ctrl+Alt+G | release/grab compositor shortcuts |
 

@@ -80,7 +80,8 @@ Commit format: `area: short imperative summary`, for example
   `LGX_DEBUG_FPS` still prints per-second diagnostics to stderr.
 - Client hotkeys are `Ctrl+Shift+Alt+F` (fullscreen) and
   `Ctrl+Shift+Alt+M` (runtime-only toggle of background audio, not persisted;
-  startup value comes from `[audio] mute_unfocused`). The
+  startup value comes from `[audio] mute_unfocused`; a Qt `lgx-osd-qt` text
+  OSD is shown). The
   keydown/keyup is swallowed and modifier key-ups clear the guest state.
   F9/F10/F11/F12 are ordinary keys and must reach the guest.
 - After a fullscreen toggle the client skips drawing until SDL reports the
