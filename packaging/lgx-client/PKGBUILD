@@ -1,13 +1,13 @@
 # Maintainer: B612S
 pkgname=lgx-client
 pkgver=0.2.0
-pkgrel=38
+pkgrel=39
 pkgdesc='lgx: zero-copy HEVC client (NVDEC/VAAPI decode)'
 arch=('x86_64')
 url='https://github.com/B612S/lgx'
 license=('MIT')
-depends=('gcc-libs' 'sdl3' 'ffmpeg' 'vulkan-icd-loader' 'mesa' 'libxkbcommon' 'wl-clipboard' 'pipewire' 'libpulse' 'qt6-base')
-makedepends=('cargo' 'rust' 'ffmpeg' 'qt6-base' 'pkgconf')
+depends=('gcc-libs' 'sdl3' 'ffmpeg' 'vulkan-icd-loader' 'mesa' 'libxkbcommon' 'wl-clipboard' 'pipewire' 'libpulse' 'qt6-base' 'freetype2')
+makedepends=('cargo' 'rust' 'ffmpeg' 'qt6-base' 'pkgconf' 'freetype2')
 source=("lgx-$pkgver.tar.gz")
 sha256sums=('SKIP')
 

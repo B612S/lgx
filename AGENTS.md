@@ -83,7 +83,8 @@ Commit format: `area: short imperative summary`, for example
   startup value comes from `[audio] mute_unfocused`; the OSD is a luma-style
   top-center text card (40 px, radius 8, 85% theme background, 20% border)
   rendered inside the Vulkan swapchain, not a separate window; its font is
-  resolved from KDE `kdeglobals` via `fc-match`, then `sans-serif`). The
+  resolved from KDE `kdeglobals` via `fc-match`, then `sans-serif`, and
+  rasterized by FreeType with `TARGET_LIGHT` hinting). The
   keydown/keyup is swallowed and modifier key-ups clear the guest state.
   F9/F10/F11/F12 are ordinary keys and must reach the guest.
 - After a fullscreen toggle the client skips drawing until SDL reports the
