@@ -133,9 +133,9 @@ impl Renderer {
         let app_name = CString::new("lgx").unwrap();
         let app_info = vk::ApplicationInfo::default()
             .application_name(app_name.as_c_str())
-            .application_version(vk::make_api_version(0, 0, 2, 0))
+            .application_version(vk::make_api_version(0, 3, 0, 0))
             .engine_name(app_name.as_c_str())
-            .engine_version(vk::make_api_version(0, 0, 2, 0))
+            .engine_version(vk::make_api_version(0, 3, 0, 0))
             .api_version(vk::make_api_version(0, 1, 3, 0));
         let create_info = vk::InstanceCreateInfo::default()
             .application_info(&app_info)

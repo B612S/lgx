@@ -148,7 +148,7 @@ checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
 
 [[package]]
 name = "lgx-client"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ash",
  "bitflags",
@@ -165,14 +165,14 @@ dependencies = [
 
 [[package]]
 name = "lgx-proto"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ring",
 ]
 
 [[package]]
 name = "lgx-server"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bitflags",
  "lgx-proto",
