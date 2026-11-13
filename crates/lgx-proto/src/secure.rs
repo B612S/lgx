@@ -165,29 +165,7 @@ impl Secure {
             .send
             .lock()
             .map_err(|_| io::Error::other("secure send lock"))?;
-        let total = plain.len() as u32;
-        st.stream.write_all(&total.to_le_bytes())?;
-        let SendState { stream, key, nonce, buf } = &mut *st;
-        for (idx, chunk) in plain.chunks(CHUNK).enumerate() {
-            let mut aad = [0u8; 12];
-            aad[..4].copy_from_slice(&total.to_le_bytes());
-            aad[4..8].copy_from_slice(&(idx as u32).to_le_bytes());
-            aad[8..].copy_from_slice(&(chunk.len() as u32).to_le_bytes());
-            buf.clear();
-            buf.extend_from_slice(chunk);
-            let mut nonce_bytes = [0u8; 12];
-            nonce_bytes[4..].copy_from_slice(&nonce.to_be_bytes());
-            key.seal_in_place_append_tag(
-                aead::Nonce::assume_unique_for_key(nonce_bytes),
-                aead::Aad::from(&aad),
-                buf,
-            )
-            .map_err(|_| crypto_err())?;
-            *nonce = nonce.checked_add(1).ok_or_else(crypto_err)?;
-            stream.write_all(&(buf.len() as u32).to_le_bytes())?;
-            stream.write_all(buf)?;
-        }
-        Ok(())
+        send_plain_locked(&mut st, plain)
     }
 
     pub fn recv_record(&self) -> io::Result<Vec<u8>> {
@@ -242,14 +220,52 @@ impl Secure {
     }
 
     pub fn send_msg(&self, m: Msg, payload: &[u8]) -> io::Result<()> {
-        let mut plain = Vec::with_capacity(12 + payload.len());
-        plain.extend_from_slice(&m.to_bytes());
-        plain.extend_from_slice(payload);
-        self.send_record(&plain)
+        let total = 12usize
+            .checked_add(payload.len())
+            .ok_or_else(|| io::Error::other("secure record too large"))?;
+        if total > MAX_RECORD {
+            return Err(io::Error::other("secure record too large"));
+        }
+        let mut st = self
+            .send
+            .lock()
+            .map_err(|_| io::Error::other("secure send lock"))?;
+        if total <= CHUNK {
+            // Fast path for video/input/clipboard: build the plaintext in the
+            // reusable buffer and seal it in place. Avoids the temporary Vec
+            // and the second copy of every frame.
+            st.buf.clear();
+            st.buf.extend_from_slice(&m.to_bytes());
+            st.buf.extend_from_slice(payload);
+            let total = st.buf.len() as u32;
+            st.stream.write_all(&total.to_le_bytes())?;
+            let SendState { stream, key, nonce, buf } = &mut *st;
+            let mut aad = [0u8; 12];
+            aad[..4].copy_from_slice(&total.to_le_bytes());
+            aad[4..8].copy_from_slice(&0u32.to_le_bytes());
+            aad[8..].copy_from_slice(&total.to_le_bytes());
+            let mut nonce_bytes = [0u8; 12];
+            nonce_bytes[4..].copy_from_slice(&nonce.to_be_bytes());
+            key.seal_in_place_append_tag(
+                aead::Nonce::assume_unique_for_key(nonce_bytes),
+                aead::Aad::from(&aad),
+                buf,
+            )
+            .map_err(|_| crypto_err())?;
+            *nonce = nonce.checked_add(1).ok_or_else(crypto_err)?;
+            stream.write_all(&(buf.len() as u32).to_le_bytes())?;
+            stream.write_all(buf)?;
+            Ok(())
+        } else {
+            let mut plain = Vec::with_capacity(total);
+            plain.extend_from_slice(&m.to_bytes());
+            plain.extend_from_slice(payload);
+            send_plain_locked(&mut st, &plain)
+        }
     }
 
     pub fn recv_msg(&self) -> io::Result<(Msg, Vec<u8>)> {
-        let plain = self.recv_record()?;
+        let mut plain = self.recv_record()?;
         if plain.len() < 12 {
             return Err(io::Error::other("short secure message"));
         }
@@ -259,7 +275,8 @@ impl Secure {
         if payload_len(&m) != plain.len() - 12 {
             return Err(io::Error::other("secure message length mismatch"));
         }
-        Ok((m, plain[12..].to_vec()))
+        plain.drain(..12);
+        Ok((m, plain))
     }
 
     pub fn send_bytes(&self, bytes: &[u8]) -> io::Result<()> {
@@ -283,6 +300,32 @@ impl Secure {
             .map_err(|_| io::Error::other("secure recv lock"))?;
         st.stream.set_read_timeout(timeout)
     }
+}
+
+fn send_plain_locked(st: &mut SendState, plain: &[u8]) -> io::Result<()> {
+    let total = plain.len() as u32;
+    st.stream.write_all(&total.to_le_bytes())?;
+    let SendState { stream, key, nonce, buf } = &mut *st;
+    for (idx, chunk) in plain.chunks(CHUNK).enumerate() {
+        let mut aad = [0u8; 12];
+        aad[..4].copy_from_slice(&total.to_le_bytes());
+        aad[4..8].copy_from_slice(&(idx as u32).to_le_bytes());
+        aad[8..].copy_from_slice(&(chunk.len() as u32).to_le_bytes());
+        buf.clear();
+        buf.extend_from_slice(chunk);
+        let mut nonce_bytes = [0u8; 12];
+        nonce_bytes[4..].copy_from_slice(&nonce.to_be_bytes());
+        key.seal_in_place_append_tag(
+            aead::Nonce::assume_unique_for_key(nonce_bytes),
+            aead::Aad::from(&aad),
+            buf,
+        )
+        .map_err(|_| crypto_err())?;
+        *nonce = nonce.checked_add(1).ok_or_else(crypto_err)?;
+        stream.write_all(&(buf.len() as u32).to_le_bytes())?;
+        stream.write_all(buf)?;
+    }
+    Ok(())
 }
 
 fn start_handshake(stream: &TcpStream) -> io::Result<()> {
@@ -405,6 +448,29 @@ mod tests {
         let (m, p) = secure.recv_msg().unwrap();
         assert_eq!(m.typ, 3);
         assert_eq!(p, b"world");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn large_record_is_chunked() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let secure = server_handshake(stream, "large-token").unwrap();
+            let (m, p) = secure.recv_msg().unwrap();
+            assert_eq!(m.typ, 3);
+            assert_eq!(p.len(), 70 * 1024);
+            assert!(p.iter().all(|b| *b == 0xAB));
+            secure.send_msg(Msg::new(3, 0, 70 * 1024, 0), &p).unwrap();
+        });
+        let stream = TcpStream::connect(addr).unwrap();
+        let secure = client_handshake(stream, "large-token").unwrap();
+        let payload = vec![0xAB; 70 * 1024];
+        secure.send_msg(Msg::new(3, 0, 70 * 1024, 0), &payload).unwrap();
+        let (m, p) = secure.recv_msg().unwrap();
+        assert_eq!(m.typ, 3);
+        assert_eq!(p, payload);
         server.join().unwrap();
     }
 

@@ -17,6 +17,7 @@ mod net;
 mod pad;
 mod pair;
 mod protocols;
+mod reconnect_ui;
 
 use std::io::Write;
 use std::os::unix::process::CommandExt;
@@ -455,6 +456,7 @@ fn main() {
     };
 
     let mut connect_attempt = reconnect_attempt();
+    let mut dialog: Option<reconnect_ui::Dialog> = None;
     let (conn, hello, video_rx) = loop {
         let (video_tx, video_rx) = std::sync::mpsc::channel::<dec::Chunk>();
         let clip_policy = net::ClipPolicy {
@@ -463,7 +465,12 @@ fn main() {
             max_bytes: s.clipboard_max_bytes,
         };
         match net::connect(&server, &keymap, &s.client_id, &token, video_tx, clip_policy) {
-            Ok((conn, hello)) => break (conn, hello, video_rx),
+            Ok((conn, hello)) => {
+                if let Some(d) = dialog.take() {
+                    d.close();
+                }
+                break (conn, hello, video_rx);
+            }
             Err(e) => {
                 if !s.reconnect || connect_attempt >= MAX_RECONNECT_ATTEMPTS {
                     eprintln!("lgx-client: cannot connect to {server}: {e}");
@@ -475,7 +482,17 @@ fn main() {
                     "lgx-client: cannot connect to {server}: {e}; retrying in {}s (attempt {connect_attempt}/{MAX_RECONNECT_ATTEMPTS})",
                     delay.as_secs()
                 );
-                std::thread::sleep(delay);
+                if !args.no_window && dialog.is_none() {
+                    dialog = reconnect_ui::Dialog::spawn(&server, connect_attempt);
+                }
+                if let Some(d) = dialog.as_mut() {
+                    if d.wait_or_cancel(delay) {
+                        eprintln!("lgx-client: reconnect cancelled");
+                        std::process::exit(0);
+                    }
+                } else {
+                    std::thread::sleep(delay);
+                }
             }
         }
     };
@@ -1025,12 +1042,9 @@ fn reconnect_delay(attempt: u32) -> Duration {
 }
 
 fn reconnect_exec(attempt: u32) -> ! {
-    let delay = reconnect_delay(attempt);
     eprintln!(
-        "lgx-client: reconnecting in {}s (attempt {attempt}/{MAX_RECONNECT_ATTEMPTS})",
-        delay.as_secs()
+        "lgx-client: restarting session for reconnect (attempt {attempt}/{MAX_RECONNECT_ATTEMPTS})"
     );
-    std::thread::sleep(delay);
     let exe = match std::env::current_exe() {
         Ok(v) => v,
         Err(e) => {
