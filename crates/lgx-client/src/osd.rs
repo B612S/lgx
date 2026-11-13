@@ -2,6 +2,9 @@
 //! `OsdToast.qml`: 40 px tall, 8 px radius, translucent theme background,
 //! a 20% text-colored border, 16 px centered text, top-center of the window.
 
+use std::path::PathBuf;
+use std::process::Command;
+
 use fontdue::{Font, FontSettings};
 
 const CARD_H: u32 = 40;
@@ -10,7 +13,7 @@ const PAD_X: u32 = 16;
 const FONT_PX: f32 = 16.0;
 const RADIUS: f32 = 8.0;
 
-const FONTS: &[&str] = &[
+const FALLBACK_FONTS: &[&str] = &[
     "/usr/share/fonts/noto/NotoSans-Regular.ttf",
     "/usr/share/fonts/TTF/DejaVuSans.ttf",
     "/usr/share/fonts/liberation/LiberationSans-Regular.ttf",
@@ -27,9 +30,76 @@ pub struct Atlas {
     pub rgba: Vec<u8>,
 }
 
+fn kdeglobals_family() -> Option<String> {
+    let mut paths = Vec::new();
+    if let Some(base) = std::env::var_os("XDG_CONFIG_HOME") {
+        paths.push(PathBuf::from(base).join("kdeglobals"));
+    } else if let Some(home) = std::env::var_os("HOME") {
+        paths.push(PathBuf::from(home).join(".config/kdeglobals"));
+    }
+    paths.push(PathBuf::from("/etc/xdg/kdeglobals"));
+    for path in paths {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let mut general = false;
+        for line in text.lines() {
+            let line = line.trim();
+            if line.starts_with('[') {
+                general = line == "[General]";
+                continue;
+            }
+            if general {
+                if let Some(value) = line.strip_prefix("font=") {
+                    let family = value.split(',').next().unwrap_or_default().trim();
+                    if !family.is_empty() {
+                        return Some(family.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn fc_match(pattern: &str) -> Option<PathBuf> {
+    let output = Command::new("fc-match")
+        .args(["-f", "%{file}", pattern])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = String::from_utf8(output.stdout).ok()?;
+    let path = path.trim();
+    if path.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(path))
+    }
+}
+
+fn system_font_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(family) = kdeglobals_family() {
+        if let Some(path) = fc_match(&family) {
+            paths.push(path);
+        }
+    }
+    if let Some(path) = fc_match("sans-serif") {
+        paths.push(path);
+    }
+    paths.extend(FALLBACK_FONTS.iter().map(PathBuf::from));
+    paths
+}
+
 fn load_font() -> Option<Font> {
-    for path in FONTS {
-        let Ok(bytes) = std::fs::read(path) else {
+    let mut seen = std::collections::HashSet::new();
+    for path in system_font_paths() {
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else {
             continue;
         };
         if let Ok(font) = Font::from_bytes(bytes, FontSettings::default()) {
@@ -189,4 +259,22 @@ pub fn atlas() -> Option<Atlas> {
         card_height: CARD_H,
         rgba,
     })
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn atlas_uses_a_system_font() {
+        let font = load_font().expect("a system sans font");
+        let on = "Background audio: On";
+        let off = "Background audio: Off";
+        assert!(text_width(&font, 32.0, on) > 0.0);
+        assert!(text_width(&font, 32.0, off) > 0.0);
+        let atlas = atlas().expect("OSD atlas");
+        assert!(atlas.card_width >= 180);
+        assert_eq!(atlas.rgba.len(), (atlas.width * atlas.height * 4) as usize);
+    }
 }
