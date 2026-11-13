@@ -323,47 +323,6 @@ fn main() {
     );
     eprintln!("lgx-client: server HEVC {}x{}", hello.width, hello.height);
 
-    {
-        let conn = conn.clone();
-        std::thread::Builder::new()
-            .name("lgx-clip-poll".into())
-            .spawn(move || {
-                let mut last_sent = String::new();
-                loop {
-                    std::thread::sleep(Duration::from_millis(300));
-                    let clip = match clip::get() {
-                        Ok(t) => t,
-                        Err(_) => continue,
-                    };
-                    let sig = clip::signature(&clip);
-                    if let clip::Clip::Text(text) = &clip {
-                        if text.is_empty() {
-                            continue;
-                        }
-                    }
-                    if sig == last_sent || sig == *conn.last_remote.lock().unwrap() {
-                        last_sent = sig;
-                        continue;
-                    }
-                    match &clip {
-                        clip::Clip::Text(text) => {
-                            let _ = conn.send(
-                                Msg::new(msg::CLIP_SET, 0, text.len() as i32, 0),
-                                text.as_bytes(),
-                            );
-                        }
-                        clip::Clip::Files(paths) => {
-                            if let Err(e) = net::send_files(&conn, paths) {
-                                eprintln!("lgx-client: file clipboard send: {e}");
-                            }
-                        }
-                    }
-                    last_sent = sig;
-                }
-            })
-            .ok();
-    }
-
     if s.audio {
         let addr = s
             .audio_connect
@@ -525,6 +484,7 @@ fn main() {
     let mut quit = false;
     let mut redraw = true;
     let mut swallow_f_keyup = false;
+    let mut swallow_clip_keyup: Option<sdl3::keyboard::Keycode> = None;
     let mut fullscreen_hold: Option<(Instant, (u32, u32))> = None;
     let mut dst = vk::fit_rect(win_w, win_h, win_w, win_h);
     let mut config_saved = s.width.is_some() && s.height.is_some();
@@ -625,6 +585,46 @@ fn main() {
                     eprintln!("lgx-client: fullscreen toggled (Ctrl+Shift+Alt+F)");
                 }
                 Event::KeyDown {
+                    keycode: Some(sdl3::keyboard::Keycode::V),
+                    keymod,
+                    ..
+                } if keymod
+                    .intersects(sdl3::keyboard::Mod::LCTRLMOD | sdl3::keyboard::Mod::RCTRLMOD)
+                    && keymod.intersects(
+                        sdl3::keyboard::Mod::LSHIFTMOD | sdl3::keyboard::Mod::RSHIFTMOD,
+                    )
+                    && keymod.intersects(
+                        sdl3::keyboard::Mod::LALTMOD | sdl3::keyboard::Mod::RALTMOD,
+                    ) =>
+                {
+                    for code in [29u16, 42, 56, 97, 100, 54] {
+                        send_key(&conn, keyboard.as_mut(), code, false);
+                    }
+                    swallow_clip_keyup = Some(sdl3::keyboard::Keycode::V);
+                    let conn = conn.clone();
+                    std::thread::spawn(move || send_host_clipboard(&conn));
+                }
+                Event::KeyDown {
+                    keycode: Some(sdl3::keyboard::Keycode::C),
+                    keymod,
+                    ..
+                } if keymod
+                    .intersects(sdl3::keyboard::Mod::LCTRLMOD | sdl3::keyboard::Mod::RCTRLMOD)
+                    && keymod.intersects(
+                        sdl3::keyboard::Mod::LSHIFTMOD | sdl3::keyboard::Mod::RSHIFTMOD,
+                    )
+                    && keymod.intersects(
+                        sdl3::keyboard::Mod::LALTMOD | sdl3::keyboard::Mod::RALTMOD,
+                    ) =>
+                {
+                    for code in [29u16, 42, 56, 97, 100, 54] {
+                        send_key(&conn, keyboard.as_mut(), code, false);
+                    }
+                    swallow_clip_keyup = Some(sdl3::keyboard::Keycode::C);
+                    let _ = conn.send(Msg::new(msg::CLIP_GET, 0, 0, 0), &[]);
+                    eprintln!("lgx-client: requested guest clipboard; press Ctrl+V on host");
+                }
+                Event::KeyDown {
                     keycode: Some(sdl3::keyboard::Keycode::G),
                     keymod,
                     ..
@@ -688,6 +688,9 @@ fn main() {
                     if swallow_f_keyup =>
                 {
                     swallow_f_keyup = false;
+                }
+                Event::KeyUp { keycode: Some(k), .. } if swallow_clip_keyup == Some(k) => {
+                    swallow_clip_keyup = None;
                 }
                 Event::KeyUp { scancode: Some(sc), .. } => {
                     if let Some(code) = hid::evdev_from_scancode((sc as i32) & 0x1ff) {
@@ -964,6 +967,39 @@ fn send_key(conn: &net::Conn, keyboard: Option<&mut Keyboard>, code: u16, down: 
         );
     }
     let _ = conn.send(Msg::new(msg::KEY, code, down as i32, 0), &[]);
+}
+
+/// Host -> guest clipboard transfer, requested by Ctrl+Shift+Alt+V.
+fn send_host_clipboard(conn: &std::sync::Arc<net::Conn>) {
+    let clip = match clip::get() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("lgx-client: clipboard: {e}");
+            return;
+        }
+    };
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    *conn.clip_ack.lock().unwrap() = Some(tx);
+    let result = match &clip {
+        clip::Clip::Text(text) if !text.is_empty() => conn.send(
+            Msg::new(msg::CLIP_SET, 0, text.len() as i32, 0),
+            text.as_bytes(),
+        ),
+        clip::Clip::Files(paths) if !paths.is_empty() => net::send_files(conn, paths),
+        _ => {
+            *conn.clip_ack.lock().unwrap() = None;
+            eprintln!("lgx-client: host clipboard is empty");
+            return;
+        }
+    };
+    match result {
+        Ok(()) => match rx.recv_timeout(Duration::from_secs(120)) {
+            Ok(()) => eprintln!("lgx-client: clipboard ready in guest; press Ctrl+V"),
+            Err(_) => eprintln!("lgx-client: clipboard transfer timed out"),
+        },
+        Err(e) => eprintln!("lgx-client: clipboard send: {e}"),
+    }
+    *conn.clip_ack.lock().unwrap() = None;
 }
 
 fn btn_code(b: sdl3::mouse::MouseButton) -> Option<u16> {

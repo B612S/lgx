@@ -12,12 +12,6 @@ pub enum Clip {
     Files(Vec<PathBuf>),
 }
 
-pub fn signature(c: &Clip) -> String {
-    match c {
-        Clip::Text(t) => format!("t:{t}"),
-        Clip::Files(p) => files::signature(p),
-    }
-}
 
 pub fn set_text(text: &str) -> io::Result<()> {
     let mut child = Command::new("wl-copy")

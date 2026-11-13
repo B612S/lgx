@@ -30,7 +30,9 @@ the header and its length is in `a`.
 | 8 | MODS | `a` = depressed, `b` = latched, `code` = locked, `flags` = group | — |
 | 9 | KEYMAP | `a` = length | xkb keymap |
 | 10 | CLIP_SET | `a` = length | text |
+| 11 | CLIP_GET | — | — |
 | 12 | CLIP_DATA | `a` = length | text |
+| 19 | CLIP_ACK | — | — |
 | 13 | CURSOR | `code` = 1 overlay the guest pointer, 0 draw locally | — |
 | 14 | PING | — | — |
 | 15 | FILE_BEGIN | `a` = length | file offer |

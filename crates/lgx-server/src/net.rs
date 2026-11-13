@@ -294,30 +294,6 @@ fn handle(
     });
     hub.request_keyframe();
 
-    // A newly connected client should see the current clipboard; the poll
-    // may have marked it as sent while nobody was connected.
-    match crate::clip::get() {
-        Ok(clip::Clip::Text(text)) if !text.is_empty() => {
-            *last_remote.lock().unwrap() =
-                clip::signature(&clip::Clip::Text(text.clone()));
-            let _ = tx.try_send(Out::Clip(text));
-        }
-        Ok(clip::Clip::Files(paths)) => {
-            *last_remote.lock().unwrap() = files::signature(&paths);
-            if !file_busy.swap(true, Ordering::Relaxed) {
-                let secure = secure.clone();
-                let busy = file_busy.clone();
-                std::thread::spawn(move || {
-                    if let Err(e) = send_files_chunked(&secure, &paths) {
-                        eprintln!("lgx-server: file send: {e}");
-                    }
-                    busy.store(false, Ordering::Relaxed);
-                });
-            }
-        }
-        _ => {}
-    }
-
     let w2 = secure.clone();
     let hubw = hub.clone();
     let writer = std::thread::Builder::new()
@@ -392,8 +368,26 @@ fn handle(
             msg::CLIP_SET => {
                 if let Ok(text) = String::from_utf8(payload) {
                     clip_set(&text);
+                    let _ = secure.send_msg(Msg::new(msg::CLIP_ACK, 0, 0, 0), &[]);
                 }
             }
+            msg::CLIP_GET => match crate::clip::get() {
+                Ok(clip::Clip::Text(text)) if !text.is_empty() => {
+                    let _ = secure.send_msg(
+                        Msg::new(msg::CLIP_DATA, 0, text.len() as i32, 0),
+                        text.as_bytes(),
+                    );
+                }
+                Ok(clip::Clip::Files(paths)) => {
+                    let secure = secure.clone();
+                    std::thread::spawn(move || {
+                        if let Err(e) = send_files_chunked(&secure, &paths) {
+                            eprintln!("lgx-server: on-demand file clipboard: {e}");
+                        }
+                    });
+                }
+                _ => {}
+            },
             msg::FILE_BEGIN => match files::decode_offer(&payload) {
                 Some(entries) => {
                     eprintln!("lgx-server: incoming file clipboard: {} entries", entries.len());
@@ -421,6 +415,7 @@ fn handle(
                                     "lgx-server: file clipboard ready ({} item(s))",
                                     paths.len()
                                 );
+                                let _ = secure.send_msg(Msg::new(msg::CLIP_ACK, 0, 0, 0), &[]);
                             }
                         }
                         Ok(_) => eprintln!("lgx-server: empty file transfer"),

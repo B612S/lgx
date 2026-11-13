@@ -19,10 +19,11 @@ pub struct Hello {
 
 pub struct Conn {
     secure: Arc<Secure>,
-    pub last_remote: Arc<Mutex<String>>,
     pub bytes: AtomicU64,
     /// Set by the reader when the server closes or the stream fails.
     pub closed: std::sync::atomic::AtomicBool,
+    /// One-shot clipboard acknowledgement slot.
+    pub clip_ack: Mutex<Option<std::sync::mpsc::SyncSender<()>>>,
 }
 
 impl Conn {
@@ -76,18 +77,16 @@ pub fn connect(
         )));
     }
 
-    let last_remote: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
-    let lr = last_remote.clone();
     let conn = Arc::new(Conn {
         secure: secure.clone(),
-        last_remote,
         bytes: AtomicU64::new(0),
         closed: std::sync::atomic::AtomicBool::new(false),
+        clip_ack: Mutex::new(None),
     });
     let conn_for_reader = conn.clone();
     std::thread::Builder::new()
         .name("lgx-reader".into())
-        .spawn(move || reader(secure, conn_for_reader, lr, video))
+        .spawn(move || reader(secure, conn_for_reader, video))
         .expect("reader thread");
     Ok((conn, hello))
 }
@@ -124,7 +123,6 @@ pub fn send_files(conn: &Conn, paths: &[PathBuf]) -> io::Result<()> {
 fn reader(
     secure: Arc<Secure>,
     conn: Arc<Conn>,
-    last_remote: Arc<Mutex<String>>,
     video: std::sync::mpsc::Sender<Chunk>,
 ) {
     let mut recv: Option<files::Receiver> = None;
@@ -140,10 +138,13 @@ fn reader(
                     break;
                 }
             }
+            msg::CLIP_ACK => {
+                if let Some(tx) = conn.clip_ack.lock().unwrap().take() {
+                    let _ = tx.try_send(());
+                }
+            }
             msg::CLIP_DATA => {
                 let text = String::from_utf8_lossy(&payload).to_string();
-                *last_remote.lock().unwrap() =
-                    crate::clip::signature(&crate::clip::Clip::Text(text.clone()));
                 if let Err(e) = crate::clip::set_text(&text) {
                     eprintln!("lgx-client: wl-copy: {e}");
                 }
@@ -167,8 +168,6 @@ fn reader(
                 if let Some(mut r) = recv.take() {
                     match r.finish() {
                         Ok(paths) if !paths.is_empty() => {
-                            let sig = files::signature(&paths);
-                            *last_remote.lock().unwrap() = sig;
                             if let Err(e) = crate::clip::set_files(&paths) {
                                 eprintln!("lgx-client: wl-copy files: {e}");
                             } else {

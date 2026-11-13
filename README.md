@@ -264,12 +264,17 @@ is the server's LAN address.
 | key | action |
 |---|---|
 | Ctrl+Shift+Alt+F | toggle client fullscreen (never forwarded) |
+| Ctrl+Shift+Alt+V | copy host clipboard into the guest (then Ctrl+V there) |
+| Ctrl+Shift+Alt+C | copy guest clipboard to the host (then Ctrl+V there) |
 | Ctrl+Alt+Q | quit |
 | Ctrl+Alt+G | release/grab compositor shortcuts |
 
-Text and files synchronise through the clipboard automatically in both
-directions; no paste shortcut is injected. F9/F10/F11/F12 are ordinary keys
-for the guest.
+Clipboard is **on demand**: copying text or files only changes the local
+clipboard. Press `Ctrl+Shift+Alt+V` to send the host clipboard to the guest, or
+`Ctrl+Shift+Alt+C` to fetch the guest clipboard to the host; then paste
+normally. Large file lists are transferred only for that explicit request.
+No automatic clipboard traffic or paste injection happens. F9/F10/F11/F12 are
+ordinary keys for the guest.
 
 All traffic — video, input, clipboard, files and audio — is inside AES-256-GCM
 records; pairing uses the same channel with a one-time code. Each client has

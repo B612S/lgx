@@ -541,39 +541,6 @@ fn main() {
             .ok();
     }
 
-    {
-        let hub = hub.clone();
-        let last_remote = last_remote.clone();
-        std::thread::Builder::new()
-            .name("lgx-clip-poll".into())
-            .spawn(move || {
-                let mut last_sent = String::new();
-                loop {
-                    std::thread::sleep(Duration::from_millis(300));
-                    let clip = match clip::get() {
-                        Ok(c) => c,
-                        Err(_) => continue,
-                    };
-                    let sig = clip::signature(&clip);
-                    if let clip::Clip::Text(text) = &clip {
-                        if text.is_empty() {
-                            continue;
-                        }
-                    }
-                    if sig == last_sent || sig == *last_remote.lock().unwrap() {
-                        last_sent = sig;
-                        continue;
-                    }
-                    match &clip {
-                        clip::Clip::Text(text) => hub.broadcast_clip(text),
-                        clip::Clip::Files(paths) => hub.broadcast_files(paths),
-                    }
-                    last_sent = sig;
-                }
-            })
-            .ok();
-    }
-
     let stream = match Stream::new(&args) {
         Ok(s) => s,
         Err(e) => {

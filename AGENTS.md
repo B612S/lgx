@@ -72,10 +72,11 @@ Commit format: `area: short imperative summary`, for example
   different locks.
 - The window title is `lgx — <server IP>` and must not contain live stats.
   `LGX_DEBUG_FPS` still prints per-second diagnostics to stderr.
-- `Ctrl+Shift+Alt+F` is the only client hotkey; it toggles fullscreen. The F
-  keydown/keyup is swallowed; the modifiers were already forwarded, so the
-  handler sends their key-up events to clear the guest state. F9/F10/F11/F12
-  are ordinary keys and must reach the guest.
+- Client hotkeys: `Ctrl+Shift+Alt+F` toggles fullscreen; `Ctrl+Shift+Alt+V`
+  sends the host clipboard to the guest; `Ctrl+Shift+Alt+C` fetches the guest
+  clipboard to the host. Each hotkey swallows its letter keydown/up and sends
+  modifier key-ups to clear guest state. F9/F10/F11/F12 are ordinary keys and
+  must reach the guest.
 - After a fullscreen toggle the client skips drawing until SDL reports the
   new window size (1.2 s cap). Vulkan acquire uses a 100 ms timeout and
   recreates the swapchain/semaphores on timeout; a UI watchdog calls
@@ -133,11 +134,14 @@ the Vulkan shader converts full-range BT.709, and the HEVC VUI says
 - Client scancodes must be masked with `& 0x1ff`.
 - `MODS` is sent before every `KEY`; the virtual keyboard needs explicit
   modifiers.
-- Clipboard is polled every 300 ms on both sides, with `last_remote`/`last_sent`
-  signature strings (`t:<text>` or `f:<paths>`) to avoid echo loops.
-- `CLIP_SET` only replaces the guest clipboard. Never inject a paste: text and
-  files synchronise automatically in both directions, and the user presses
-  Ctrl+V in the target application.
+- **No automatic clipboard polling or push.** Copying only changes the local
+  clipboard. `Ctrl+Shift+Alt+V` sends host text/files with `CLIP_SET` and waits
+  for `CLIP_ACK`; `Ctrl+Shift+Alt+C` sends `CLIP_GET` and the server returns
+  the guest clipboard on demand. The user then presses Ctrl+V normally. Never
+  add a background clipboard watcher or a paste injection.
+- `CLIP_SET` replaces the guest clipboard and acknowledges with `CLIP_ACK`.
+  `FILE_END` does the same after the URI list is installed. Never ACK before
+  the local clipboard command succeeded.
 - Files/directories are exchanged with `FILE_BEGIN`/`FILE_DATA`/`FILE_END`.
   The offer lists `(kind, relative path, size)`; data is sequential 64 KiB
   chunks. Both sides write into `~/.cache/lgx/clipboard/<pid>-<stamp>/`,
@@ -146,9 +150,6 @@ the Vulkan shader converts full-range BT.709, and the HEVC VUI says
 - The server sends files from a per-client thread that locks the socket per
   message, so video keeps flowing during large transfers. Do not hold the
   writer mutex for a whole file.
-- A newly connected client receives the server's current clipboard (text or
-  files) in `handle()`, and the server sets `last_remote` so its poll does not
-  immediately echo it back.
 - Audio is on by default (`--no-audio` disables it) and uses the same secure
   handshake/record layer with the same token PSK. The server records
   `parec --device=@DEFAULT_MONITOR@` (48 kHz s16le stereo, 20 ms latency) and
