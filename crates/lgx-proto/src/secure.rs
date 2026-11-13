@@ -115,12 +115,15 @@ struct SendState {
     stream: TcpStream,
     key: aead::LessSafeKey,
     nonce: u64,
+    /// Reused per chunk so a 160 fps stream does not allocate per frame.
+    buf: Vec<u8>,
 }
 
 struct RecvState {
     stream: TcpStream,
     key: aead::LessSafeKey,
     nonce: u64,
+    buf: Vec<u8>,
 }
 
 pub struct Secure {
@@ -142,11 +145,13 @@ impl Secure {
                 stream,
                 key: aead_key(&send_key)?,
                 nonce: 0,
+                buf: Vec::with_capacity(CHUNK + 16),
             }),
             recv: Mutex::new(RecvState {
                 stream: recv_stream,
                 key: aead_key(&recv_key)?,
                 nonce: 0,
+                buf: Vec::with_capacity(CHUNK + 16),
             }),
             shutdown,
         })
@@ -162,24 +167,25 @@ impl Secure {
             .map_err(|_| io::Error::other("secure send lock"))?;
         let total = plain.len() as u32;
         st.stream.write_all(&total.to_le_bytes())?;
+        let SendState { stream, key, nonce, buf } = &mut *st;
         for (idx, chunk) in plain.chunks(CHUNK).enumerate() {
             let mut aad = [0u8; 12];
             aad[..4].copy_from_slice(&total.to_le_bytes());
             aad[4..8].copy_from_slice(&(idx as u32).to_le_bytes());
             aad[8..].copy_from_slice(&(chunk.len() as u32).to_le_bytes());
-            let mut ct = chunk.to_vec();
+            buf.clear();
+            buf.extend_from_slice(chunk);
             let mut nonce_bytes = [0u8; 12];
-            nonce_bytes[4..].copy_from_slice(&st.nonce.to_be_bytes());
-            st.key
-                .seal_in_place_append_tag(
-                    aead::Nonce::assume_unique_for_key(nonce_bytes),
-                    aead::Aad::from(&aad),
-                    &mut ct,
-                )
-                .map_err(|_| crypto_err())?;
-            st.nonce = st.nonce.checked_add(1).ok_or_else(crypto_err)?;
-            st.stream.write_all(&(ct.len() as u32).to_le_bytes())?;
-            st.stream.write_all(&ct)?;
+            nonce_bytes[4..].copy_from_slice(&nonce.to_be_bytes());
+            key.seal_in_place_append_tag(
+                aead::Nonce::assume_unique_for_key(nonce_bytes),
+                aead::Aad::from(&aad),
+                buf,
+            )
+            .map_err(|_| crypto_err())?;
+            *nonce = nonce.checked_add(1).ok_or_else(crypto_err)?;
+            stream.write_all(&(buf.len() as u32).to_le_bytes())?;
+            stream.write_all(buf)?;
         }
         Ok(())
     }
@@ -199,36 +205,37 @@ impl Secure {
             return Ok(Vec::new());
         }
         let mut out = Vec::with_capacity(total);
+        let RecvState { stream, key, nonce, buf } = &mut *st;
         let mut idx = 0u32;
         while out.len() < total {
             let mut clen = [0u8; 4];
-            st.stream.read_exact(&mut clen)?;
+            stream.read_exact(&mut clen)?;
             let ct_len = u32::from_le_bytes(clen) as usize;
             if ct_len <= 16 || ct_len > CHUNK + 16 {
                 return Err(io::Error::other("bad secure chunk"));
             }
-            let mut ct = vec![0u8; ct_len];
-            st.stream.read_exact(&mut ct)?;
+            buf.clear();
+            buf.resize(ct_len, 0);
+            stream.read_exact(buf)?;
             let chunk_len = (ct_len - 16) as u32;
             let mut aad = [0u8; 12];
             aad[..4].copy_from_slice(&(total as u32).to_le_bytes());
             aad[4..8].copy_from_slice(&idx.to_le_bytes());
             aad[8..].copy_from_slice(&chunk_len.to_le_bytes());
             let mut nonce_bytes = [0u8; 12];
-            nonce_bytes[4..].copy_from_slice(&st.nonce.to_be_bytes());
-            let pt = st
-                .key
+            nonce_bytes[4..].copy_from_slice(&nonce.to_be_bytes());
+            let pt = key
                 .open_in_place(
                     aead::Nonce::assume_unique_for_key(nonce_bytes),
                     aead::Aad::from(&aad),
-                    &mut ct,
+                    buf,
                 )
                 .map_err(|_| crypto_err())?;
             if out.len() + pt.len() > total {
                 return Err(io::Error::other("bad secure record length"));
             }
             out.extend_from_slice(pt);
-            st.nonce = st.nonce.checked_add(1).ok_or_else(crypto_err)?;
+            *nonce = nonce.checked_add(1).ok_or_else(crypto_err)?;
             idx += 1;
         }
         Ok(out)

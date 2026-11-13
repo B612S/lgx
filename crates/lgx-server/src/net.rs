@@ -21,7 +21,7 @@ use crate::clip;
 use crate::input::Cmd;
 
 enum Out {
-    Video(Vec<u8>),
+    Video(Arc<Vec<u8>>),
     Clip(String),
     ClipHtml(Vec<u8>),
 }
@@ -117,6 +117,7 @@ impl Hub {
     }
 
     pub fn broadcast_video(&self, chunk: Vec<u8>) {
+        let chunk = Arc::new(chunk);
         let idr = is_idr(&chunk);
         let mut list = self.clients.lock().unwrap();
         let mut dropped = false;
