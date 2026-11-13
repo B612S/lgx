@@ -1,33 +1,29 @@
 //! Client configuration stored in `~/.config/lgx/client.conf`.
 //!
-//! Global settings live in `[network]`, `[video]`, `[audio]`. Each named
-//! client instance is an additional section:
+//! Global settings are `[video]` and `[audio]`; every client instance is a
+//! section named after the instance, e.g. `[archlinux]`:
 //!
 //! ```ini
-//! [network]
-//! server = 192.168.122.25:5902
+//! [video]
+//! width = 1920
 //!
-//! [client1]
-//! token = <token>
-//! server = 192.168.122.25:5902
-//! client_id = <id>
+//! [audio]
+//! enabled = true
 //!
-//! [client2]
+//! [archlinux]
+//! server = 192.168.122.25:5902
 //! token = <token>
-//! server = 10.0.0.5:5902
-//! client_id = <id>
 //! ```
 //!
-//! `lgx-client client1` selects `[client1]`; no name inside the section is
-//! needed. The file contains secrets and is always written mode 0600.
+//! Run `lgx-client archlinux`. The section name is also the public client ID
+//! used on the wire. There is no `[network]`, no `[default]` and no automatic
+//! migration. The file contains tokens, so it is written mode 0600.
 
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
-
-pub const DEFAULT_NAME: &str = "default";
 
 pub fn path() -> PathBuf {
     let base = std::env::var_os("XDG_CONFIG_HOME")
@@ -43,7 +39,7 @@ pub fn validate_name(name: &str) -> io::Result<()> {
         || !name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
-        || matches!(name, "network" | "video" | "audio" | "misc")
+        || matches!(name, "video" | "audio" | "misc" | "network" | "default")
     {
         return Err(io::Error::other(
             "instance name must be 1..64 chars of A-Z a-z 0-9 - _ . and not a reserved section",
@@ -58,7 +54,6 @@ fn canonical(key: &str) -> String {
         return key.to_string();
     }
     let (section, name) = match key {
-        "server" | "token" | "client_id" => ("network", key),
         "width" | "height" | "fullscreen" | "vsync" | "decoder" | "cursor" => {
             ("video", key)
         }
@@ -79,7 +74,6 @@ impl Config {
     pub fn load() -> Self {
         let mut values = BTreeMap::new();
         let mut section = String::new();
-        let mut sectioned = false;
         let existed = match fs::read_to_string(path()) {
             Ok(text) => {
                 for line in text.lines() {
@@ -89,7 +83,6 @@ impl Config {
                     }
                     if line.starts_with('[') && line.ends_with(']') {
                         section = line[1..line.len() - 1].trim().to_string();
-                        sectioned = true;
                         continue;
                     }
                     if let Some((k, v)) = line.split_once('=') {
@@ -106,44 +99,28 @@ impl Config {
             }
             Err(_) => false,
         };
-        let cfg = Self { values, existed };
-        if existed && !sectioned {
-            let _ = cfg.save();
-        }
-        cfg
+        Self { values, existed }
     }
 
-    /// Loads the shared config, creates it, and migrates the old global token
-    /// file into the `[default]` instance once.
+    /// Creates the file with video/audio defaults when missing. No migration
+    /// from old configs or token files is attempted.
     pub fn load_or_create() -> Self {
-        let mut cfg = Self::load();
-        if !cfg.existed {
-            cfg.set("server", "192.168.122.25:5902");
-            cfg.set("width", 1920);
-            cfg.set("height", 1080);
-            cfg.set("fullscreen", "false");
-            cfg.set("vsync", "false");
-            cfg.set("decoder", "auto");
-            cfg.set("cursor", "remote");
-            cfg.set("audio", "true");
-            cfg.set("audio_connect", "");
+        let cfg = Self::load();
+        if cfg.existed {
+            return cfg;
         }
-        let mut changed = !cfg.existed;
-        if cfg.instance_get(DEFAULT_NAME, "token").is_none() {
-            if let Some(creds) = lgx_proto::auth::load_credentials() {
-                cfg.set_instance(DEFAULT_NAME, "token", creds.token);
-                cfg.set_instance(DEFAULT_NAME, "client_id", creds.id);
-                let _ = fs::remove_file(lgx_proto::auth::config_path());
-                eprintln!("lgx-client: moved old token into [default]");
-                changed = true;
-            }
+        let mut cfg = Self::default();
+        cfg.set("width", 1920);
+        cfg.set("height", 1080);
+        cfg.set("fullscreen", "false");
+        cfg.set("vsync", "false");
+        cfg.set("decoder", "auto");
+        cfg.set("cursor", "remote");
+        cfg.set("audio", "true");
+        if let Err(e) = cfg.save() {
+            eprintln!("lgx-client: cannot write {}: {e}", path().display());
         }
-        if changed {
-            if let Err(e) = cfg.save() {
-                eprintln!("lgx-client: cannot write {}: {e}", path().display());
-            }
-            cfg.existed = true;
-        }
+        cfg.existed = true;
         cfg
     }
 
@@ -199,16 +176,19 @@ impl Config {
                 .insert(key, value.clone());
         }
         let mut out = String::from("# lgx client configuration\n");
-        for section in ["network", "video", "audio", "misc"] {
+        for section in ["video", "audio", "misc"] {
             if let Some(values) = sections.get(section) {
                 out.push_str(&format!("\n[{section}]\n"));
                 for (key, value) in values {
+                    if section == "audio" && key == "connect" && value.is_empty() {
+                        continue;
+                    }
                     out.push_str(&format!("{key} = {value}\n"));
                 }
             }
         }
         for (section, values) in &sections {
-            if ["network", "video", "audio", "misc"].contains(&section.as_str()) {
+            if ["video", "audio", "misc", "network", "default"].contains(&section.as_str()) {
                 continue;
             }
             out.push_str(&format!("\n[{section}]\n"));

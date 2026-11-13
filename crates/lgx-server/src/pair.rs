@@ -18,11 +18,20 @@ use crate::clients;
 
 pub fn run(addr: &str, name: Option<&str>) -> io::Result<()> {
     clients::ensure()?;
-    let id = auth::generate();
     let token = auth::generate_token();
-    let name = name
-        .map(clients::clean_name)
-        .unwrap_or_else(|| format!("client-{}", &id[..8]));
+    // A named pairing uses the profile name as the public client ID, so the
+    // client config only needs [name] server/token.
+    let (id, name) = match name {
+        Some(n) => {
+            let n = clients::clean_name(n);
+            (n.clone(), n)
+        }
+        None => {
+            let id = auth::generate();
+            let name = format!("client-{}", &id[..8]);
+            (id, name)
+        }
+    };
     let code = auth::generate();
     let listener = TcpListener::bind(addr).map_err(|e| io::Error::other(format!("bind {addr}: {e}")))?;
     listener.set_nonblocking(true)?;

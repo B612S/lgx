@@ -70,7 +70,8 @@ Commit format: `area: short imperative summary`, for example
   `$XDG_RUNTIME_DIR/lgx-client-<uid>-<hash>.lock`. A second launch for the same
   host exits before connecting or creating a window; different hosts use
   different locks.
-- The window title is `lgx — <server IP>` and must not contain live stats.
+- The window title is `lgx — <name> — <server IP>` and must not contain live
+  stats. The `<name>` is the profile section selected on the command line.
   `LGX_DEBUG_FPS` still prints per-second diagnostics to stderr.
 - `Ctrl+Shift+Alt+F` is the only client hotkey; it toggles fullscreen. The F
   keydown/keyup is swallowed and modifier key-ups clear the guest state.
@@ -80,15 +81,18 @@ Commit format: `area: short imperative summary`, for example
   recreates the swapchain/semaphores on timeout; a UI watchdog calls
   `_exit(2)` if the main loop has not advanced for 3 s instead of leaving a
   frozen window.
-- Client profiles: `~/.config/lgx/client.conf` has shared `network`/`video`/
-  `audio` sections plus `[client1]`, `[client2]` sections with `token`,
-  `server` and `client_id`. Launch with `lgx-client client1`; no `name =` is
-  stored. The file is mode 0600. Missing/old configs migrate the old token
-  file into `[default]`. Server settings are `~/.config/lgx/server.conf`
-  (`network`, `video`, `audio`, `input`). CLI flags override.
-- Pairing with a name: `lgx-client client1 --pair HOST:PAIRPORT --pair-code
-  CODE` writes `[client1]`; token and client id must never go to a global
-  token file again.
+- Client profiles: `~/.config/lgx/client.conf` has shared `video`/`audio`
+  sections plus `[archlinux]`, `[client2]` sections with only `server` and
+  `token`. Launch with `lgx-client archlinux`; the section name is the public
+  client ID. There is no `[network]`, no `[default]`, no `client_id` field and
+  no config migration. The file is mode 0600. `[audio] connect` is an
+  optional audio-port override; omit it and derive `host:5903` from `server`.
+  Server settings are `~/.config/lgx/server.conf` (`network`, `video`,
+  `audio`, `input`). CLI flags override.
+- Pairing with a name: `lgx-server --pair --pair-name archlinux` and
+  `lgx-client archlinux --pair HOST:PAIRPORT --pair-code CODE` write
+  `[archlinux]`; token and client id must never go to a global token file
+  again.
 - SDL3 gamepads are opened through `GamepadSubsystem`; duplicate
   `ControllerDeviceAdded` events are filtered by device path.
 
@@ -176,15 +180,18 @@ the Vulkan shader converts full-range BT.709, and the HEVC VUI says
   key are the source of truth; do not add a global token path back.
 - Back up `master.key` with the registry. Losing it makes encrypted tokens
   undecryptable and requires re-pairing every client; never log or commit it.
-- Pairing generates a new ID and token, sends `id\ntoken` over the
+- Pairing generates a new token and sends `id\ntoken` over the
   code-authenticated secure channel, waits for `ok`, and only then adds the
-  entry. A failed pairing must not create an entry.
+  entry. With `--pair-name NAME` the ID is NAME, so it matches the client
+  section; without it the ID is random. A failed pairing must not create an
+  entry.
 - The client sends its ID in a plaintext frame before `LGX1`. The ID is public;
   the server looks up the token in the registry for the handshake. Never send
   the token before the handshake.
-- `lgx-client NAME --pair HOST:PORT --pair-code CODE` receives credentials and
-  writes `[NAME]` in `client.conf` (mode 0600). The legacy token file is
-  migrated into `[default]`; there is no global client token file.
+- `lgx-client NAME --pair HOST:PORT --pair-code CODE` receives credentials,
+  verifies that the server ID equals NAME, and writes `[NAME]` in
+  `client.conf` (mode 0600). There is no global client token file and no
+  config migration.
 - `lgx-server --list` prints the registry. `lgx-server --revoke ID|NAME`
   removes entries. A watcher in the running server reloads the registry every
   second and closes the secure stream of any active client whose ID vanished.
@@ -226,7 +233,7 @@ Manual check on the VM:
 # guest
 LGX_VAENC=$PWD/lgx-vaenc lgx-server --listen 0.0.0.0:5902
 # host
-lgx-client --connect 192.168.122.25:5902
+lgx-client archlinux
 ./scripts/fake-server.py ...
 ```
 

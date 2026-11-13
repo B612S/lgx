@@ -63,9 +63,6 @@ Both sides use sectioned INI files:
 `~/.config/lgx/client.conf`:
 
 ```ini
-[network]
-server = 192.168.122.25:5902
-
 [video]
 width = 1920
 height = 1080
@@ -76,24 +73,18 @@ cursor = remote
 
 [audio]
 enabled = true
-connect =
 
-[client1]
-token = <token>
+[archlinux]
 server = 192.168.122.25:5902
-client_id = <id>
-
-[client2]
 token = <token>
-server = 10.0.0.5:5902
-client_id = <id>
 ```
 
-Run an instance with `lgx-client client1`; without a name the `default`
-section is used. `[network]`/`[video]`/`[audio]` are shared; a named section
-can override `server` and stores its own token and client id. The file
-contains secrets and is written `0600`. Old `client.conf` + `token` files are
-migrated into `[default]` on first load.
+Run an instance with `lgx-client archlinux`; the section name is also the
+public client ID. `[video]`/`[audio]` are shared; every client section has its
+own `server` and `token`. There is no `[network]`, no `[default]` and no
+migration. `[audio] connect` is an optional audio-port override; normally
+omit it, the port is derived from `server` as `host:5903`. The file contains
+tokens and is written `0600`.
 
 `~/.config/lgx/server.conf`:
 
@@ -188,7 +179,7 @@ lgx-server: HEVC ready (1920x1080@160, 40 Mbit/s, low_power=true, pitch 1920)
 Client, on the host:
 
 ```bash
-lgx-client --connect 192.168.122.25:5902
+lgx-client archlinux
 # --decoder auto|cuda|vaapi|software
 # --size 1920x1080
 # --cursor local|remote
@@ -201,19 +192,11 @@ Select a profile with `lgx-client <name>`.
 
 ### Client configuration
 
-```ini
-server = 192.168.122.25:5902
-width = 1920
-height = 1080
-fullscreen = false
-vsync = false
-audio = true           # raw 48 kHz stereo, 20 ms
-audio_connect = 192.168.122.25:5903
-decoder = auto          # auto, cuda, vaapi, software
-cursor = remote         # remote (streamed) or local (zero latency)
-```
-
-Command-line flags win over the file. Unknown keys survive a save round trip.
+Shared settings are `[video]` and `[audio]`; each `[name]` section has only
+`server` and `token`. `[audio] connect` is an optional override for the audio
+port (default: the server host on port 5903); leave it out unless the audio
+port is different. There is no `[network]`, no `[default]`, no `client_id` and
+no migration. Command-line flags win over the file.
 
 #### Text clipboard
 
@@ -235,21 +218,22 @@ Revocation removes the registry entry. The running server reloads the registry
 every second: an already-connected revoked client is disconnected immediately
 and new connections with that ID fail. Other clients are unaffected.
 
-An old single-line `~/.config/lgx/token` is moved into the `[default]` client
-section. On the server, the old global token is migrated into a `default`
-registry entry, so an existing client keeps working. Old clients that do not
-send an ID must be updated.
+The client config is not migrated: profiles are explicit `[name]` sections.
+The server registry still migrates an old global token into a `default`
+registry entry if one exists.
 
 ### Pairing a named client
 
 ```bash
-lgx-server --pair --pair-name client1
-lgx-client client1 --pair 192.168.122.25:5904 --pair-code CODE
-lgx-client client1
+lgx-server --pair --pair-name archlinux
+lgx-client archlinux --pair 192.168.122.25:5904 --pair-code CODE
+lgx-client archlinux
 ```
 
-The pairing result is written as `[client1]` in `client.conf` (token, server
-and client_id); the profile is then launched with `lgx-client client1`.
+The server uses `--pair-name` as the public client ID; the client writes
+`[archlinux]` with `server` and the new 256-bit `token`. There is no
+`client_id` field to keep in sync. Without `--pair-name` the server generates
+a random ID, which cannot be launched as a named profile.
 
 ### Token protection at rest
 
@@ -257,7 +241,7 @@ New pairings issue 256-bit tokens. The server does not store them in plaintext:
 `~/.config/lgx/clients` contains AES-256-GCM ciphertext under a separate
 random `~/.config/lgx/master.key` (32 bytes, mode 0600). A leaked registry
 alone cannot be used without the master key; the client keeps its token in
-`~/.config/lgx/client.conf` under its named section (mode 0600), because it is
+its `[name]` section of `~/.config/lgx/client.conf` (mode 0600), because it is
 the shared PSK. Back up
 `master.key` with the registry: if it is lost, every client must be paired
 again. The source code alone cannot derive a token.
