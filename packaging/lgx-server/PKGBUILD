@@ -13,7 +13,10 @@ sha256sums=('SKIP')
 
 build() {
   cd "lgx-$pkgver"
-  cargo build --release --locked
+  # ring ships its own C/asm; Arch's hardening CFLAGS break its static
+  # library link order. Use the crate's own flags for this Rust-only build.
+  unset CFLAGS CXXFLAGS LDFLAGS
+  cargo build --release --locked -p lgx-server
   gcc -O2 -o lgx-uinput helper/lgx-uinput.c
   gcc -O2 -o lgx-vaenc helper/lgx-vaenc.c -lavcodec -lavutil -lva -lva-drm
 }
