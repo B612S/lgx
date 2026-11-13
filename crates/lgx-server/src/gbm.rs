@@ -91,19 +91,27 @@ pub fn create_raw(width: u32, height: u32, format: u32, flags: u32) -> io::Resul
     Ok((dev, bo))
 }
 
-pub fn plane_count(bo: *mut c_void) -> i32 {
+/// # Safety
+/// `bo` must be a valid GBM buffer object.
+pub unsafe fn plane_count(bo: *mut c_void) -> i32 {
     unsafe { gbm_bo_get_plane_count(bo) }
 }
 
-pub fn plane_fd(bo: *mut c_void, plane: i32) -> i32 {
+/// # Safety
+/// `bo` must be a valid GBM buffer object.
+pub unsafe fn plane_fd(bo: *mut c_void, plane: i32) -> i32 {
     unsafe { gbm_bo_get_fd_for_plane(bo, plane) }
 }
 
-pub fn plane_offset(bo: *mut c_void, plane: i32) -> u32 {
+/// # Safety
+/// `bo` must be a valid GBM buffer object.
+pub unsafe fn plane_offset(bo: *mut c_void, plane: i32) -> u32 {
     unsafe { gbm_bo_get_offset(bo, plane) }
 }
 
-pub fn plane_stride(bo: *mut c_void, plane: i32) -> u32 {
+/// # Safety
+/// `bo` must be a valid GBM buffer object.
+pub unsafe fn plane_stride(bo: *mut c_void, plane: i32) -> u32 {
     unsafe { gbm_bo_get_stride_for_plane(bo, plane) }
 }
 

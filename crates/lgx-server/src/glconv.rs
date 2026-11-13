@@ -166,7 +166,9 @@ pub struct GlConv {
 }
 
 impl GlConv {
-    pub fn new(gbm_dev: *mut c_void) -> Option<Self> {
+    /// # Safety
+    /// `gbm_dev` must be a live GBM device for the lifetime of the context.
+    pub unsafe fn new(gbm_dev: *mut c_void) -> Option<Self> {
         unsafe {
             let get_platform: unsafe extern "C" fn(u32, *mut c_void, *const i32) -> Display =
                 std::mem::transmute(eglGetProcAddress(CString::new("eglGetPlatformDisplayEXT").ok()?.as_ptr()));

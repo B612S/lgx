@@ -35,14 +35,11 @@ the header and its length is in `a`.
 | 21 | CLIP_DATA_HTML | `a` = length | rich text |
 | 13 | CURSOR | `code` = 1 overlay the guest pointer, 0 draw locally | — |
 | 14 | PING | — | — |
-| 15 | FILE_BEGIN | `a` = length | file offer |
-| 16 | FILE_DATA | `a` = length | sequential file bytes |
-| 17 | FILE_END | — | — |
 | 18 | GAMEPAD | `a` = 24 | one gamepad snapshot |
 
 ## Handshake
 
-1. Client sends `AUTH` with the shared token.
+1. Client sends its public client ID, then `AUTH` with that client's token (the PSK).
 2. Server verifies it and sends `HELLO` (codec, width, height) before
    registering the client for video.
 3. Client may send `KEYMAP` and `CURSOR`.

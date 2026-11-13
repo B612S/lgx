@@ -8,8 +8,9 @@
 //!   id<TAB>name<TAB>token<TAB>created-unix
 
 use std::collections::HashSet;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -75,9 +76,30 @@ fn parse(text: &str) -> Vec<Entry> {
     out
 }
 
+fn lock() -> io::Result<File> {
+    let p = path().with_extension("lock");
+    if let Some(dir) = p.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let f = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&p)?;
+    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(f)
+}
+
 pub fn load() -> io::Result<Vec<Entry>> {
     match fs::read_to_string(path()) {
-        Ok(text) => Ok(parse(&text)),
+        Ok(text) => {
+            let _ = fs::set_permissions(path(), fs::Permissions::from_mode(0o600));
+            Ok(parse(&text))
+        }
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(e) => Err(e),
     }
@@ -94,6 +116,7 @@ pub fn save(entries: &[Entry]) -> io::Result<()> {
         .write(true)
         .truncate(true)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(&tmp)?;
     writeln!(f, "# lgx clients: id\tname\ttoken\tcreated")?;
     let mut sorted: Vec<_> = entries.to_vec();
@@ -109,12 +132,18 @@ pub fn save(entries: &[Entry]) -> io::Result<()> {
     fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
     fs::rename(&tmp, &p)?;
     fs::set_permissions(&p, fs::Permissions::from_mode(0o600))?;
+    if let Some(dir) = p.parent() {
+        if let Ok(d) = File::open(dir) {
+            let _ = d.sync_all();
+        }
+    }
     Ok(())
 }
 
 /// Seed the registry on first use. A pre-registry install has one global
 /// token; keep it as the `default` client so existing clients still work.
 pub fn ensure() -> io::Result<()> {
+    let _guard = lock()?;
     if path().exists() {
         return Ok(());
     }
@@ -141,6 +170,7 @@ pub fn ensure() -> io::Result<()> {
 }
 
 pub fn set_default(token: &str) -> io::Result<()> {
+    let _guard = lock()?;
     let mut list = load()?;
     list.retain(|e| e.id != DEFAULT_ID);
     list.push(Entry {
@@ -157,6 +187,7 @@ pub fn token_for(id: &str) -> io::Result<Option<String>> {
 }
 
 pub fn add(entry: Entry) -> io::Result<()> {
+    let _guard = lock()?;
     let mut list = load()?;
     list.retain(|e| e.id != entry.id);
     list.push(entry);
@@ -164,6 +195,7 @@ pub fn add(entry: Entry) -> io::Result<()> {
 }
 
 pub fn revoke(key: &str) -> io::Result<usize> {
+    let _guard = lock()?;
     let mut list = load()?;
     let before = list.len();
     list.retain(|e| e.id != key && e.name != key);

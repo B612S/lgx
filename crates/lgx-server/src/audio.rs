@@ -3,6 +3,7 @@
 //! The guest records the monitor of its default sink with `pw-cat` (raw
 //! s16le, 48 kHz, stereo) and streams the samples to every connected client.
 
+use std::collections::HashSet;
 use std::io::{self, Read};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Command, Stdio};
@@ -10,7 +11,7 @@ use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use lgx_proto::secure;
+use lgx_proto::secure::{self, Secure};
 
 use crate::clients;
 
@@ -18,7 +19,9 @@ pub const RATE: u32 = 48_000;
 pub const CHANNELS: u32 = 2;
 
 struct Client {
+    id: String,
     tx: SyncSender<Vec<u8>>,
+    secure: Arc<Secure>,
 }
 
 pub fn serve(addr: &str) -> io::Result<()> {
@@ -71,8 +74,36 @@ pub fn serve(addr: &str) -> io::Result<()> {
     let listener = TcpListener::bind(addr)?;
     eprintln!("lgx-server: audio on {addr}");
     let _keep_child = child;
+
+    // Revocation must also stop audio for an already-connected client.
+    {
+        let clients = clients.clone();
+        std::thread::Builder::new()
+            .name("lgx-audio-revoke".into())
+            .spawn(move || loop {
+                std::thread::sleep(Duration::from_secs(1));
+                let Ok(list) = crate::clients::load() else { continue };
+                let valid: HashSet<String> = list.into_iter().map(|e| e.id).collect();
+                let mut clients = clients.lock().unwrap();
+                clients.retain(|c| {
+                    if valid.contains(&c.id) {
+                        true
+                    } else {
+                        eprintln!("lgx-server: revoking audio client {}", c.id);
+                        c.secure.close();
+                        false
+                    }
+                });
+            })
+            .ok();
+    }
+
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
+        if clients.lock().unwrap().len() >= 8 {
+            eprintln!("lgx-server: audio: too many clients");
+            continue;
+        }
         let clients = clients.clone();
         std::thread::Builder::new()
             .name("lgx-audio-client".into())
@@ -108,7 +139,11 @@ fn handle(
     }
 
     let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(16);
-    clients.lock().unwrap().push(Client { tx });
+    clients.lock().unwrap().push(Client {
+        id: client_id,
+        tx,
+        secure: secure.clone(),
+    });
     while let Ok(chunk) = rx.recv() {
         if secure.send_bytes(&chunk).is_err() {
             break;

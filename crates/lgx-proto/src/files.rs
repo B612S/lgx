@@ -396,7 +396,7 @@ mod tests {
     #[test]
     fn uri_roundtrip() {
         let p = PathBuf::from("/tmp/a b/файл.txt");
-        let list = uri_list(&[p.clone()]);
+        let list = uri_list(std::slice::from_ref(&p));
         assert!(list.starts_with("file:///tmp/a%20b/"));
         assert_eq!(parse_uri_list(&list), vec![p]);
     }

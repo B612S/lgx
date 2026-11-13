@@ -121,7 +121,9 @@ the Vulkan shader converts full-range BT.709, and the HEVC VUI says
 ## Input and clipboard
 
 - Input goes through the root `lgx-uinput` helper (uinput devices) over
-  `/run/lgx-input.sock`; the Wayland virtual keyboard remains a fallback.
+  `/run/lgx-input.sock`. The helper chowns the socket to `LGX_INPUT_UID`
+  (default 1000) with mode 0600, checks `SO_PEERCRED`, and writes the gamepad
+  marker 0644. Never make this socket world-writable; it injects input.
 - Gamepads are forwarded as 24-byte `GAMEPAD` state snapshots (slot, buttons
   bitmask, six i16 axes, two hat bytes). The helper creates up to four
   `lgx virtual gamepad N` devices lazily and emits only changed buttons/axes.
@@ -254,14 +256,12 @@ driver. The server needs libva headers for the helper.
 12. `VkSurfaceKHR` comes from SDL; the sdl3 crate must be built with its `ash`
     feature so the surface types match the `ash` crate. Do not mix a raw
     `u64` surface with `ash` handles.
-13. `text/uri-list` lines end in CRLF; strip `\r` before using a path in shell
-    tests. The Rust parser already does.
-14. `vkAcquireNextImageKHR` with `UINT64_MAX` freezes the whole client during
+13. `vkAcquireNextImageKHR` with `UINT64_MAX` freezes the whole client during
     a Wayland fullscreen/resize transition. Never wait forever there. Reset
     the in-flight fence only after a successful acquire, and recreate the
     frame semaphores when the swapchain is recreated.
-15. The secure layer is mandatory. An old client without the client-ID
+14. The secure layer is mandatory. An old client without the client-ID
     preface fails the handshake; update client and server together. Each
     client's registry token is its PSK; the token itself is never transmitted.
-16. Revocation only works if `clients` stays the source of truth and the
+15. Revocation only works if `clients` stays the source of truth and the
     running server keeps watching it. Do not cache a token list at startup.

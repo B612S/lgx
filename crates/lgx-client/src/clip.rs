@@ -1,23 +1,19 @@
 //! Host clipboard through wl-clipboard, including file lists.
 
 use std::io::{self, Write};
-use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-use lgx_proto::files;
 
 #[derive(Clone, Debug)]
 pub enum Clip {
     Text(String),
     Rich { html: String, text: String },
-    Files(Vec<PathBuf>),
 }
 
 pub fn signature(c: &Clip) -> String {
     match c {
         Clip::Text(t) => format!("t:{t}"),
         Clip::Rich { html, text } => format!("h:{html}{text}"),
-        Clip::Files(p) => files::signature(p),
     }
 }
 
@@ -53,20 +49,6 @@ pub fn set_rich(html: &str, text: &str) -> io::Result<()> {
         .map_err(|e| io::Error::other(format!("wl-copy rich: {e}")))
 }
 
-pub fn set_files(paths: &[PathBuf]) -> io::Result<()> {
-    let list = files::uri_list(paths);
-    let mut child = Command::new("wl-copy")
-        .args(["--type", "text/uri-list"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(list.as_bytes())?;
-    }
-    child.wait()?;
-    Ok(())
-}
 
 pub fn get() -> io::Result<Clip> {
     let types = Command::new("wl-paste")
@@ -89,15 +71,9 @@ pub fn get() -> io::Result<Clip> {
             return Ok(Clip::Rich { html, text });
         }
     }
+    // File clipboard is intentionally not synchronized.
     if types.lines().any(|t| t.trim() == "text/uri-list") {
-        let out = Command::new("wl-paste")
-            .args(["--type", "text/uri-list", "--no-newline"])
-            .stderr(Stdio::null())
-            .output()?;
-        let list = files::parse_uri_list(&String::from_utf8_lossy(&out.stdout));
-        if !list.is_empty() {
-            return Ok(Clip::Files(list));
-        }
+        return Ok(Clip::Text(String::new()));
     }
     let out = Command::new("wl-paste")
         .arg("--no-newline")

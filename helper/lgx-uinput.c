@@ -21,8 +21,17 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 #include <sys/un.h>
 #include <unistd.h>
+
+/* Only this UID (and root) may talk to the root helper. The server runs as
+ * this user; override with LGX_INPUT_UID for a different desktop UID. */
+static uid_t allowed_uid(void) {
+    const char *s = getenv("LGX_INPUT_UID");
+    if (s && *s) return (uid_t)strtoul(s, NULL, 10);
+    return (uid_t)1000;
+}
 
 static int emit(int fd, int type, int code, int32_t value) {
     struct input_event ev = {0};
@@ -179,8 +188,8 @@ int main(int argc, char **argv) {
     for (int i = 0; i < MAX_PADS; i++) pads[i] = -1;
     /* Capability marker: the server only sends gamepad packets to a helper
      * that understands them. Remove it again on exit. */
-    int cap = open("/run/lgx-input.gamepad", O_CREAT | O_WRONLY | O_TRUNC, 0666);
-    if (cap >= 0) { write(cap, "1", 1); close(cap); }
+    int cap = open("/run/lgx-input.gamepad", O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    if (cap >= 0) { write(cap, "1", 1); close(cap); chmod("/run/lgx-input.gamepad", 0644); }
     uint32_t last_buttons[MAX_PADS] = {0};
     int16_t last_axes[MAX_PADS][6] = {{0}};
     int8_t last_hat[MAX_PADS][2] = {{0}};
@@ -192,12 +201,21 @@ int main(int argc, char **argv) {
     addr.sun_family = AF_UNIX;
     snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path);
     if (bind(lsock, (struct sockaddr *)&addr, sizeof(addr)) < 0) { perror("bind"); return 1; }
-    chmod(path, 0666);
+    if (chown(path, allowed_uid(), (gid_t)-1) < 0) perror("chown");
+    if (chmod(path, 0600) < 0) perror("chmod");
     listen(lsock, 4);
 
     for (;;) {
         int c = accept(lsock, NULL, NULL);
         if (c < 0) { if (errno == EINTR) continue; break; }
+        struct ucred cred;
+        socklen_t clen = sizeof(cred);
+        if (getsockopt(c, SOL_SOCKET, SO_PEERCRED, &cred, &clen) < 0
+            || (cred.uid != 0 && cred.uid != allowed_uid())) {
+            fprintf(stderr, "uinput: rejected peer uid=%u\n", (unsigned)cred.uid);
+            close(c);
+            continue;
+        }
         fprintf(stderr, "uinput: client connected\n");
         for (;;) {
             char cmd;

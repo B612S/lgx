@@ -48,8 +48,8 @@ it encodes at 160 fps; `--fps` is only an override, not the default.
 - Only the newest decoded frame is kept, so a slow window never builds a
   queue of stale frames.
 - Input through kernel-level `uinput` (every key and compositor shortcut),
-  absolute pointer, **gamepads** (up to four, hot-plugged), clipboard (text,
-  files and directories in both directions), and low-latency raw audio
+  absolute pointer, **gamepads** (up to four, hot-plugged), rich-text
+  clipboard, and low-latency raw audio
   (48 kHz stereo, captured from the default sink monitor and played on the
   host).
 - The window title is just `lgx — <server IP>`; FPS/bandwidth stay in the
@@ -239,7 +239,7 @@ and press Ctrl+V on the other. File clipboard contents are ignored. There is
 no paste injection and no transfer hotkey. F9/F10/F11/F12 are ordinary keys
 for the guest.
 
-All traffic — video, input, clipboard, files and audio — is inside AES-256-GCM
+All traffic — video, input, clipboard and audio — is inside AES-256-GCM
 records; pairing uses the same channel with a one-time code. Each client has
 its own token, so a revoked client does not affect the others. AES-NI makes the cost negligible at the stream's few MB/s; only
 record sizes are visible to a passive observer, never HEVC frames or tokens.
@@ -269,13 +269,9 @@ encoder, is now the limit.
 
 - wlroots compositors only (wlr-screencopy).
 - HEVC only, 8-bit, one output, no HDR.
-- No encryption; use a trusted network or an SSH tunnel.
 - Audio is raw PCM (no Opus): ~187 KiB/s.
 - The Vulkan path currently uploads NV12; a Vulkan dma-buf import path is the
   next optimization. Decoding is still hardware (CUDA/NVDEC or VAAPI).
-- File-clipboard transfers use the control TCP connection and share its
-  bandwidth with video; files are cached under `~/.cache/lgx/clipboard/` and
-  are not removed automatically.
 - KMS capture is not supported: without DRM master `GETFB2` returns zero
   handles, so the compositor keeps the wlr-screencopy path. VPP already moves
   the conversion off the 3D engine.

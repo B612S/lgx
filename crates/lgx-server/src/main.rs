@@ -241,7 +241,7 @@ impl Stream {
                     .map_err(|e| format!("cannot allocate the NV12 target: {e}"))?;
             target = Some(FdGuard(y_fd));
             let g = cap.last_gbm().ok_or("no GBM device for GL conversion")?;
-            let c = glconv::GlConv::new(g.device()).ok_or("GL conversion is unavailable")?;
+            let c = unsafe { glconv::GlConv::new(g.device()) }.ok_or("GL conversion is unavailable")?;
             let mut e = vaenc::VaEnc::start_import(
                 "/tmp/lgx-vaenc.sock",
                 &helper,

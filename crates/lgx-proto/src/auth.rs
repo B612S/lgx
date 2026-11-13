@@ -19,9 +19,17 @@ pub struct Credentials {
     pub token: String,
 }
 
+fn harden() {
+    let path = config_path();
+    if path.exists() {
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+}
+
 /// Client credentials. One line is the legacy global token (`default`);
 /// two lines are `<id>` and `<token>`.
 pub fn load_credentials() -> Option<Credentials> {
+    harden();
     let text = std::fs::read_to_string(config_path()).ok()?;
     let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
     let first = lines.next()?.to_string();
@@ -65,6 +73,7 @@ fn save_two(id: &str, token: &str) -> io::Result<()> {
 }
 
 pub fn load() -> Option<String> {
+    harden();
     std::fs::read_to_string(config_path())
         .ok()
         .map(|s| s.trim().to_string())
@@ -88,19 +97,14 @@ pub fn save(token: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// 32 hex characters from /dev/urandom.
+/// 16 random bytes from the OS CSPRNG. Fail closed: a predictable token or
+/// pairing code is worse than refusing to start.
 pub fn generate() -> String {
-    use std::io::Read;
+    use ring::rand::{SecureRandom, SystemRandom};
     let mut buf = [0u8; 16];
-    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-        let _ = f.read_exact(&mut buf);
-    } else {
-        let t = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        buf.copy_from_slice(&t.to_le_bytes());
-    }
+    SystemRandom::new()
+        .fill(&mut buf)
+        .expect("lgx: system CSPRNG unavailable");
     buf.iter().map(|b| format!("{b:02x}")).collect()
 }
 

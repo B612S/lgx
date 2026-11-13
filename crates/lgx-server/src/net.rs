@@ -8,13 +8,13 @@
 use std::collections::HashSet;
 use std::io;
 use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use lgx_proto::secure::{self, Secure};
-use lgx_proto::{codec, files, msg, Msg};
+use lgx_proto::{codec, msg, Msg};
 
 use crate::clients;
 use crate::clip;
@@ -45,7 +45,6 @@ struct Client {
     /// the previous client's encoder state are dropped for it.
     needs_idr: bool,
     secure: Arc<Secure>,
-    file_busy: Arc<AtomicBool>,
 }
 
 impl Hub {
@@ -161,55 +160,10 @@ impl Hub {
         });
     }
 
-    pub fn broadcast_files(&self, paths: &[PathBuf]) {
-        let list = self.clients.lock().unwrap();
-        for c in list.iter() {
-            if c.file_busy.swap(true, Ordering::Relaxed) {
-                continue;
-            }
-            let secure = c.secure.clone();
-            let busy = c.file_busy.clone();
-            let paths = paths.to_vec();
-            std::thread::spawn(move || {
-                if let Err(e) = send_files_chunked(&secure, &paths) {
-                    eprintln!("lgx-server: file send: {e}");
-                }
-                busy.store(false, Ordering::Relaxed);
-            });
-        }
-    }
 }
 
 /// Streams a file clipboard to one client, locking the socket per message so
 /// video packets interleave instead of freezing for the whole transfer.
-fn send_files_chunked(secure: &Arc<Secure>, paths: &[PathBuf]) -> io::Result<()> {
-    let local = files::collect(paths)?;
-    if local.is_empty() {
-        return Ok(());
-    }
-    let entries: Vec<_> = local.iter().map(|e| e.entry.clone()).collect();
-    let offer = files::encode_offer(&entries);
-    secure.send_msg(
-        Msg::new(msg::FILE_BEGIN, 0, offer.len() as i32, 0),
-        &offer,
-    )?;
-    let mut total = 0u64;
-    for e in &local {
-        if e.entry.kind == files::KIND_FILE {
-            total += e.entry.size;
-            files::stream_file(&e.source, &mut |chunk| {
-                secure.send_msg(Msg::new(msg::FILE_DATA, 0, chunk.len() as i32, 0), chunk)
-            })?;
-        }
-    }
-    secure.send_msg(Msg::new(msg::FILE_END, 0, 0, 0), &[])?;
-    eprintln!(
-        "lgx-server: sent {} file(s), {} KiB",
-        entries.iter().filter(|e| e.kind == files::KIND_FILE).count(),
-        total / 1024
-    );
-    Ok(())
-}
 
 pub fn listen(
     addr: &str,
@@ -218,10 +172,17 @@ pub fn listen(
     clip_set: Arc<dyn Fn(&str) + Send + Sync>,
     last_remote: Arc<Mutex<String>>,
 ) -> io::Result<()> {
+    const MAX_CLIENTS: usize = 8;
+    let active = Arc::new(AtomicUsize::new(0));
     let listener = TcpListener::bind(addr)?;
     eprintln!("lgx-server: listening on {addr} (HEVC)");
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
+        if active.load(Ordering::Relaxed) >= MAX_CLIENTS {
+            eprintln!("lgx-server: too many clients, rejecting");
+            continue;
+        }
+        active.fetch_add(1, Ordering::Relaxed);
         let id = hub.next_id.fetch_add(1, Ordering::Relaxed);
         eprintln!("lgx-server: client #{id}: {:?}", stream.peer_addr());
         let _ = stream.set_nodelay(true);
@@ -229,6 +190,7 @@ pub fn listen(
         let input2 = input.clone();
         let clip2 = clip_set.clone();
         let remote2 = last_remote.clone();
+        let active2 = active.clone();
         std::thread::Builder::new()
             .name(format!("lgx-client-{id}"))
             .spawn(move || {
@@ -236,6 +198,7 @@ pub fn listen(
                     eprintln!("lgx-server: client #{id}: {e}");
                 }
                 eprintln!("lgx-server: client #{id} disconnected");
+                active2.fetch_sub(1, Ordering::Relaxed);
             })
             .ok();
     }
@@ -275,7 +238,9 @@ fn handle(
             return Ok(());
         }
     };
+    secure.set_read_timeout(Some(Duration::from_secs(5)))?;
     let (m, payload) = secure.recv_msg()?;
+    secure.set_read_timeout(None)?;
     let ok = m.typ == msg::AUTH
         && lgx_proto::auth::eq(String::from_utf8_lossy(&payload).trim(), &token);
     if !ok {
@@ -293,14 +258,12 @@ fn handle(
     }
 
     let (tx, rx) = std::sync::mpsc::sync_channel::<Out>(2);
-    let file_busy = Arc::new(AtomicBool::new(false));
     hub.clients.lock().unwrap().push(Client {
         id,
         client: client_id,
         tx: tx.clone(),
         needs_idr: true,
         secure: secure.clone(),
-        file_busy: file_busy.clone(),
     });
     hub.request_keyframe();
 
@@ -335,7 +298,6 @@ fn handle(
             }
         })?;
 
-    let mut file_recv: Option<files::Receiver> = None;
     loop {
         let (m, payload) = match secure.recv_msg() {
             Ok(v) => v,
@@ -397,39 +359,8 @@ fn handle(
                     }
                 }
             }
-            msg::FILE_BEGIN => match files::decode_offer(&payload) {
-                Some(entries) => {
-                    eprintln!("lgx-server: incoming file clipboard: {} entries", entries.len());
-                    file_recv = files::Receiver::begin(entries).ok();
-                }
-                None => eprintln!("lgx-server: malformed file offer"),
-            },
-            msg::FILE_DATA => {
-                if let Some(r) = file_recv.as_mut() {
-                    if let Err(e) = r.data(&payload) {
-                        eprintln!("lgx-server: file receive: {e}");
-                        file_recv = None;
-                    }
-                }
-            }
-            msg::FILE_END => {
-                if let Some(mut r) = file_recv.take() {
-                    match r.finish() {
-                        Ok(paths) if !paths.is_empty() => {
-                            *last_remote.lock().unwrap() = files::signature(&paths);
-                            if let Err(e) = crate::clip::set_files(&paths) {
-                                eprintln!("lgx-server: wl-copy files: {e}");
-                            } else {
-                                eprintln!(
-                                    "lgx-server: file clipboard ready ({} item(s))",
-                                    paths.len()
-                                );
-                            }
-                        }
-                        Ok(_) => eprintln!("lgx-server: empty file transfer"),
-                        Err(e) => eprintln!("lgx-server: file receive: {e}"),
-                    }
-                }
+            msg::FILE_BEGIN | msg::FILE_DATA | msg::FILE_END => {
+                eprintln!("lgx-server: ignoring file clipboard (text only)");
             }
             msg::GAMEPAD => {
                 if payload.len() >= msg::GAMEPAD_LEN {

@@ -23,7 +23,7 @@ pub fn run(addr: &str, code: &str) -> io::Result<()> {
     let (id, token) = (id.trim(), token.trim());
     if id.is_empty()
         || id.len() > 128
-        || id.bytes().any(|b| b < 0x21 || b > 0x7e)
+        || id.bytes().any(|b| !(0x21..=0x7e).contains(&b))
         || token.len() < 16
         || token.len() > 256
         || !token.bytes().all(|b| b.is_ascii_hexdigit())

@@ -9,6 +9,7 @@ use std::fs::{File, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::io;
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 
 pub struct InstanceLock {
@@ -31,6 +32,8 @@ pub fn acquire(host: &str) -> io::Result<Option<InstanceLock>> {
         .create(true)
         .read(true)
         .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(&path)?;
     let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if rc == 0 {

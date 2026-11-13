@@ -177,7 +177,7 @@ impl Secure {
                     &mut ct,
                 )
                 .map_err(|_| crypto_err())?;
-            st.nonce = st.nonce.checked_add(1).ok_or_else(|| crypto_err())?;
+            st.nonce = st.nonce.checked_add(1).ok_or_else(crypto_err)?;
             st.stream.write_all(&(ct.len() as u32).to_le_bytes())?;
             st.stream.write_all(&ct)?;
         }
@@ -228,7 +228,7 @@ impl Secure {
                 return Err(io::Error::other("bad secure record length"));
             }
             out.extend_from_slice(pt);
-            st.nonce = st.nonce.checked_add(1).ok_or_else(|| crypto_err())?;
+            st.nonce = st.nonce.checked_add(1).ok_or_else(crypto_err)?;
             idx += 1;
         }
         Ok(out)
@@ -266,6 +266,16 @@ impl Secure {
     pub fn close(&self) {
         let _ = self.shutdown.shutdown(std::net::Shutdown::Both);
     }
+
+    /// Set a timeout on the receive half. Used before the first AUTH/HELLO so
+    /// a peer cannot hold a server thread without sending anything.
+    pub fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        let st = self
+            .recv
+            .lock()
+            .map_err(|_| io::Error::other("secure recv lock"))?;
+        st.stream.set_read_timeout(timeout)
+    }
 }
 
 fn start_handshake(stream: &TcpStream) -> io::Result<()> {
@@ -278,7 +288,7 @@ fn start_handshake(stream: &TcpStream) -> io::Result<()> {
 /// Send the public client id before the encrypted handshake. The id is not
 /// secret; it selects the per-client token in the server registry.
 pub fn client_handshake_id(mut stream: TcpStream, id: &str, token: &str) -> io::Result<Secure> {
-    if id.is_empty() || id.len() > 128 || id.bytes().any(|b| b < 0x21 || b > 0x7e) {
+    if id.is_empty() || id.len() > 128 || id.bytes().any(|b| !(0x21..=0x7e).contains(&b)) {
         return Err(io::Error::other("bad client id"));
     }
     stream.set_nodelay(true)?;
@@ -291,7 +301,7 @@ pub fn server_read_id(stream: &mut TcpStream) -> io::Result<String> {
     stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
     let data = recv_frame(stream)?;
     let id = String::from_utf8(data).map_err(|_| io::Error::other("bad client id"))?;
-    if id.is_empty() || id.len() > 128 || id.bytes().any(|b| b < 0x21 || b > 0x7e) {
+    if id.is_empty() || id.len() > 128 || id.bytes().any(|b| !(0x21..=0x7e).contains(&b)) {
         return Err(io::Error::other("bad client id"));
     }
     Ok(id)
