@@ -182,7 +182,7 @@ the Vulkan shader converts full-range BT.709, and the HEVC VUI says
 - The token is both the auth secret and the transport PSK. Keep the registry
   and client credential files 0600.
 
-## Transport## Transport
+## Transport
 
 - **No plaintext TCP.** Both the main port and the audio port start with a
   public client-ID frame followed by an `LGX1` handshake: ephemeral X25519, two random 32-byte nonces, and the auth
@@ -264,7 +264,8 @@ driver. The server needs libva headers for the helper.
     a Wayland fullscreen/resize transition. Never wait forever there. Reset
     the in-flight fence only after a successful acquire, and recreate the
     frame semaphores when the swapchain is recreated.
-15. The secure layer is mandatory. An old plaintext client fails the `LGX1`
-    handshake and is disconnected; update client and server together. The auth
-    token is the PSK and is never transmitted, so it must be identical on both
-    sides.
+15. The secure layer is mandatory. An old client without the client-ID
+    preface fails the handshake; update client and server together. Each
+    client's registry token is its PSK; the token itself is never transmitted.
+16. Revocation only works if `clients` stays the source of truth and the
+    running server keeps watching it. Do not cache a token list at startup.
