@@ -198,46 +198,12 @@ cursor = remote         # remote (streamed) or local (zero latency)
 
 Command-line flags win over the file. Unknown keys survive a save round trip.
 
-#### File clipboard
+#### Text clipboard
 
-Copying files or directories on either side puts `text/uri-list` on the
-clipboard. The peer receives them into `~/.cache/lgx/clipboard/<id>/` and sets
-its own `text/uri-list` to those paths, so a normal paste in Dolphin/Thunar
-copies them to the destination. Symlinks are skipped; paths are sanitised and
-transfers are chunked (64 KiB) and interleaved with video.
-
-Text is synchronised in both directions too. Nothing is pasted automatically:
-copy on one side, then press Ctrl+V in the target application on the other.
-
-## Pairing a new client
-
-A client cannot connect without credentials in `~/.config/lgx/token`. The
-server keeps a per-client registry at `~/.config/lgx/clients` (mode 0600):
-every pairing creates a random client ID and a random token. Run this **on the
-server** (locally or over SSH):
-
-```bash
-lgx-server --pair --pair-listen 0.0.0.0:5904 --pair-name laptop
-```
-
-It prints a random 32-hex one-time code and the client command. On the client:
-
-```bash
-lgx-client --pair 192.168.122.25:5904 --pair-code <code>
-```
-
-The pair listener uses the same X25519 + AES-256-GCM layer with the one-time
-code as the PSK. The new client ID and token are sent only inside that
-encrypted channel, after the code-authenticated handshake; the client stores
-them with mode 0600. The code is never sent over the network, is valid for
-three minutes, accepts one client and stops after five failed attempts. A
-client without the code cannot complete the handshake or obtain credentials; a
-fake server without the code cannot make a client save them. Pairing must be
-started locally on the server — there is no remote "pair me" endpoint.
-
-The client sends its public ID in a small plaintext preface before `LGX1`; the
-server looks up that ID in the registry and uses its token as the PSK. The ID
-is not a secret; the token is.
+Only **text** is synchronized automatically, with normal Ctrl+C / Ctrl+V in
+both directions. The client polls the host text clipboard and the server polls
+the guest text clipboard; signatures prevent echo loops. Files and directories
+are **not** synchronized at all, and there are no clipboard hotkeys.
 
 ### Revoking a client
 
@@ -264,17 +230,13 @@ is the server's LAN address.
 | key | action |
 |---|---|
 | Ctrl+Shift+Alt+F | toggle client fullscreen (never forwarded) |
-| Ctrl+Shift+Alt+V | copy host clipboard into the guest (then Ctrl+V there) |
-| Ctrl+Shift+Alt+C | copy guest clipboard to the host (then Ctrl+V there) |
 | Ctrl+Alt+Q | quit |
 | Ctrl+Alt+G | release/grab compositor shortcuts |
 
-Clipboard is **on demand**: copying text or files only changes the local
-clipboard. Press `Ctrl+Shift+Alt+V` to send the host clipboard to the guest, or
-`Ctrl+Shift+Alt+C` to fetch the guest clipboard to the host; then paste
-normally. Large file lists are transferred only for that explicit request.
-No automatic clipboard traffic or paste injection happens. F9/F10/F11/F12 are
-ordinary keys for the guest.
+Only text is synchronized automatically in both directions: copy on one side
+and press Ctrl+V on the other. File clipboard contents are ignored. There is
+no paste injection and no transfer hotkey. F9/F10/F11/F12 are ordinary keys
+for the guest.
 
 All traffic — video, input, clipboard, files and audio — is inside AES-256-GCM
 records; pairing uses the same channel with a one-time code. Each client has

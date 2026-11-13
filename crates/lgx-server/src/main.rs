@@ -541,6 +541,35 @@ fn main() {
             .ok();
     }
 
+    {
+        let hub = hub.clone();
+        let last_remote = last_remote.clone();
+        std::thread::Builder::new()
+            .name("lgx-clip-poll".into())
+            .spawn(move || {
+                // Do not push a pre-existing guest clipboard to a new client:
+                // the client sends its own host text first, and that wins.
+                let mut last_sent = match clip::get() {
+                    Ok(clip::Clip::Text(text)) if !text.is_empty() => text,
+                    _ => String::new(),
+                };
+                loop {
+                    std::thread::sleep(Duration::from_millis(300));
+                    let text = match clip::get() {
+                        Ok(clip::Clip::Text(text)) if !text.is_empty() => text,
+                        _ => continue,
+                    };
+                    if text == last_sent || text == *last_remote.lock().unwrap() {
+                        last_sent = text;
+                        continue;
+                    }
+                    hub.broadcast_clip(&text);
+                    last_sent = text;
+                }
+            })
+            .ok();
+    }
+
     let stream = match Stream::new(&args) {
         Ok(s) => s,
         Err(e) => {

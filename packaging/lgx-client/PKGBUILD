@@ -1,7 +1,7 @@
 # Maintainer: B612S
 pkgname=lgx-client
 pkgver=0.2.0
-pkgrel=17
+pkgrel=18
 pkgdesc='lgx: zero-copy HEVC client (NVDEC/VAAPI decode)'
 arch=('x86_64')
 url='https://github.com/B612S/lgx'

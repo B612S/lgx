@@ -17,7 +17,6 @@ use lgx_proto::secure::{self, Secure};
 use lgx_proto::{codec, files, msg, Msg};
 
 use crate::clients;
-use crate::clip;
 use crate::input::Cmd;
 
 enum Out {
@@ -368,26 +367,8 @@ fn handle(
             msg::CLIP_SET => {
                 if let Ok(text) = String::from_utf8(payload) {
                     clip_set(&text);
-                    let _ = secure.send_msg(Msg::new(msg::CLIP_ACK, 0, 0, 0), &[]);
                 }
             }
-            msg::CLIP_GET => match crate::clip::get() {
-                Ok(clip::Clip::Text(text)) if !text.is_empty() => {
-                    let _ = secure.send_msg(
-                        Msg::new(msg::CLIP_DATA, 0, text.len() as i32, 0),
-                        text.as_bytes(),
-                    );
-                }
-                Ok(clip::Clip::Files(paths)) => {
-                    let secure = secure.clone();
-                    std::thread::spawn(move || {
-                        if let Err(e) = send_files_chunked(&secure, &paths) {
-                            eprintln!("lgx-server: on-demand file clipboard: {e}");
-                        }
-                    });
-                }
-                _ => {}
-            },
             msg::FILE_BEGIN => match files::decode_offer(&payload) {
                 Some(entries) => {
                     eprintln!("lgx-server: incoming file clipboard: {} entries", entries.len());
@@ -415,7 +396,6 @@ fn handle(
                                     "lgx-server: file clipboard ready ({} item(s))",
                                     paths.len()
                                 );
-                                let _ = secure.send_msg(Msg::new(msg::CLIP_ACK, 0, 0, 0), &[]);
                             }
                         }
                         Ok(_) => eprintln!("lgx-server: empty file transfer"),

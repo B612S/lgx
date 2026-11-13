@@ -30,9 +30,7 @@ the header and its length is in `a`.
 | 8 | MODS | `a` = depressed, `b` = latched, `code` = locked, `flags` = group | — |
 | 9 | KEYMAP | `a` = length | xkb keymap |
 | 10 | CLIP_SET | `a` = length | text |
-| 11 | CLIP_GET | — | — |
 | 12 | CLIP_DATA | `a` = length | text |
-| 19 | CLIP_ACK | — | — |
 | 13 | CURSOR | `code` = 1 overlay the guest pointer, 0 draw locally | — |
 | 14 | PING | — | — |
 | 15 | FILE_BEGIN | `a` = length | file offer |
@@ -56,69 +54,13 @@ uses VAAPI HEVC Main, low-power VDENC, CBR and no B-frames. A keyframe request
 produces VPS/SPS/PPS/IDR; the encoder may return several access units for one
 frame, and each is sent as its own `VIDEO` message.
 
-## File clipboard
+## Clipboard
 
-`FILE_BEGIN` carries a compact offer:
-
-```
-u32 count
-per entry: u8 kind (0 = file, 1 = directory)
-           u32 path_len, path bytes (relative, '/'-separated)
-           u64 size (0 for directories)
-```
-
-`FILE_DATA` messages follow in entry order; each carries up to 64 KiB of the
-current file. Directories have no data. `FILE_END` closes the transfer. The
-receiver writes into `~/.cache/lgx/clipboard/<pid>-<stamp>/`, sanitises paths,
-and sets `text/uri-list` to the top-level received paths.
-
-## Gamepad
-
-`GAMEPAD` is a 24-byte snapshot:
-
-```
-u8  slot         0..3
-u8  connected
-u16 reserved
-u32 buttons      bit order: South, East, North, West, Back, Guide, Start,
-                 LeftStick, RightStick, LeftShoulder, RightShoulder,
-                 DPadUp, DPadDown, DPadLeft, DPadRight, Misc1..Misc5,
-                 RightPaddle1, LeftPaddle1, RightPaddle2, LeftPaddle2,
-                 Touchpad
-i16 lx, ly, rx, ry, lt, rt
-i8  hat_x, hat_y
-u8  reserved[2]
-```
-
-Sticks are -32768..32767; triggers 0..32767. The server forwards the snapshot
-to the root uinput helper, which applies only changed buttons/axes to a
-`lgx virtual gamepad`.
-
-## Encrypted transport
-
-Every TCP connection (video/control and audio) starts with `LGX1`:
-
-```
-client -> server: u32 len=68, "LGX1", X25519 public key (32), random (32)
-server -> client: u32 len=68, "LGX1", X25519 public key (32), random (32)
-```
-
-Both sides run X25519, then HKDF-SHA256 with the shared auth token as IKM and
-the two random values as salt. Directional 32-byte AES-256-GCM keys are
-derived. The token never appears on the wire.
-
-A record is:
-
-```
-u32 total_plaintext_len
-repeated:
-  u32 ciphertext_len
-  ciphertext (plaintext chunk <= 32 KiB + 16-byte tag)
-```
-
-The total length, chunk index and chunk length are authenticated as AEAD
-associated data. The 12-byte lgx message header and its payload are both
-inside the plaintext, so message types and HEVC frames are not visible.
+Only text is synchronized. Each side polls its local clipboard every 300 ms
+and sends only text: the client uses `CLIP_SET`, the server broadcasts
+`CLIP_DATA`. `last_remote`/`last_sent` signatures prevent echo loops. File
+clipboard contents are not synchronized, and there are no clipboard hotkeys
+or automatic pastes.
 
 ## Pairing and revocation
 

@@ -23,8 +23,6 @@ pub mod msg {
     pub const MODS: u8 = 8;
     pub const KEYMAP: u8 = 9;
     pub const CLIP_SET: u8 = 10;
-    /// Request the peer's current clipboard; no payload.
-    pub const CLIP_GET: u8 = 11;
     pub const CLIP_DATA: u8 = 12;
     /// `code` = 1 to overlay the guest pointer, 0 to draw it on the client.
     pub const CURSOR: u8 = 13;
@@ -37,8 +35,6 @@ pub mod msg {
     /// One gamepad state snapshot; see `GAMEPAD_LEN`.
     pub const GAMEPAD: u8 = 18;
     pub const GAMEPAD_LEN: usize = 24;
-    /// Clipboard content was installed on the peer; no payload.
-    pub const CLIP_ACK: u8 = 19;
 }
 
 pub mod codec {
