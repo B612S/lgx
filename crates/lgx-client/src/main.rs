@@ -566,6 +566,7 @@ fn main() {
     }
 
     let audio_focus = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let mute_unfocused = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(s.mute_unfocused));
     if s.audio {
         let addr = s
             .audio_connect
@@ -577,11 +578,11 @@ fn main() {
         let token = token.clone();
         let client_id = s.client_id.clone();
         let focus = audio_focus.clone();
-        let mute_unfocused = s.mute_unfocused;
+        let mute = mute_unfocused.clone();
         std::thread::Builder::new()
             .name("lgx-audio".into())
             .spawn(move || {
-                if let Err(e) = audio::run(&addr, &client_id, &token, mute_unfocused, focus) {
+                if let Err(e) = audio::run(&addr, &client_id, &token, mute, focus) {
                     eprintln!("lgx-client: audio: {e}");
                 }
             })
@@ -735,6 +736,7 @@ fn main() {
     let mut connection_lost = false;
     let mut redraw = true;
     let mut swallow_f_keyup = false;
+    let mut swallow_m_keyup = false;
     let mut fullscreen_hold: Option<(Instant, (u32, u32))> = None;
     let mut dst = vk::fit_rect(win_w, win_h, win_w, win_h);
     let mut config_saved = s.width.is_some() && s.height.is_some();
@@ -842,6 +844,37 @@ fn main() {
                     eprintln!("lgx-client: fullscreen toggled (Ctrl+Shift+Alt+F)");
                 }
                 Event::KeyDown {
+                    keycode: Some(sdl3::keyboard::Keycode::M),
+                    keymod,
+                    repeat,
+                    ..
+                } if !repeat
+                    && keymod
+                        .intersects(sdl3::keyboard::Mod::LCTRLMOD | sdl3::keyboard::Mod::RCTRLMOD)
+                    && keymod.intersects(
+                        sdl3::keyboard::Mod::LSHIFTMOD | sdl3::keyboard::Mod::RSHIFTMOD,
+                    )
+                    && keymod.intersects(
+                        sdl3::keyboard::Mod::LALTMOD | sdl3::keyboard::Mod::RALTMOD,
+                    ) =>
+                {
+                    let now_mute = !mute_unfocused.load(std::sync::atomic::Ordering::Relaxed);
+                    mute_unfocused.store(now_mute, std::sync::atomic::Ordering::Relaxed);
+                    let mut cfg = config::Config::load();
+                    cfg.set("mute_unfocused", now_mute);
+                    if let Err(e) = cfg.save() {
+                        eprintln!("lgx-client: cannot save mute_unfocused: {e}");
+                    }
+                    for code in [29u16, 42, 56, 97, 100, 54] {
+                        send_key(&conn, keyboard.as_mut(), code, false);
+                    }
+                    swallow_m_keyup = true;
+                    eprintln!(
+                        "lgx-client: background audio {} (Ctrl+Shift+Alt+M)",
+                        if now_mute { "disabled" } else { "enabled" }
+                    );
+                }
+                Event::KeyDown {
                     keycode: Some(sdl3::keyboard::Keycode::G),
                     keymod,
                     ..
@@ -905,6 +938,11 @@ fn main() {
                     if swallow_f_keyup =>
                 {
                     swallow_f_keyup = false;
+                }
+                Event::KeyUp { keycode: Some(sdl3::keyboard::Keycode::M), .. }
+                    if swallow_m_keyup =>
+                {
+                    swallow_m_keyup = false;
                 }
                 Event::KeyUp { scancode: Some(sc), .. } => {
                     if let Some(code) = hid::evdev_from_scancode((sc as i32) & 0x1ff) {

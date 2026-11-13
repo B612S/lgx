@@ -70,7 +70,7 @@ pub fn run(
     addr: &str,
     client_id: &str,
     token: &str,
-    mute_unfocused: bool,
+    mute_unfocused: Arc<AtomicBool>,
     focus: Arc<AtomicBool>,
 ) -> std::io::Result<()> {
     let stream = TcpStream::connect(addr)?;
@@ -86,8 +86,10 @@ pub fn run(
         if chunk.is_empty() {
             break;
         }
-        if mute_unfocused {
-            player.set_paused(!focus.load(Ordering::Relaxed));
+        if mute_unfocused.load(Ordering::Relaxed) && !focus.load(Ordering::Relaxed) {
+            player.set_paused(true);
+        } else {
+            player.set_paused(false);
         }
         if player.paused {
             // Keep draining the secure stream; do not let it back up while
