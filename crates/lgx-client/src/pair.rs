@@ -6,9 +6,9 @@
 use std::io;
 use std::net::TcpStream;
 
-use lgx_proto::{auth, secure};
+use lgx_proto::secure;
 
-pub fn run(addr: &str, code: &str) -> io::Result<()> {
+pub fn run(addr: &str, code: &str) -> io::Result<(String, String)> {
     if code.is_empty() {
         return Err(io::Error::other("--pair-code must not be empty"));
     }
@@ -30,12 +30,15 @@ pub fn run(addr: &str, code: &str) -> io::Result<()> {
     {
         return Err(io::Error::other("server returned invalid credentials"));
     }
-    auth::save_credentials(id, token)?;
     secure.send_bytes(b"ok")?;
     secure.close();
-    eprintln!(
-        "lgx-client: paired as {id}; credentials saved to {}",
-        auth::config_path().display()
-    );
-    Ok(())
+    Ok((id.to_string(), token.to_string()))
+}
+
+/// The normal video port is 5902; pairing uses the separate pair port.
+pub fn normal_server(addr: &str) -> String {
+    match addr.rsplit_once(':') {
+        Some((host, _)) => format!("{host}:5902"),
+        None => format!("{addr}:5902"),
+    }
 }

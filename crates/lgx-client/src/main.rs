@@ -27,6 +27,7 @@ use sdl3::event::Event;
 use dec::Backend;
 
 struct Args {
+    name: String,
     connect: Option<String>,
     no_window: bool,
     fullscreen: Option<bool>,
@@ -46,6 +47,7 @@ struct Args {
 }
 
 struct Settings {
+    name: String,
     server: String,
     width: Option<u32>,
     height: Option<u32>,
@@ -61,6 +63,7 @@ struct Settings {
 
 fn parse_args() -> Result<Args, String> {
     let mut a = Args {
+        name: config::DEFAULT_NAME.to_string(),
         connect: None,
         no_window: false,
         fullscreen: None,
@@ -78,6 +81,7 @@ fn parse_args() -> Result<Args, String> {
         pair: None,
         pair_code: None,
     };
+    let mut profile: Option<String> = None;
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -112,7 +116,8 @@ fn parse_args() -> Result<Args, String> {
             }
             "-h" | "--help" => {
                 println!(
-                    "lgx-client [--connect HOST:PORT] [--token T] [--size WxH]\n\
+                    "lgx-client [NAME] [--connect HOST:PORT] [--token T] [--size WxH]\n\
+                     \x20          NAME selects ~/.config/lgx/instances/NAME.conf\n\
                      \x20          [--decoder auto|cuda|vaapi|software]\n\
                      \x20          [--cursor local|remote] [--fullscreen|--windowed]\n\
                      \x20          [--vsync] [--audio] [--audio-connect ADDR]\n\
@@ -122,9 +127,19 @@ fn parse_args() -> Result<Args, String> {
                 );
                 std::process::exit(0);
             }
+            other if !other.starts_with('-') => {
+                if profile.is_some() {
+                    return Err("only one profile name may be given".into());
+                }
+                profile = Some(other.to_string());
+            }
             other => return Err(format!("unknown argument: {other}")),
         }
     }
+    if let Some(name) = profile {
+        a.name = name;
+    }
+    config::validate_name(&a.name).map_err(|e| e.to_string())?;
     Ok(a)
 }
 
@@ -221,32 +236,49 @@ fn main() {
                 std::process::exit(2);
             }
         };
-        if let Err(e) = pair::run(&addr, code) {
-            eprintln!("lgx-client: pairing with {addr} failed: {e}");
-            std::process::exit(1);
+        match pair::run(&addr, code) {
+            Ok((id, token)) => {
+                let mut cfg = config::Config::load_or_create();
+                cfg.set_instance(&args.name, "token", &token);
+                cfg.set_instance(&args.name, "client_id", &id);
+                cfg.set_instance(&args.name, "server", pair::normal_server(&addr));
+                if let Err(e) = cfg.save() {
+                    eprintln!("lgx-client: cannot save profile {}: {e}", args.name);
+                    std::process::exit(1);
+                }
+                eprintln!(
+                    "lgx-client: paired as {id}; saved [{}] in {}",
+                    args.name,
+                    config::path().display()
+                );
+            }
+            Err(e) => {
+                eprintln!("lgx-client: pairing with {addr} failed: {e}");
+                std::process::exit(1);
+            }
         }
         return;
     }
 
     let cfg = config::Config::load_or_create();
-    let creds = lgx_proto::auth::load_credentials();
     let token = args
         .token
         .clone()
         .or_else(|| std::env::var("LGX_TOKEN").ok())
-        .or_else(|| cfg.get("token").map(str::to_string))
-        .or_else(|| creds.as_ref().map(|c| c.token.clone()))
+        .or_else(|| cfg.instance_get(&args.name, "token").map(str::to_string))
         .unwrap_or_default();
     let client_id = args
         .client_id
         .clone()
-        .or_else(|| creds.as_ref().map(|c| c.id.clone()))
+        .or_else(|| cfg.instance_get(&args.name, "client_id").map(str::to_string))
         .unwrap_or_else(|| "default".to_string());
     let s = Settings {
+        name: args.name.clone(),
         server: args
             .connect
             .clone()
             .or_else(|| std::env::var("LGX_SERVER").ok())
+            .or_else(|| cfg.instance_get(&args.name, "server").map(str::to_string))
             .or_else(|| cfg.get("server").map(str::to_string))
             .unwrap_or_else(|| "127.0.0.1:5902".to_string()),
         width: args
@@ -284,8 +316,11 @@ fn main() {
             .unwrap_or(true),
     };
     if s.token.is_empty() {
-        eprintln!("lgx-client: no token for {}", s.server);
-        eprintln!("lgx-client: pair a client with --pair HOST:PAIRPORT --pair-code CODE");
+        eprintln!("lgx-client: no token in profile {} for {}", s.name, s.server);
+        eprintln!(
+            "lgx-client: pair with: lgx-client {} --pair HOST:PAIRPORT --pair-code CODE",
+            s.name
+        );
         std::process::exit(2);
     }
     let this_host = display_host(&s.server).to_string();
@@ -412,7 +447,7 @@ fn main() {
         .expect("window");
     let display_host = display_host(&s.server);
     window
-        .set_title(&format!("lgx — {display_host}"))
+        .set_title(&format!("lgx — {} — {display_host}", s.name))
         .ok();
     if std::env::var_os("LGX_DEBUG_FPS").is_some() {
         eprintln!("lgx-client: title {:?}", window.title());

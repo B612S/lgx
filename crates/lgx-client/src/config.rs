@@ -1,26 +1,33 @@
 //! Client configuration stored in `~/.config/lgx/client.conf`.
 //!
-//! Settings are grouped into sections:
+//! Global settings live in `[network]`, `[video]`, `[audio]`. Each named
+//! client instance is an additional section:
 //!
 //! ```ini
 //! [network]
 //! server = 192.168.122.25:5902
 //!
-//! [video]
-//! width = 1920
-//! height = 1080
-//! fullscreen = false
-//! vsync = false
+//! [client1]
+//! token = <token>
+//! server = 192.168.122.25:5902
+//! client_id = <id>
 //!
-//! [audio]
-//! enabled = true
+//! [client2]
+//! token = <token>
+//! server = 10.0.0.5:5902
+//! client_id = <id>
 //! ```
 //!
-//! Older flat files are migrated on load.
+//! `lgx-client client1` selects `[client1]`; no name inside the section is
+//! needed. The file contains secrets and is always written mode 0600.
 
 use std::collections::BTreeMap;
-use std::io;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
+
+pub const DEFAULT_NAME: &str = "default";
 
 pub fn path() -> PathBuf {
     let base = std::env::var_os("XDG_CONFIG_HOME")
@@ -30,13 +37,28 @@ pub fn path() -> PathBuf {
     base.join("lgx").join("client.conf")
 }
 
+pub fn validate_name(name: &str) -> io::Result<()> {
+    if name.is_empty()
+        || name.len() > 64
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+        || matches!(name, "network" | "video" | "audio" | "misc")
+    {
+        return Err(io::Error::other(
+            "instance name must be 1..64 chars of A-Z a-z 0-9 - _ . and not a reserved section",
+        ));
+    }
+    Ok(())
+}
+
 fn canonical(key: &str) -> String {
     let key = key.trim();
     if key.contains('.') {
         return key.to_string();
     }
     let (section, name) = match key {
-        "server" | "token" => ("network", key),
+        "server" | "token" | "client_id" => ("network", key),
         "width" | "height" | "fullscreen" | "vsync" | "decoder" | "cursor" => {
             ("video", key)
         }
@@ -58,7 +80,7 @@ impl Config {
         let mut values = BTreeMap::new();
         let mut section = String::new();
         let mut sectioned = false;
-        let existed = match std::fs::read_to_string(path()) {
+        let existed = match fs::read_to_string(path()) {
             Ok(text) => {
                 for line in text.lines() {
                     let line = line.trim();
@@ -91,27 +113,37 @@ impl Config {
         cfg
     }
 
-    /// Loads the client config, creating a sectioned default file when it is
-    /// missing. Existing files are never overwritten.
+    /// Loads the shared config, creates it, and migrates the old global token
+    /// file into the `[default]` instance once.
     pub fn load_or_create() -> Self {
-        let cfg = Self::load();
-        if cfg.existed {
-            return cfg;
+        let mut cfg = Self::load();
+        if !cfg.existed {
+            cfg.set("server", "192.168.122.25:5902");
+            cfg.set("width", 1920);
+            cfg.set("height", 1080);
+            cfg.set("fullscreen", "false");
+            cfg.set("vsync", "false");
+            cfg.set("decoder", "auto");
+            cfg.set("cursor", "remote");
+            cfg.set("audio", "true");
+            cfg.set("audio_connect", "");
         }
-        let mut cfg = Self::default();
-        cfg.set("server", "192.168.122.25:5902");
-        cfg.set("width", 1920);
-        cfg.set("height", 1080);
-        cfg.set("fullscreen", "false");
-        cfg.set("vsync", "false");
-        cfg.set("decoder", "auto");
-        cfg.set("cursor", "remote");
-        cfg.set("audio", "true");
-        cfg.set("audio_connect", "");
-        if let Err(e) = cfg.save() {
-            eprintln!("lgx-client: cannot write {}: {e}", path().display());
+        let mut changed = !cfg.existed;
+        if cfg.instance_get(DEFAULT_NAME, "token").is_none() {
+            if let Some(creds) = lgx_proto::auth::load_credentials() {
+                cfg.set_instance(DEFAULT_NAME, "token", creds.token);
+                cfg.set_instance(DEFAULT_NAME, "client_id", creds.id);
+                let _ = fs::remove_file(lgx_proto::auth::config_path());
+                eprintln!("lgx-client: moved old token into [default]");
+                changed = true;
+            }
         }
-        cfg.existed = true;
+        if changed {
+            if let Err(e) = cfg.save() {
+                eprintln!("lgx-client: cannot write {}: {e}", path().display());
+            }
+            cfg.existed = true;
+        }
         cfg
     }
 
@@ -124,6 +156,17 @@ impl Config {
 
     pub fn set(&mut self, key: &str, value: impl ToString) {
         self.values.insert(canonical(key), value.to_string());
+    }
+
+    pub fn instance_get(&self, name: &str, key: &str) -> Option<&str> {
+        self.values
+            .get(&format!("{name}.{key}"))
+            .map(|s| s.as_str())
+    }
+
+    pub fn set_instance(&mut self, name: &str, key: &str, value: impl ToString) {
+        self.values
+            .insert(format!("{name}.{key}"), value.to_string());
     }
 
     pub fn get_u32(&self, key: &str) -> Option<u32> {
@@ -141,7 +184,8 @@ impl Config {
     pub fn save(&self) -> io::Result<()> {
         let p = path();
         if let Some(dir) = p.parent() {
-            std::fs::create_dir_all(dir)?;
+            fs::create_dir_all(dir)?;
+            let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
         }
         let mut sections: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
         for (full, value) in &self.values {
@@ -172,6 +216,15 @@ impl Config {
                 out.push_str(&format!("{key} = {value}\n"));
             }
         }
-        std::fs::write(p, out)
+        let mut f = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&p)?;
+        f.write_all(out.as_bytes())?;
+        f.sync_all()?;
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o600))?;
+        Ok(())
     }
 }

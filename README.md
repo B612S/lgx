@@ -77,7 +77,23 @@ cursor = remote
 [audio]
 enabled = true
 connect =
+
+[client1]
+token = <token>
+server = 192.168.122.25:5902
+client_id = <id>
+
+[client2]
+token = <token>
+server = 10.0.0.5:5902
+client_id = <id>
 ```
+
+Run an instance with `lgx-client client1`; without a name the `default`
+section is used. `[network]`/`[video]`/`[audio]` are shared; a named section
+can override `server` and stores its own token and client id. The file
+contains secrets and is written `0600`. Old `client.conf` + `token` files are
+migrated into `[default]` on first load.
 
 `~/.config/lgx/server.conf`:
 
@@ -181,6 +197,7 @@ lgx-client --connect 192.168.122.25:5902
 
 The client reads the server geometry from `HELLO` and sizes the window to it
 on the first run; the size is stored in `~/.config/lgx/client.conf`.
+Select a profile with `lgx-client <name>`.
 
 ### Client configuration
 
@@ -218,10 +235,21 @@ Revocation removes the registry entry. The running server reloads the registry
 every second: an already-connected revoked client is disconnected immediately
 and new connections with that ID fail. Other clients are unaffected.
 
-An old single-line `~/.config/lgx/token` is treated as client `default`. On the
-first run after upgrading, the server migrates the old global token into a
-`default` registry entry, so an existing client keeps working. Old clients
-that do not send an ID must be updated.
+An old single-line `~/.config/lgx/token` is moved into the `[default]` client
+section. On the server, the old global token is migrated into a `default`
+registry entry, so an existing client keeps working. Old clients that do not
+send an ID must be updated.
+
+### Pairing a named client
+
+```bash
+lgx-server --pair --pair-name client1
+lgx-client client1 --pair 192.168.122.25:5904 --pair-code CODE
+lgx-client client1
+```
+
+The pairing result is written as `[client1]` in `client.conf` (token, server
+and client_id); the profile is then launched with `lgx-client client1`.
 
 ### Token protection at rest
 
@@ -229,7 +257,8 @@ New pairings issue 256-bit tokens. The server does not store them in plaintext:
 `~/.config/lgx/clients` contains AES-256-GCM ciphertext under a separate
 random `~/.config/lgx/master.key` (32 bytes, mode 0600). A leaked registry
 alone cannot be used without the master key; the client keeps its token in
-`~/.config/lgx/token` (mode 0600), because it is the shared PSK. Back up
+`~/.config/lgx/client.conf` under its named section (mode 0600), because it is
+the shared PSK. Back up
 `master.key` with the registry: if it is lost, every client must be paired
 again. The source code alone cannot derive a token.
 

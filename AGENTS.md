@@ -80,10 +80,15 @@ Commit format: `area: short imperative summary`, for example
   recreates the swapchain/semaphores on timeout; a UI watchdog calls
   `_exit(2)` if the main loop has not advanced for 3 s instead of leaving a
   frozen window.
-- Settings files are sectioned: client `~/.config/lgx/client.conf`
-  (`network`, `video`, `audio`), server `~/.config/lgx/server.conf`
-  (`network`, `video`, `audio`, `input`). CLI flags override the file; missing
-  files are created with defaults and flat client configs are migrated.
+- Client profiles: `~/.config/lgx/client.conf` has shared `network`/`video`/
+  `audio` sections plus `[client1]`, `[client2]` sections with `token`,
+  `server` and `client_id`. Launch with `lgx-client client1`; no `name =` is
+  stored. The file is mode 0600. Missing/old configs migrate the old token
+  file into `[default]`. Server settings are `~/.config/lgx/server.conf`
+  (`network`, `video`, `audio`, `input`). CLI flags override.
+- Pairing with a name: `lgx-client client1 --pair HOST:PAIRPORT --pair-code
+  CODE` writes `[client1]`; token and client id must never go to a global
+  token file again.
 - SDL3 gamepads are opened through `GamepadSubsystem`; duplicate
   `ControllerDeviceAdded` events are filtered by device path.
 
@@ -177,9 +182,9 @@ the Vulkan shader converts full-range BT.709, and the HEVC VUI says
 - The client sends its ID in a plaintext frame before `LGX1`. The ID is public;
   the server looks up the token in the registry for the handshake. Never send
   the token before the handshake.
-- `lgx-client --pair HOST:PORT --pair-code CODE` receives credentials and
-  saves them with `auth::save_credentials` (mode 0600). The legacy one-line
-  token is read as id `default`.
+- `lgx-client NAME --pair HOST:PORT --pair-code CODE` receives credentials and
+  writes `[NAME]` in `client.conf` (mode 0600). The legacy token file is
+  migrated into `[default]`; there is no global client token file.
 - `lgx-server --list` prints the registry. `lgx-server --revoke ID|NAME`
   removes entries. A watcher in the running server reloads the registry every
   second and closes the secure stream of any active client whose ID vanished.
