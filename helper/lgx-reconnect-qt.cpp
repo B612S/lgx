@@ -15,6 +15,9 @@
 #include <QVBoxLayout>
 #include <QWidget>
 
+#include <csignal>
+#include <sys/prctl.h>
+
 class ReconnectWindow final : public QWidget {
 public:
     ReconnectWindow(const QString &server, int attempt) {
@@ -70,6 +73,8 @@ protected:
 };
 
 int main(int argc, char **argv) {
+    // Do not leave an orphan dialog if the client process dies.
+    prctl(PR_SET_PDEATHSIG, SIGTERM);
     QApplication app(argc, argv);
     QApplication::setApplicationName(QStringLiteral("lgx-reconnect"));
     QApplication::setApplicationDisplayName(QStringLiteral("lgx"));

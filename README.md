@@ -202,7 +202,9 @@ Select a profile with `lgx-client <name>`.
 
 The client reconnects automatically after a network/server drop: it retries
 with exponential backoff and restarts the session (window and audio are
-re-created). Use `--no-reconnect` for tests. `lgx-client --list` prints
+re-created). While retrying it shows a separate Qt `lgx-reconnect-qt` window in
+the desktop style with an indeterminate progress line and a Cancel button; the
+SDL/Vulkan client itself does not link Qt. Use `--no-reconnect` for tests. `lgx-client --list` prints
 profiles without tokens, and `lgx-client --check <name>` validates that a
 profile has a server and token.
 

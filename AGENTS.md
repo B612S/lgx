@@ -73,6 +73,9 @@ Commit format: `area: short imperative summary`, for example
 - The window title is `lgx — <name> — <server IP>` and must not contain live
   stats. The client reconnects with exponential backoff after a lost session by
   exec'ing itself (window/audio are re-created); `--no-reconnect` disables it.
+  The reconnect wait uses the child `lgx-reconnect-qt` (Qt Widgets, system
+  style, indeterminate progress bar, Cancel -> exit 2); the client itself must
+  not link Qt.
   `--list`/`--check NAME` inspect profiles without printing tokens. The `<name>` is the profile section selected on the command line.
   `LGX_DEBUG_FPS` still prints per-second diagnostics to stderr.
 - `Ctrl+Shift+Alt+F` is the only client hotkey; it toggles fullscreen. The F
@@ -214,7 +217,10 @@ the Vulkan shader converts full-range BT.709, and the HEVC VUI says
   public client-ID frame followed by an `LGX1` handshake: ephemeral X25519, two random 32-byte nonces, and the auth
   token mixed as the HKDF-SHA256 IKM. Each direction gets an AES-256-GCM key
   and an independent nonce counter. Never add a plaintext fallback.
-- `crates/lgx-proto/src/secure.rs` owns the handshake and record layer:
+- `crates/lgx-proto/src/secure.rs` owns the handshake and record layer. Small
+  records are sealed in place in the reusable buffer (no per-frame temporary
+  Vec/copy); keep this fast path when touching the record layer. AES-256-GCM
+  is AES-NI accelerated and is negligible at this bitrate.
   records are split into 32 KiB chunks; the length/index/chunk length are
   included in the AEAD associated data. `Secure::close` shuts down a raw clone
   because the reader may hold the recv mutex while blocked in `read_exact`.

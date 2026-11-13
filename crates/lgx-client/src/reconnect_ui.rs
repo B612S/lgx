@@ -29,8 +29,14 @@ fn helper_path() -> Option<PathBuf> {
 
 impl Dialog {
     pub fn spawn(server: &str, attempt: u32) -> Option<Self> {
-        let helper = helper_path()?;
-        let child = Command::new(helper)
+        let helper = match helper_path() {
+            Some(p) => p,
+            None => {
+                eprintln!("lgx-client: reconnect dialog not found (lgx-reconnect-qt)");
+                return None;
+            }
+        };
+        let child = match Command::new(&helper)
             .arg("--server")
             .arg(server)
             .arg("--attempt")
@@ -39,7 +45,16 @@ impl Dialog {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .ok()?;
+        {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!(
+                    "lgx-client: cannot start reconnect dialog {}: {e}",
+                    helper.display()
+                );
+                return None;
+            }
+        };
         Some(Self { child })
     }
 
