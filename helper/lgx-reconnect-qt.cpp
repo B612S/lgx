@@ -71,7 +71,7 @@ public:
 public:
     void set_attempt(int attempt) {
         status_->setText(
-            QStringLiteral("Reconnecting to %1 (attempt %2)…").arg(name_).arg(attempt));
+            QStringLiteral("Reconnecting… attempt %1/10").arg(attempt));
     }
 
 protected:
