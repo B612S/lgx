@@ -97,7 +97,10 @@ Commit format: `area: short imperative summary`, for example
   no config migration. The file is mode 0600. `[audio] connect` is an
   optional audio-port override; omit it and derive `host:5903` from `server`.
   Server settings are `~/.config/lgx/server.conf` (`network`, `video`,
-  `audio`, `input`). CLI flags override.
+  `audio`, `input`). CLI flags override. `[audio] mute_unfocused = true`
+  pauses the local pacat child on SDL `WindowFocusLost` (SIGSTOP) and resumes
+  on `WindowFocusGained` (SIGCONT); the audio stream is still drained and
+  discarded while paused, so the server does not back up.
 - Pairing with a name: `lgx-server --pair --pair-name archlinux` and
   `lgx-client archlinux --pair HOST:PAIRPORT --pair-code CODE` write
   `[archlinux]`; token and client id must never go to a global token file

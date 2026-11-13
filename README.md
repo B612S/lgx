@@ -73,6 +73,7 @@ cursor = remote
 
 [audio]
 enabled = true
+mute_unfocused = true
 
 [input]
 gamepads = true
@@ -87,7 +88,9 @@ token = <token>
 
 Run an instance with `lgx-client archlinux`; the section name is also the
 public client ID. `[video]`/`[audio]`/`[input]` are shared; every client section has its
-own `server` and `token`. `[input] gamepads = false` (or
+own `server` and `token`. `[audio] mute_unfocused = true` pauses local audio
+playback while the window is unfocused (the secure audio stream is still
+drained and discarded); `--no-mute-unfocused` disables this. `[input] gamepads = false` (or
 `--no-gamepads`) disables gamepad forwarding without affecting keyboard or
 mouse. `clipboard = false` disables clipboard sync, `clipboard_rich = false`
 sends only plain text, and `clipboard_max_bytes` limits both directions
@@ -113,6 +116,7 @@ vpp = true
 
 [audio]
 enabled = true
+mute_unfocused = true
 
 [input]
 enabled = true

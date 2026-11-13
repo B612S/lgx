@@ -51,6 +51,7 @@ struct Args {
     clipboard: Option<bool>,
     clipboard_rich: Option<bool>,
     clipboard_max: Option<usize>,
+    mute_unfocused: Option<bool>,
     frames: Option<u64>,
     pair: Option<String>,
     pair_code: Option<String>,
@@ -73,6 +74,7 @@ struct Settings {
     clipboard: bool,
     clipboard_rich: bool,
     clipboard_max_bytes: usize,
+    mute_unfocused: bool,
     reconnect: bool,
 }
 
@@ -99,6 +101,7 @@ fn parse_args() -> Result<Args, String> {
         clipboard: None,
         clipboard_rich: None,
         clipboard_max: None,
+        mute_unfocused: None,
         frames: None,
         pair: None,
         pair_code: None,
@@ -125,6 +128,8 @@ fn parse_args() -> Result<Args, String> {
             "--check" => a.check_profile = true,
             "--no-clipboard" => a.clipboard = Some(false),
             "--no-rich-clipboard" => a.clipboard_rich = Some(false),
+            "--mute-unfocused" => a.mute_unfocused = Some(true),
+            "--no-mute-unfocused" => a.mute_unfocused = Some(false),
             "--clipboard-max-bytes" => {
                 a.clipboard_max = Some(
                     it.next()
@@ -161,6 +166,7 @@ fn parse_args() -> Result<Args, String> {
                      \x20          [--gamepads|--no-gamepads] [--no-reconnect]\n\
                      \x20          [--list] [--check]\n\
                      \x20          [--no-clipboard] [--no-rich-clipboard]\n\
+                     \x20          [--mute-unfocused|--no-mute-unfocused]\n\
                      \x20          [--no-window] [--bench SECONDS] [--frames N]\n\
                      \x20          [--screenshot FILE]\n\
                      \x20          [--pair HOST:PORT --pair-code CODE] [--client-id ID]"
@@ -424,6 +430,10 @@ fn main() {
             .clipboard_max
             .or_else(|| cfg.get_u32("clipboard_max_bytes").map(|v| v as usize))
             .unwrap_or(1024 * 1024),
+        mute_unfocused: args
+            .mute_unfocused
+            .or_else(|| cfg.get_bool("mute_unfocused"))
+            .unwrap_or(true),
         reconnect: args.connections,
     };
     if s.token.is_empty() {
@@ -555,6 +565,7 @@ fn main() {
         eprintln!("lgx-client: clipboard forwarding disabled");
     }
 
+    let audio_focus = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     if s.audio {
         let addr = s
             .audio_connect
@@ -565,10 +576,12 @@ fn main() {
             });
         let token = token.clone();
         let client_id = s.client_id.clone();
+        let focus = audio_focus.clone();
+        let mute_unfocused = s.mute_unfocused;
         std::thread::Builder::new()
             .name("lgx-audio".into())
             .spawn(move || {
-                if let Err(e) = audio::run(&addr, &client_id, &token) {
+                if let Err(e) = audio::run(&addr, &client_id, &token, mute_unfocused, focus) {
                     eprintln!("lgx-client: audio: {e}");
                 }
             })
@@ -753,6 +766,12 @@ fn main() {
         for ev in events {
             match ev {
                 Event::Quit { .. } => quit = true,
+                Event::Window { win_event: sdl3::event::WindowEvent::FocusLost, .. } => {
+                    audio_focus.store(false, std::sync::atomic::Ordering::Relaxed);
+                }
+                Event::Window { win_event: sdl3::event::WindowEvent::FocusGained, .. } => {
+                    audio_focus.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
                 Event::Window { .. } => redraw = true,
                 Event::ControllerDeviceAdded { which, .. } => {
                     if let Some(subsystem) = gamepad_subsystem.as_ref() {

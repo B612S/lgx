@@ -58,6 +58,7 @@ fn canonical(key: &str) -> String {
             ("video", key)
         }
         "audio" => ("audio", "enabled"),
+        "mute_unfocused" => ("audio", "mute_unfocused"),
         "audio_connect" => ("audio", "connect"),
         "gamepads" => ("input", "gamepads"),
         "clipboard" => ("input", "clipboard"),
@@ -125,6 +126,7 @@ impl Config {
             ("clipboard", "true"),
             ("clipboard_rich", "true"),
             ("clipboard_max_bytes", "1048576"),
+            ("mute_unfocused", "true"),
         ] {
             if cfg.get(key).is_none() {
                 cfg.set(key, value);
@@ -280,7 +282,9 @@ mod tests {
         cfg.set("clipboard", "false");
         cfg.set("clipboard_rich", "false");
         cfg.set("clipboard_max_bytes", "4096");
+        cfg.set("mute_unfocused", "true");
         assert_eq!(cfg.get_bool("gamepads"), Some(false));
+        assert_eq!(cfg.get_bool("mute_unfocused"), Some(true));
         assert_eq!(cfg.get_bool("clipboard"), Some(false));
         assert_eq!(cfg.get_bool("clipboard_rich"), Some(false));
         assert_eq!(cfg.get_u32("clipboard_max_bytes"), Some(4096));
