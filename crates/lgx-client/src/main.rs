@@ -41,6 +41,7 @@ struct Args {
     audio_connect: Option<String>,
     decoder: Option<String>,
     cursor: Option<bool>,
+    gamepads: Option<bool>,
     frames: Option<u64>,
     pair: Option<String>,
     pair_code: Option<String>,
@@ -59,6 +60,7 @@ struct Settings {
     client_id: String,
     decoder: String,
     cursor_remote: bool,
+    gamepads: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -77,6 +79,7 @@ fn parse_args() -> Result<Args, String> {
         audio_connect: None,
         decoder: None,
         cursor: None,
+        gamepads: None,
         frames: None,
         pair: None,
         pair_code: None,
@@ -96,6 +99,8 @@ fn parse_args() -> Result<Args, String> {
             "--audio" => a.audio = Some(true),
             "--no-audio" => a.audio = Some(false),
             "--audio-connect" => a.audio_connect = Some(it.next().ok_or("--audio-connect")?),
+            "--gamepads" => a.gamepads = Some(true),
+            "--no-gamepads" => a.gamepads = Some(false),
             "--screenshot" => a.screenshot = Some(it.next().ok_or("--screenshot")?),
             "--token" => a.token = Some(it.next().ok_or("--token")?),
             "--client-id" => a.client_id = Some(it.next().ok_or("--client-id")?),
@@ -121,6 +126,7 @@ fn parse_args() -> Result<Args, String> {
                      \x20          [--decoder auto|cuda|vaapi|software]\n\
                      \x20          [--cursor local|remote] [--fullscreen|--windowed]\n\
                      \x20          [--vsync] [--audio] [--audio-connect ADDR]\n\
+                     \x20          [--gamepads|--no-gamepads]\n\
                      \x20          [--no-window] [--bench SECONDS] [--frames N]\n\
                      \x20          [--screenshot FILE]\n\
                      \x20          [--pair HOST:PORT --pair-code CODE] [--client-id ID]"
@@ -329,6 +335,10 @@ fn main() {
             .cursor
             .or_else(|| cfg.get("cursor").map(|v| v != "local"))
             .unwrap_or(true),
+        gamepads: args
+            .gamepads
+            .or_else(|| cfg.get_bool("gamepads"))
+            .unwrap_or(true),
     };
     if s.token.is_empty() {
         eprintln!("lgx-client: no token in [{}] for {}", s.name, s.server);
@@ -500,7 +510,12 @@ fn main() {
     });
     let decoder = dec::spawn(chosen, None, want_dmabuf, video_rx, sink.clone(), wake);
 
-    let gamepad_subsystem = sdl.gamepad().ok();
+    let gamepad_subsystem = if s.gamepads {
+        sdl.gamepad().ok()
+    } else {
+        eprintln!("lgx-client: gamepad forwarding disabled");
+        None
+    };
     let mut pads = gamepad_subsystem
         .as_ref()
         .map(pad::open_all)

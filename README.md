@@ -74,14 +74,19 @@ cursor = remote
 [audio]
 enabled = true
 
+[input]
+gamepads = true
+
 [archlinux]
 server = 192.168.122.25:5902
 token = <token>
 ```
 
 Run an instance with `lgx-client archlinux`; the section name is also the
-public client ID. `[video]`/`[audio]` are shared; every client section has its
-own `server` and `token`. There is no `[network]`, no `[default]` and no
+public client ID. `[video]`/`[audio]`/`[input]` are shared; every client section has its
+own `server` and `token`. `[input] gamepads = false` (or
+`--no-gamepads`) disables gamepad forwarding without affecting keyboard or
+mouse. There is no `[network]`, no `[default]` and no
 migration. `[audio] connect` is an optional audio-port override; normally
 omit it, the port is derived from `server` as `host:5903`. The file contains
 tokens and is written `0600`.
@@ -192,8 +197,9 @@ Select a profile with `lgx-client <name>`.
 
 ### Client configuration
 
-Shared settings are `[video]` and `[audio]`; each `[name]` section has only
-`server` and `token`. `[audio] connect` is an optional override for the audio
+Shared settings are `[video]`, `[audio]` and `[input]`; each `[name]` section
+has only `server` and `token`. `[input] gamepads = false` disables gamepad
+forwarding. `[audio] connect` is an optional override for the audio
 port (default: the server host on port 5903); leave it out unless the audio
 port is different. There is no `[network]`, no `[default]`, no `client_id` and
 no migration. Command-line flags win over the file.

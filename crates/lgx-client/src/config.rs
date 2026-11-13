@@ -39,7 +39,7 @@ pub fn validate_name(name: &str) -> io::Result<()> {
         || !name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
-        || matches!(name, "video" | "audio" | "misc" | "network" | "default")
+        || matches!(name, "video" | "audio" | "input" | "misc" | "network" | "default")
     {
         return Err(io::Error::other(
             "instance name must be 1..64 chars of A-Z a-z 0-9 - _ . and not a reserved section",
@@ -59,6 +59,7 @@ fn canonical(key: &str) -> String {
         }
         "audio" => ("audio", "enabled"),
         "audio_connect" => ("audio", "connect"),
+        "gamepads" => ("input", "gamepads"),
         _ => ("misc", key),
     };
     format!("{section}.{name}")
@@ -105,22 +106,27 @@ impl Config {
     /// Creates the file with video/audio defaults when missing. No migration
     /// from old configs or token files is attempted.
     pub fn load_or_create() -> Self {
-        let cfg = Self::load();
-        if cfg.existed {
-            return cfg;
+        let mut cfg = Self::load();
+        let mut changed = !cfg.existed;
+        if !cfg.existed {
+            cfg.set("width", 1920);
+            cfg.set("height", 1080);
+            cfg.set("fullscreen", "false");
+            cfg.set("vsync", "false");
+            cfg.set("decoder", "auto");
+            cfg.set("cursor", "remote");
+            cfg.set("audio", "true");
         }
-        let mut cfg = Self::default();
-        cfg.set("width", 1920);
-        cfg.set("height", 1080);
-        cfg.set("fullscreen", "false");
-        cfg.set("vsync", "false");
-        cfg.set("decoder", "auto");
-        cfg.set("cursor", "remote");
-        cfg.set("audio", "true");
-        if let Err(e) = cfg.save() {
-            eprintln!("lgx-client: cannot write {}: {e}", path().display());
+        if cfg.get("gamepads").is_none() {
+            cfg.set("gamepads", "true");
+            changed = true;
         }
-        cfg.existed = true;
+        if changed {
+            if let Err(e) = cfg.save() {
+                eprintln!("lgx-client: cannot write {}: {e}", path().display());
+            }
+            cfg.existed = true;
+        }
         cfg
     }
 
@@ -176,7 +182,7 @@ impl Config {
                 .insert(key, value.clone());
         }
         let mut out = String::from("# lgx client configuration\n");
-        for section in ["video", "audio", "misc"] {
+        for section in ["video", "audio", "input", "misc"] {
             if let Some(values) = sections.get(section) {
                 out.push_str(&format!("\n[{section}]\n"));
                 for (key, value) in values {
@@ -188,7 +194,7 @@ impl Config {
             }
         }
         for (section, values) in &sections {
-            if ["video", "audio", "misc", "network", "default"].contains(&section.as_str()) {
+            if ["video", "audio", "input", "misc", "network", "default"].contains(&section.as_str()) {
                 continue;
             }
             out.push_str(&format!("\n[{section}]\n"));

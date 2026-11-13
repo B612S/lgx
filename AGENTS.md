@@ -81,9 +81,11 @@ Commit format: `area: short imperative summary`, for example
   recreates the swapchain/semaphores on timeout; a UI watchdog calls
   `_exit(2)` if the main loop has not advanced for 3 s instead of leaving a
   frozen window.
-- Client profiles: `~/.config/lgx/client.conf` has shared `video`/`audio`
-  sections plus `[archlinux]`, `[client2]` sections with only `server` and
-  `token`. Launch with `lgx-client archlinux`; the section name is the public
+- Client profiles: `~/.config/lgx/client.conf` has shared `video`/`audio`/
+  `input` sections plus `[archlinux]`, `[client2]` sections with only `server`
+  and `token`. `[input] gamepads = false` (or `--no-gamepads`) skips the SDL
+  gamepad subsystem and sends no `GAMEPAD` packets; keyboard/mouse are
+  unaffected. Launch with `lgx-client archlinux`; the section name is the public
   client ID. There is no `[network]`, no `[default]`, no `client_id` field and
   no config migration. The file is mode 0600. `[audio] connect` is an
   optional audio-port override; omit it and derive `host:5903` from `server`.
