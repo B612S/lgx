@@ -118,14 +118,27 @@ The total length, chunk index and chunk length are authenticated as AEAD
 associated data. The 12-byte lgx message header and its payload are both
 inside the plaintext, so message types and HEVC frames are not visible.
 
-## Pairing
+## Pairing and revocation
 
 `lgx-server --pair` opens a temporary listener (default `0.0.0.0:5904`) and
 prints a 32-hex one-time code. The client connects with the same `LGX1`
 handshake, using the code instead of the long-term token as the PSK. After the
-handshake the server sends the long-term token as one secure record; the
-client stores it mode 0600 and answers `ok`. The pairing listener accepts one
-client, expires after three minutes and stops after five failed attempts.
+handshake the server sends `id\ntoken` as one secure record; the client stores
+it mode 0600 and answers `ok`. The server then adds the entry to its registry.
+The pairing listener accepts one client, expires after three minutes and stops
+after five failed attempts.
+
+Normal connections start with a public client-ID frame:
+
+```
+client -> server: u32 len, id bytes (ASCII, 1..128)
+client -> server: the usual LGX1 handshake, PSK = that client's token
+```
+
+The server looks the ID up in `~/.config/lgx/clients`; an unknown or revoked ID
+is rejected. The running server watches the registry every second and closes
+active sessions whose ID disappeared. `lgx-server --list` and
+`lgx-server --revoke ID|NAME` manage the registry.
 
 ## Audio
 

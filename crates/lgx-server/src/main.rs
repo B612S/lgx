@@ -12,6 +12,7 @@ pub mod audio;
 mod cpuconv;
 mod capture;
 mod clip;
+mod clients;
 mod config;
 mod dmabuf;
 pub mod glconv;
@@ -40,6 +41,9 @@ struct Args {
     vpp: bool,
     pair: bool,
     pair_listen: String,
+    pair_name: Option<String>,
+    revoke: Option<String>,
+    list: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -75,6 +79,9 @@ fn parse_args() -> Result<Args, String> {
             .get("network.pair_listen")
             .unwrap_or("0.0.0.0:5904")
             .to_string(),
+        pair_name: None,
+        revoke: None,
+        list: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -100,6 +107,9 @@ fn parse_args() -> Result<Args, String> {
             "--token" => a.token = Some(it.next().ok_or("--token")?),
             "--pair" => a.pair = true,
             "--pair-listen" => a.pair_listen = it.next().ok_or("--pair-listen")?,
+            "--pair-name" => a.pair_name = Some(it.next().ok_or("--pair-name")?),
+            "--revoke" => a.revoke = Some(it.next().ok_or("--revoke")?),
+            "--list" => a.list = true,
             "-h" | "--help" => {
                 println!(
                     "lgx-server [--listen ADDR] [--fps N] [--bitrate BPS] [--output NAME]\n\
@@ -107,7 +117,8 @@ fn parse_args() -> Result<Args, String> {
                      \x20          [--no-low-power] [--async-depth N] [--no-input]\n\
                      \x20          [--token T] [--no-audio]\n\
                      \x20          [--audio-listen ADDR] [--vpp|--no-vpp]\n\
-                     \x20          [--pair] [--pair-listen ADDR]\n\
+                     \x20          [--pair] [--pair-listen ADDR] [--pair-name NAME]\n\
+                     \x20          [--list] [--revoke ID|NAME]\n\
                      \x20          settings: ~/.config/lgx/server.conf"
                 );
                 std::process::exit(0);
@@ -456,15 +467,30 @@ fn main() {
         }
     };
 
+    if let Err(e) = clients::ensure() {
+        eprintln!("lgx-server: cannot initialize client registry: {e}");
+        std::process::exit(1);
+    }
+    if let Some(token) = args.token.clone() {
+        if let Err(e) = clients::set_default(&token) {
+            eprintln!("lgx-server: cannot update default token: {e}");
+            std::process::exit(1);
+        }
+    }
+    if args.list {
+        clients::print_list();
+        return;
+    }
+    if let Some(key) = args.revoke.clone() {
+        match clients::revoke(&key) {
+            Ok(0) => eprintln!("lgx-server: no client matching {key}"),
+            Ok(n) => eprintln!("lgx-server: revoked {n} client(s) matching {key}"),
+            Err(e) => eprintln!("lgx-server: revoke: {e}"),
+        }
+        return;
+    }
     if args.pair {
-        let token = match args.token.clone().or_else(lgx_proto::auth::load) {
-            Some(t) => t,
-            None => {
-                eprintln!("lgx-server: pairing needs an existing token; start the server once first");
-                std::process::exit(1);
-            }
-        };
-        if let Err(e) = pair::run(&args.pair_listen, &token) {
+        if let Err(e) = pair::run(&args.pair_listen, args.pair_name.as_deref()) {
             eprintln!("lgx-server: pairing: {e}");
             std::process::exit(1);
         }
@@ -472,27 +498,23 @@ fn main() {
     }
 
     let hub = Hub::new();
+    {
+        let hub = hub.clone();
+        std::thread::Builder::new()
+            .name("lgx-revoke-watch".into())
+            .spawn(move || loop {
+                std::thread::sleep(Duration::from_secs(1));
+                if let Some(valid) = clients::valid_ids() {
+                    hub.revoke_missing(&valid);
+                }
+            })
+            .ok();
+    }
     let input_tx = if args.no_input {
         let (tx, _) = std::sync::mpsc::channel();
         tx
     } else {
         input::spawn(None)
-    };
-
-    let token = match args.token.clone().or_else(lgx_proto::auth::load) {
-        Some(t) => Arc::new(t),
-        None => {
-            let t = lgx_proto::auth::generate();
-            match lgx_proto::auth::save(&t) {
-                Ok(()) => eprintln!(
-                    "lgx-server: no token configured, generated {} ({})",
-                    t,
-                    lgx_proto::auth::config_path().display()
-                ),
-                Err(e) => eprintln!("lgx-server: cannot save token: {e}"),
-            }
-            Arc::new(t)
-        }
     };
 
     let last_remote = Arc::new(std::sync::Mutex::new(String::new()));
@@ -509,11 +531,10 @@ fn main() {
 
     if args.audio {
         let addr = args.audio_listen.clone();
-        let token = Some(token.clone());
         std::thread::Builder::new()
             .name("lgx-audio".into())
             .spawn(move || {
-                if let Err(e) = audio::serve(&addr, token) {
+                if let Err(e) = audio::serve(&addr) {
                     eprintln!("lgx-server: audio: {e}");
                 }
             })
@@ -566,12 +587,11 @@ fn main() {
     let hub2 = hub.clone();
     let input2 = input_tx.clone();
     let clip2 = clip_set.clone();
-    let token2 = Some(token.clone());
     let remote2 = last_remote.clone();
     std::thread::Builder::new()
         .name("lgx-listen".into())
         .spawn(move || {
-            if let Err(e) = net::listen(&listen, hub2, input2, clip2, token2, remote2) {
+            if let Err(e) = net::listen(&listen, hub2, input2, clip2, remote2) {
                 eprintln!("lgx-server: {e}");
             }
         })

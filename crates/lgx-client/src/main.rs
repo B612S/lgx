@@ -35,6 +35,7 @@ struct Args {
     bench: Option<f64>,
     size: Option<(u32, u32)>,
     token: Option<String>,
+    client_id: Option<String>,
     audio: Option<bool>,
     audio_connect: Option<String>,
     decoder: Option<String>,
@@ -53,6 +54,7 @@ struct Settings {
     audio: bool,
     audio_connect: Option<String>,
     token: String,
+    client_id: String,
     decoder: String,
     cursor_remote: bool,
 }
@@ -67,6 +69,7 @@ fn parse_args() -> Result<Args, String> {
         bench: None,
         size: None,
         token: None,
+        client_id: None,
         audio: None,
         audio_connect: None,
         decoder: None,
@@ -91,6 +94,7 @@ fn parse_args() -> Result<Args, String> {
             "--audio-connect" => a.audio_connect = Some(it.next().ok_or("--audio-connect")?),
             "--screenshot" => a.screenshot = Some(it.next().ok_or("--screenshot")?),
             "--token" => a.token = Some(it.next().ok_or("--token")?),
+            "--client-id" => a.client_id = Some(it.next().ok_or("--client-id")?),
             "--decoder" => a.decoder = Some(it.next().ok_or("--decoder")?),
             "--bench" => a.bench = Some(it.next().ok_or("--bench")?.parse().map_err(|_| "--bench")?),
             "--frames" => a.frames = Some(it.next().ok_or("--frames")?.parse().map_err(|_| "--frames")?),
@@ -114,7 +118,7 @@ fn parse_args() -> Result<Args, String> {
                      \x20          [--vsync] [--audio] [--audio-connect ADDR]\n\
                      \x20          [--no-window] [--bench SECONDS] [--frames N]\n\
                      \x20          [--screenshot FILE]\n\
-                     \x20          [--pair HOST:PORT --pair-code CODE]"
+                     \x20          [--pair HOST:PORT --pair-code CODE] [--client-id ID]"
                 );
                 std::process::exit(0);
             }
@@ -225,6 +229,19 @@ fn main() {
     }
 
     let cfg = config::Config::load_or_create();
+    let creds = lgx_proto::auth::load_credentials();
+    let token = args
+        .token
+        .clone()
+        .or_else(|| std::env::var("LGX_TOKEN").ok())
+        .or_else(|| cfg.get("token").map(str::to_string))
+        .or_else(|| creds.as_ref().map(|c| c.token.clone()))
+        .unwrap_or_default();
+    let client_id = args
+        .client_id
+        .clone()
+        .or_else(|| creds.as_ref().map(|c| c.id.clone()))
+        .unwrap_or_else(|| "default".to_string());
     let s = Settings {
         server: args
             .connect
@@ -254,12 +271,8 @@ fn main() {
                     .filter(|v| !v.is_empty())
                     .map(str::to_string)
             }),
-        token: args
-            .token
-            .clone()
-            .or_else(|| std::env::var("LGX_TOKEN").ok())
-            .or_else(lgx_proto::auth::load)
-            .unwrap_or_default(),
+        token,
+        client_id,
         decoder: args
             .decoder
             .clone()
@@ -270,6 +283,11 @@ fn main() {
             .or_else(|| cfg.get("cursor").map(|v| v != "local"))
             .unwrap_or(true),
     };
+    if s.token.is_empty() {
+        eprintln!("lgx-client: no token for {}", s.server);
+        eprintln!("lgx-client: pair a client with --pair HOST:PAIRPORT --pair-code CODE");
+        std::process::exit(2);
+    }
     let this_host = display_host(&s.server).to_string();
     let _instance = match instance::acquire(&this_host) {
         Ok(Some(guard)) => Some(guard),
@@ -292,7 +310,7 @@ fn main() {
     };
 
     let (video_tx, video_rx) = std::sync::mpsc::channel::<dec::Chunk>();
-    let (conn, hello) = match net::connect(&server, &keymap, &token, video_tx) {
+    let (conn, hello) = match net::connect(&server, &keymap, &s.client_id, &token, video_tx) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("lgx-client: cannot connect to {server}: {e}");
@@ -355,10 +373,11 @@ fn main() {
                 None => format!("{server}:5903"),
             });
         let token = token.clone();
+        let client_id = s.client_id.clone();
         std::thread::Builder::new()
             .name("lgx-audio".into())
             .spawn(move || {
-                if let Err(e) = audio::run(&addr, &token) {
+                if let Err(e) = audio::run(&addr, &client_id, &token) {
                     eprintln!("lgx-client: audio: {e}");
                 }
             })
@@ -527,6 +546,10 @@ fn main() {
         };
         if frame.is_none() {
             frame = sink.take();
+        }
+        if conn.closed.load(std::sync::atomic::Ordering::Relaxed) {
+            eprintln!("lgx-client: server closed the connection");
+            quit = true;
         }
 
         for ev in events {
@@ -826,7 +849,7 @@ fn save_frame(path: &str, frame: &dec::Frame) {
 
 fn run_headless(
     sink: std::sync::Arc<dec::Sink>,
-    _conn: &std::sync::Arc<net::Conn>,
+    conn: &std::sync::Arc<net::Conn>,
     mut screenshot: Option<String>,
     deadline: Option<Instant>,
     max_frames: Option<u64>,
@@ -862,6 +885,10 @@ fn run_headless(
                     }
                 }
             }
+        }
+        if conn.closed.load(std::sync::atomic::Ordering::Relaxed) {
+            eprintln!("lgx-client: server closed the connection");
+            break;
         }
         if let Some(err) = sink.error() {
             eprintln!("lgx-client: decoder: {err}");

@@ -156,25 +156,36 @@ the Vulkan shader converts full-range BT.709, and the HEVC VUI says
   used: its `--target` auto-connected to `easyeffects_source` (the microphone)
   on the test VM and produced silence.
 
-## Pairing
+## Pairing and revocation
 
 - `lgx-server --pair` is a local admin action. It binds the pair port
   (`--pair-listen`, default `0.0.0.0:5904`), prints a 32-hex one-time code,
   accepts exactly one client for three minutes and exits after five failed
   attempts. It must not become a remote, always-on endpoint.
-- The pair connection runs the normal `LGX1` handshake with the one-time code
-  as the PSK. The long-term token is sent only after that handshake, inside a
-  secure record; the code itself never crosses the wire.
-- `lgx-client --pair HOST:PORT --pair-code CODE` receives the token, saves it
-  with `auth::save` (mode 0600) and sends an `ok` acknowledgement. Without the
-  code the client cannot decrypt the token and must not write the file.
-- `auth::save` must keep mode 0600; the token is both the auth secret and the
-  long-term transport PSK.
+- Per-client registry: `~/.config/lgx/clients`, mode 0600, tab-separated
+  `id<TAB>name<TAB>token<TAB>created`. `clients::ensure` migrates a legacy
+  single-line `token` file into the `default` entry. The registry is the source
+  of truth; do not add a global token path back.
+- Pairing generates a new ID and token, sends `id\ntoken` over the
+  code-authenticated secure channel, waits for `ok`, and only then adds the
+  entry. A failed pairing must not create an entry.
+- The client sends its ID in a plaintext frame before `LGX1`. The ID is public;
+  the server looks up the token in the registry for the handshake. Never send
+  the token before the handshake.
+- `lgx-client --pair HOST:PORT --pair-code CODE` receives credentials and
+  saves them with `auth::save_credentials` (mode 0600). The legacy one-line
+  token is read as id `default`.
+- `lgx-server --list` prints the registry. `lgx-server --revoke ID|NAME`
+  removes entries. A watcher in the running server reloads the registry every
+  second and closes the secure stream of any active client whose ID vanished.
+  The client reader sets `Conn::closed`, and the UI/headless loop exits on it.
+- The token is both the auth secret and the transport PSK. Keep the registry
+  and client credential files 0600.
 
-## Transport
+## Transport## Transport
 
-- **No plaintext TCP.** Both the main port and the audio port start with an
-  `LGX1` handshake: ephemeral X25519, two random 32-byte nonces, and the auth
+- **No plaintext TCP.** Both the main port and the audio port start with a
+  public client-ID frame followed by an `LGX1` handshake: ephemeral X25519, two random 32-byte nonces, and the auth
   token mixed as the HKDF-SHA256 IKM. Each direction gets an AES-256-GCM key
   and an independent nonce counter. Never add a plaintext fallback.
 - `crates/lgx-proto/src/secure.rs` owns the handshake and record layer:

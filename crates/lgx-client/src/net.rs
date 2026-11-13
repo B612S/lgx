@@ -21,6 +21,8 @@ pub struct Conn {
     secure: Arc<Secure>,
     pub last_remote: Arc<Mutex<String>>,
     pub bytes: AtomicU64,
+    /// Set by the reader when the server closes or the stream fails.
+    pub closed: std::sync::atomic::AtomicBool,
 }
 
 impl Conn {
@@ -43,11 +45,12 @@ impl Conn {
 pub fn connect(
     addr: &str,
     keymap: &[u8],
+    client_id: &str,
     token: &str,
     video: std::sync::mpsc::Sender<Chunk>,
 ) -> std::io::Result<(Arc<Conn>, Hello)> {
     let stream = TcpStream::connect(addr)?;
-    let secure = Arc::new(secure::client_handshake(stream, token)?);
+    let secure = Arc::new(secure::client_handshake_id(stream, client_id, token)?);
     secure.send_msg(
         Msg::new(msg::AUTH, 0, token.len() as i32, 0),
         token.as_bytes(),
@@ -79,6 +82,7 @@ pub fn connect(
         secure: secure.clone(),
         last_remote,
         bytes: AtomicU64::new(0),
+        closed: std::sync::atomic::AtomicBool::new(false),
     });
     let conn_for_reader = conn.clone();
     std::thread::Builder::new()
@@ -182,4 +186,5 @@ fn reader(
             _ => {}
         }
     }
+    conn.closed.store(true, Ordering::Relaxed);
 }

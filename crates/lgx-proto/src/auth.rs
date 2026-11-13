@@ -13,6 +13,57 @@ pub fn config_path() -> PathBuf {
     base.join("lgx").join("token")
 }
 
+#[derive(Clone, Debug)]
+pub struct Credentials {
+    pub id: String,
+    pub token: String,
+}
+
+/// Client credentials. One line is the legacy global token (`default`);
+/// two lines are `<id>` and `<token>`.
+pub fn load_credentials() -> Option<Credentials> {
+    let text = std::fs::read_to_string(config_path()).ok()?;
+    let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
+    let first = lines.next()?.to_string();
+    match lines.next() {
+        None => Some(Credentials {
+            id: "default".to_string(),
+            token: first,
+        }),
+        Some(second) => {
+            if first.is_empty() || second.is_empty() {
+                None
+            } else {
+                Some(Credentials {
+                    id: first,
+                    token: second.to_string(),
+                })
+            }
+        }
+    }
+}
+
+pub fn save_credentials(id: &str, token: &str) -> io::Result<()> {
+    save_two(id, token)
+}
+
+fn save_two(id: &str, token: &str) -> io::Result<()> {
+    let path = config_path();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut f = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)?;
+    f.write_all(format!("{id}\n{token}\n").as_bytes())?;
+    f.sync_all()?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
 pub fn load() -> Option<String> {
     std::fs::read_to_string(config_path())
         .ok()

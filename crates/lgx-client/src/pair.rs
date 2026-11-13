@@ -16,19 +16,25 @@ pub fn run(addr: &str, code: &str) -> io::Result<()> {
     stream.set_nodelay(true)?;
     let secure = secure::client_handshake(stream, code)?;
     let raw = secure.recv_bytes()?;
-    let token = String::from_utf8(raw).map_err(|_| io::Error::other("bad token from server"))?;
-    let token = token.trim();
-    if token.len() < 16
+    let text = String::from_utf8(raw).map_err(|_| io::Error::other("bad credentials from server"))?;
+    let (id, token) = text
+        .split_once('\n')
+        .ok_or_else(|| io::Error::other("server returned incomplete credentials"))?;
+    let (id, token) = (id.trim(), token.trim());
+    if id.is_empty()
+        || id.len() > 128
+        || id.bytes().any(|b| b < 0x21 || b > 0x7e)
+        || token.len() < 16
         || token.len() > 256
         || !token.bytes().all(|b| b.is_ascii_hexdigit())
     {
-        return Err(io::Error::other("server returned an invalid token"));
+        return Err(io::Error::other("server returned invalid credentials"));
     }
-    auth::save(token)?;
+    auth::save_credentials(id, token)?;
     secure.send_bytes(b"ok")?;
     secure.close();
     eprintln!(
-        "lgx-client: paired; token saved to {}",
+        "lgx-client: paired as {id}; credentials saved to {}",
         auth::config_path().display()
     );
     Ok(())

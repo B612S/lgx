@@ -211,11 +211,13 @@ copy on one side, then press Ctrl+V in the target application on the other.
 
 ## Pairing a new client
 
-A client cannot connect without `~/.config/lgx/token`. To enroll a new client,
-run this **on the server** (locally or over SSH):
+A client cannot connect without credentials in `~/.config/lgx/token`. The
+server keeps a per-client registry at `~/.config/lgx/clients` (mode 0600):
+every pairing creates a random client ID and a random token. Run this **on the
+server** (locally or over SSH):
 
 ```bash
-lgx-server --pair --pair-listen 0.0.0.0:5904
+lgx-server --pair --pair-listen 0.0.0.0:5904 --pair-name laptop
 ```
 
 It prints a random 32-hex one-time code and the client command. On the client:
@@ -225,13 +227,34 @@ lgx-client --pair 192.168.122.25:5904 --pair-code <code>
 ```
 
 The pair listener uses the same X25519 + AES-256-GCM layer with the one-time
-code as the PSK. The long-term token is sent only inside that encrypted
-channel, after the code-authenticated handshake, and is stored with mode 0600.
-The code is never sent over the network, is valid for three minutes, accepts
-one client and stops after five failed attempts. A client without the code
-cannot complete the handshake or obtain the token; a fake server without the
-code cannot make a client save one. Pairing must be started locally on the
-server — there is no remote "pair me" endpoint.
+code as the PSK. The new client ID and token are sent only inside that
+encrypted channel, after the code-authenticated handshake; the client stores
+them with mode 0600. The code is never sent over the network, is valid for
+three minutes, accepts one client and stops after five failed attempts. A
+client without the code cannot complete the handshake or obtain credentials; a
+fake server without the code cannot make a client save them. Pairing must be
+started locally on the server — there is no remote "pair me" endpoint.
+
+The client sends its public ID in a small plaintext preface before `LGX1`; the
+server looks up that ID in the registry and uses its token as the PSK. The ID
+is not a secret; the token is.
+
+### Revoking a client
+
+```bash
+lgx-server --list
+lgx-server --revoke laptop          # ID or name
+lgx-server --revoke <client-id>
+```
+
+Revocation removes the registry entry. The running server reloads the registry
+every second: an already-connected revoked client is disconnected immediately
+and new connections with that ID fail. Other clients are unaffected.
+
+An old single-line `~/.config/lgx/token` is treated as client `default`. On the
+first run after upgrading, the server migrates the old global token into a
+`default` registry entry, so an existing client keeps working. Old clients
+that do not send an ID must be updated.
 
 `--pair-listen` defaults to `0.0.0.0:5904`; the address printed in the example
 is the server's LAN address.
@@ -249,7 +272,8 @@ directions; no paste shortcut is injected. F9/F10/F11/F12 are ordinary keys
 for the guest.
 
 All traffic — video, input, clipboard, files and audio — is inside AES-256-GCM
-records; pairing uses the same channel with a one-time code. AES-NI makes the cost negligible at the stream's few MB/s; only
+records; pairing uses the same channel with a one-time code. Each client has
+its own token, so a revoked client does not affect the others. AES-NI makes the cost negligible at the stream's few MB/s; only
 record sizes are visible to a passive observer, never HEVC frames or tokens.
 
 ## Measured (VM: Hyprland 1920x1080@160, Intel UHD 770; host RTX 4070 SUPER)

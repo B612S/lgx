@@ -5,6 +5,7 @@
 //! data are serialised there. Encoded frames are never copied to the CPU: the
 //! writer takes ownership of the encoder's buffer.
 
+use std::collections::HashSet;
 use std::io;
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -15,6 +16,7 @@ use std::sync::{Arc, Mutex};
 use lgx_proto::secure::{self, Secure};
 use lgx_proto::{codec, files, msg, Msg};
 
+use crate::clients;
 use crate::clip;
 use crate::input::Cmd;
 
@@ -35,6 +37,8 @@ pub struct Hub {
 
 struct Client {
     id: u64,
+    /// Registry id of the authenticated client; used for revocation.
+    client: String,
     tx: SyncSender<Out>,
     /// A freshly registered client may only see an IDR; delayed packets from
     /// the previous client's encoder state are dropped for it.
@@ -97,6 +101,19 @@ impl Hub {
 
     pub fn cursor_overlay(&self) -> bool {
         self.cursor_overlay.load(Ordering::Relaxed)
+    }
+
+    pub fn revoke_missing(&self, valid: &HashSet<String>) {
+        let mut list = self.clients.lock().unwrap();
+        list.retain(|c| {
+            if valid.contains(&c.client) {
+                true
+            } else {
+                eprintln!("lgx-server: revoking active client {}", c.client);
+                c.secure.close();
+                false
+            }
+        });
     }
 
     pub fn broadcast_video(&self, chunk: Vec<u8>) {
@@ -189,7 +206,6 @@ pub fn listen(
     hub: Arc<Hub>,
     input: std::sync::mpsc::Sender<Cmd>,
     clip_set: Arc<dyn Fn(&str) + Send + Sync>,
-    token: Option<Arc<String>>,
     last_remote: Arc<Mutex<String>>,
 ) -> io::Result<()> {
     let listener = TcpListener::bind(addr)?;
@@ -202,12 +218,11 @@ pub fn listen(
         let hub2 = hub.clone();
         let input2 = input.clone();
         let clip2 = clip_set.clone();
-        let token2 = token.clone();
         let remote2 = last_remote.clone();
         std::thread::Builder::new()
             .name(format!("lgx-client-{id}"))
             .spawn(move || {
-                if let Err(e) = handle(stream, id, hub2, input2, clip2, token2, remote2) {
+                if let Err(e) = handle(stream, id, hub2, input2, clip2, remote2) {
                     eprintln!("lgx-server: client #{id}: {e}");
                 }
                 eprintln!("lgx-server: client #{id} disconnected");
@@ -218,16 +233,32 @@ pub fn listen(
 }
 
 fn handle(
-    stream: TcpStream,
+    mut stream: TcpStream,
     id: u64,
     hub: Arc<Hub>,
     input: std::sync::mpsc::Sender<Cmd>,
     clip_set: Arc<dyn Fn(&str) + Send + Sync>,
-    token: Option<Arc<String>>,
     last_remote: Arc<Mutex<String>>,
 ) -> io::Result<()> {
-    let token_secret = token.as_ref().map(|s| s.as_str()).unwrap_or("");
-    let secure = match secure::server_handshake(stream, token_secret) {
+    let client_id = match secure::server_read_id(&mut stream) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("lgx-server: client #{id}: cannot read client id: {e}");
+            return Ok(());
+        }
+    };
+    let token = match clients::token_for(&client_id) {
+        Ok(Some(t)) => t,
+        Ok(None) => {
+            eprintln!("lgx-server: client #{id}: unknown client id {client_id}");
+            return Ok(());
+        }
+        Err(e) => {
+            eprintln!("lgx-server: client #{id}: registry: {e}");
+            return Ok(());
+        }
+    };
+    let secure = match secure::server_handshake(stream, &token) {
         Ok(s) => Arc::new(s),
         Err(e) => {
             eprintln!("lgx-server: client #{id}: secure handshake failed: {e}");
@@ -235,19 +266,14 @@ fn handle(
         }
     };
     let (m, payload) = secure.recv_msg()?;
-    if let Some(expected) = &token {
-        let ok = m.typ == msg::AUTH
-            && lgx_proto::auth::eq(
-                String::from_utf8_lossy(&payload).trim(),
-                expected,
-            );
-        if !ok {
-            eprintln!("lgx-server: client #{id}: authentication failed");
-            secure.close();
-            return Ok(());
-        }
-        eprintln!("lgx-server: client #{id}: authenticated");
+    let ok = m.typ == msg::AUTH
+        && lgx_proto::auth::eq(String::from_utf8_lossy(&payload).trim(), &token);
+    if !ok {
+        eprintln!("lgx-server: client #{id}: authentication failed");
+        secure.close();
+        return Ok(());
     }
+    eprintln!("lgx-server: client #{id}: authenticated as {client_id}");
 
     // HELLO before the writer thread: the client needs the geometry and codec
     // before it can size its window or create a decoder.
@@ -260,6 +286,7 @@ fn handle(
     let file_busy = Arc::new(AtomicBool::new(false));
     hub.clients.lock().unwrap().push(Client {
         id,
+        client: client_id,
         tx: tx.clone(),
         needs_idr: true,
         secure: secure.clone(),

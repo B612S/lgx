@@ -12,6 +12,8 @@ use std::time::Duration;
 
 use lgx_proto::secure;
 
+use crate::clients;
+
 pub const RATE: u32 = 48_000;
 pub const CHANNELS: u32 = 2;
 
@@ -19,7 +21,7 @@ struct Client {
     tx: SyncSender<Vec<u8>>,
 }
 
-pub fn serve(addr: &str, token: Option<Arc<String>>) -> io::Result<()> {
+pub fn serve(addr: &str) -> io::Result<()> {
     // @DEFAULT_MONITOR@ is the sink monitor (desktop audio), not the default
     // source (microphone). pw-cat's --target is not reliable on PipeWire and
     // auto-connected to easyeffects_source on the test VM.
@@ -72,11 +74,10 @@ pub fn serve(addr: &str, token: Option<Arc<String>>) -> io::Result<()> {
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let clients = clients.clone();
-        let token = token.clone();
         std::thread::Builder::new()
             .name("lgx-audio-client".into())
             .spawn(move || {
-                if let Err(e) = handle(stream, clients, token) {
+                if let Err(e) = handle(stream, clients) {
                     eprintln!("lgx-server: audio client: {e}");
                 }
             })
@@ -86,20 +87,24 @@ pub fn serve(addr: &str, token: Option<Arc<String>>) -> io::Result<()> {
 }
 
 fn handle(
-    stream: TcpStream,
+    mut stream: TcpStream,
     clients: Arc<Mutex<Vec<Client>>>,
-    token: Option<Arc<String>>,
 ) -> io::Result<()> {
-    let token_secret = token.as_ref().map(|s| s.as_str()).unwrap_or("");
-    let secure = Arc::new(secure::server_handshake(stream, token_secret)?);
-    let tok = secure.recv_bytes()?;
-    if let Some(expected) = &token {
-        let got = String::from_utf8_lossy(&tok).trim().to_string();
-        if !lgx_proto::auth::eq(&got, expected) {
-            eprintln!("lgx-server: audio: authentication failed");
-            secure.close();
+    let client_id = secure::server_read_id(&mut stream)?;
+    let token = match clients::token_for(&client_id)? {
+        Some(t) => t,
+        None => {
+            eprintln!("lgx-server: audio: unknown client id {client_id}");
             return Ok(());
         }
+    };
+    let secure = Arc::new(secure::server_handshake(stream, &token)?);
+    let tok = secure.recv_bytes()?;
+    let got = String::from_utf8_lossy(&tok).trim().to_string();
+    if !lgx_proto::auth::eq(&got, &token) {
+        eprintln!("lgx-server: audio: authentication failed");
+        secure.close();
+        return Ok(());
     }
 
     let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(16);

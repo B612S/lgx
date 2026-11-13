@@ -14,7 +14,15 @@ use lgx_proto::secure;
 
 use lgx_proto::auth;
 
-pub fn run(addr: &str, token: &str) -> io::Result<()> {
+use crate::clients;
+
+pub fn run(addr: &str, name: Option<&str>) -> io::Result<()> {
+    clients::ensure()?;
+    let id = auth::generate();
+    let token = auth::generate();
+    let name = name
+        .map(clients::clean_name)
+        .unwrap_or_else(|| format!("client-{}", &id[..8]));
     let code = auth::generate();
     let listener = TcpListener::bind(addr).map_err(|e| io::Error::other(format!("bind {addr}: {e}")))?;
     listener.set_nonblocking(true)?;
@@ -33,9 +41,20 @@ pub fn run(addr: &str, token: &str) -> io::Result<()> {
             Ok((stream, peer)) => {
                 let _ = stream.set_nodelay(true);
                 eprintln!("lgx-server: pairing client from {peer}");
-                match pair_client(stream, &code, token) {
+                match pair_client(stream, &code, &id, &token) {
                     Ok(()) => {
-                        eprintln!("lgx-server: paired client {peer}; token delivered");
+                        clients::add(clients::Entry {
+                            id: id.clone(),
+                            name: name.clone(),
+                            token: token.clone(),
+                            created: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs(),
+                        })?;
+                        eprintln!(
+                            "lgx-server: paired client {peer}: id={id} name={name}; token delivered"
+                        );
                         return Ok(());
                     }
                     Err(e) => {
@@ -55,11 +74,16 @@ pub fn run(addr: &str, token: &str) -> io::Result<()> {
     }
 }
 
-fn pair_client(stream: std::net::TcpStream, code: &str, token: &str) -> io::Result<()> {
+fn pair_client(
+    stream: std::net::TcpStream,
+    code: &str,
+    id: &str,
+    token: &str,
+) -> io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
     stream.set_write_timeout(Some(Duration::from_secs(30)))?;
     let secure = secure::server_handshake(stream, code)?;
-    secure.send_bytes(token.as_bytes())?;
+    secure.send_bytes(format!("{id}\n{token}").as_bytes())?;
     let ack = secure.recv_bytes()?;
     if ack != b"ok" {
         secure.close();

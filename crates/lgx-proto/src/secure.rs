@@ -275,6 +275,28 @@ fn start_handshake(stream: &TcpStream) -> io::Result<()> {
     Ok(())
 }
 
+/// Send the public client id before the encrypted handshake. The id is not
+/// secret; it selects the per-client token in the server registry.
+pub fn client_handshake_id(mut stream: TcpStream, id: &str, token: &str) -> io::Result<Secure> {
+    if id.is_empty() || id.len() > 128 || id.bytes().any(|b| b < 0x21 || b > 0x7e) {
+        return Err(io::Error::other("bad client id"));
+    }
+    stream.set_nodelay(true)?;
+    stream.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
+    send_frame(&mut stream, id.as_bytes())?;
+    client_handshake(stream, token)
+}
+
+pub fn server_read_id(stream: &mut TcpStream) -> io::Result<String> {
+    stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
+    let data = recv_frame(stream)?;
+    let id = String::from_utf8(data).map_err(|_| io::Error::other("bad client id"))?;
+    if id.is_empty() || id.len() > 128 || id.bytes().any(|b| b < 0x21 || b > 0x7e) {
+        return Err(io::Error::other("bad client id"));
+    }
+    Ok(id)
+}
+
 pub fn client_handshake(mut stream: TcpStream, token: &str) -> io::Result<Secure> {
     start_handshake(&stream)?;
     let rng = SystemRandom::new();

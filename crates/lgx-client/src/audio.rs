@@ -7,9 +7,9 @@ use std::process::{Command, Stdio};
 
 use lgx_proto::secure;
 
-pub fn run(addr: &str, token: &str) -> std::io::Result<()> {
+pub fn run(addr: &str, client_id: &str, token: &str) -> std::io::Result<()> {
     let stream = TcpStream::connect(addr)?;
-    let secure = secure::client_handshake(stream, token)?;
+    let secure = secure::client_handshake_id(stream, client_id, token)?;
     secure.send_bytes(token.as_bytes())?;
 
     let mut child = Command::new("pacat")
