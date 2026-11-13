@@ -860,11 +860,6 @@ fn main() {
                 {
                     let now_mute = !mute_unfocused.load(std::sync::atomic::Ordering::Relaxed);
                     mute_unfocused.store(now_mute, std::sync::atomic::Ordering::Relaxed);
-                    let mut cfg = config::Config::load();
-                    cfg.set("mute_unfocused", now_mute);
-                    if let Err(e) = cfg.save() {
-                        eprintln!("lgx-client: cannot save mute_unfocused: {e}");
-                    }
                     for code in [29u16, 42, 56, 97, 100, 54] {
                         send_key(&conn, keyboard.as_mut(), code, false);
                     }

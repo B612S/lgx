@@ -277,15 +277,15 @@ is the server's LAN address.
 | key | action |
 |---|---|
 | Ctrl+Shift+Alt+F | toggle client fullscreen (never forwarded) |
-| Ctrl+Shift+Alt+M | toggle background audio / save `mute_unfocused` |
+| Ctrl+Shift+Alt+M | toggle background audio for this run (runtime only) |
 | Ctrl+Alt+Q | quit |
 | Ctrl+Alt+G | release/grab compositor shortcuts |
 
 Only text is synchronized automatically in both directions: copy on one side
 and press Ctrl+V on the other. File clipboard contents are ignored. There is
 no paste injection and no transfer hotkey. `Ctrl+Shift+Alt+M` toggles
-background audio at runtime and persists `[audio] mute_unfocused`; the key is
-never sent to the guest. F9/F10/F11/F12 are ordinary keys
+background audio at runtime only; it is not written to `client.conf` and resets
+to `[audio] mute_unfocused` on restart. The key is never sent to the guest. F9/F10/F11/F12 are ordinary keys
 for the guest.
 
 All traffic — video, input, clipboard and audio — is inside AES-256-GCM
