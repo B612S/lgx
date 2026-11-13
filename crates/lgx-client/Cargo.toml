@@ -1,0 +1,17 @@
+[package]
+name = "lgx-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "lgx client: hardware HEVC decode and zero-copy presentation"
+
+[dependencies]
+lgx-proto = { path = "../lgx-proto" }
+libc = "0.2"
+sdl3 = { version = "0.16", features = ["ash"] }
+xkbcommon = "0.8"
+wayland-client = { version = "0.31", features = ["system"] }
+wayland-backend = { version = "0.3", features = ["client_system"] }
+wayland-scanner = "0.31"
+bitflags = "2"
+ash = { version = "0.38", features = ["loaded"] }

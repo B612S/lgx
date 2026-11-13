@@ -1,0 +1,10 @@
+[Unit]
+Description=lgx uinput helper
+After=systemd-user-sessions.service
+
+[Service]
+ExecStart=/usr/lib/lgx/lgx-uinput /run/lgx-input.sock
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

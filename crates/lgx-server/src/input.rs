@@ -1,0 +1,247 @@
+//! Virtual input devices inside the guest.
+//!
+//! Runs in a dedicated thread with its own Wayland connection: Wayland objects
+//! are not `Send`, and input must be accepted from the TCP stream while
+//! capture runs in its own loop.
+
+use std::io::Write;
+use std::os::fd::AsFd;
+use std::sync::mpsc::{Receiver, Sender};
+
+use wayland_client::globals::registry_queue_init;
+use wayland_client::protocol::{wl_pointer, wl_seat};
+use wayland_client::{Connection, QueueHandle};
+
+use crate::protocols::{virtual_keyboard, virtual_pointer};
+
+struct InputState;
+
+macro_rules! no_events {
+    ($iface:ty) => {
+        impl wayland_client::Dispatch<$iface, ()> for InputState {
+            fn event(
+                _: &mut Self,
+                _: &$iface,
+                _: <$iface as wayland_client::Proxy>::Event,
+                _: &(),
+                _: &Connection,
+                _: &QueueHandle<InputState>,
+            ) {
+            }
+        }
+    };
+}
+
+no_events!(wl_seat::WlSeat);
+no_events!(wayland_client::protocol::wl_pointer::WlPointer);
+no_events!(wayland_client::protocol::wl_keyboard::WlKeyboard);
+no_events!(virtual_pointer::client::zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1);
+no_events!(virtual_pointer::client::zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1);
+no_events!(virtual_keyboard::client::zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1);
+no_events!(virtual_keyboard::client::zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1);
+
+impl wayland_client::Dispatch<wayland_client::protocol::wl_registry::WlRegistry, wayland_client::globals::GlobalListContents>
+    for InputState
+{
+    fn event(
+        _: &mut Self,
+        _: &wayland_client::protocol::wl_registry::WlRegistry,
+        _: <wayland_client::protocol::wl_registry::WlRegistry as wayland_client::Proxy>::Event,
+        _: &wayland_client::globals::GlobalListContents,
+        _: &Connection,
+        _: &QueueHandle<InputState>,
+    ) {
+    }
+}
+
+pub enum Cmd {
+    Keymap(Vec<u8>),
+    Key { code: u32, state: u32, time: u32 },
+    Btn { code: u32, state: u32, time: u32 },
+    Motion { x: u32, y: u32, time: u32 },
+    Wheel { axis: u32, steps: i32, time: u32 },
+    Mods { depressed: u32, latched: u32, locked: u32, group: u32 },
+    Gamepad {
+        pad: u8,
+        connected: bool,
+        buttons: u32,
+        axes: [i16; 6],
+        hat: [i8; 2],
+    },
+}
+
+/// Kernel-level input devices created by the `lgx-uinput` helper. They work for
+/// every application and every compositor shortcut, like Sunshine's uinput
+/// backend, and do not depend on Wayland protocol details.
+fn run_uinput(rx: Receiver<Cmd>, mut sock: std::os::unix::net::UnixStream) -> std::io::Result<()> {
+    use std::io::Write;
+    while let Ok(cmd) = rx.recv() {
+        let ok = match cmd {
+            Cmd::Key { code, state, .. } => {
+                let mut b = [b'K', 0, 0, state as u8];
+                b[1..3].copy_from_slice(&(code as u16).to_le_bytes());
+                sock.write_all(&b)
+            }
+            Cmd::Btn { code, state, .. } => {
+                let mut b = [b'B', 0, 0, state as u8];
+                b[1..3].copy_from_slice(&(code as u16).to_le_bytes());
+                sock.write_all(&b)
+            }
+            Cmd::Motion { x, y, .. } => {
+                let mut b = [0u8; 9];
+                b[0] = b'A';
+                b[1..5].copy_from_slice(&(x as i32).to_le_bytes());
+                b[5..9].copy_from_slice(&(y as i32).to_le_bytes());
+                sock.write_all(&b)
+            }
+            Cmd::Wheel { steps, .. } => {
+                let mut b = [0u8; 5];
+                b[0] = b'W';
+                b[1..5].copy_from_slice(&steps.to_le_bytes());
+                sock.write_all(&b)
+            }
+            Cmd::Gamepad { pad, connected, buttons, axes, hat } => {
+                if !std::path::Path::new("/run/lgx-input.gamepad").exists() {
+                    static WARNED: std::sync::atomic::AtomicBool =
+                        std::sync::atomic::AtomicBool::new(false);
+                    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        eprintln!(
+                            "lgx-server: gamepad ignored: update and restart lgx-input"
+                        );
+                    }
+                    continue;
+                }
+                let mut b = [0u8; 21];
+                b[0] = b'G';
+                b[1] = pad;
+                b[2] = connected as u8;
+                b[3..7].copy_from_slice(&buttons.to_le_bytes());
+                for (i, a) in axes.iter().enumerate() {
+                    b[7 + i * 2..9 + i * 2].copy_from_slice(&a.to_le_bytes());
+                }
+                b[19] = hat[0] as u8;
+                b[20] = hat[1] as u8;
+                sock.write_all(&b)
+            }
+            // uinput devices track modifiers themselves
+            Cmd::Mods { .. } | Cmd::Keymap(_) => Ok(()),
+        };
+        if ok.is_err() {
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
+pub fn spawn(seat_name: Option<String>) -> Sender<Cmd> {
+    let (tx, rx) = std::sync::mpsc::channel::<Cmd>();
+    std::thread::Builder::new()
+        .name("lgx-input".into())
+        .spawn(move || {
+            match std::os::unix::net::UnixStream::connect("/run/lgx-input.sock") {
+                Ok(sock) => {
+                    eprintln!("lgx-server: input: kernel uinput devices");
+                    if let Err(e) = run_uinput(rx, sock) {
+                        eprintln!("lgx-server: input: {e}");
+                    }
+                }
+                Err(_) => {
+                    eprintln!("lgx-server: input: uinput helper not found, using Wayland virtual devices");
+                    if let Err(e) = run(rx, seat_name) {
+                        eprintln!("lgx-server: input: {e}");
+                    }
+                }
+            }
+        })
+        .expect("input thread");
+    tx
+}
+
+fn run(rx: Receiver<Cmd>, _seat_name: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let conn = Connection::connect_to_env()?;
+    let (globals, queue) = registry_queue_init::<InputState>(&conn)?;
+    let qh: QueueHandle<InputState> = queue.handle();
+
+    let seat: wl_seat::WlSeat = globals.bind(&qh, 1..=7, ())?;
+    let vptr_mgr = globals.bind::<virtual_pointer::client::zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1, _, _>(
+        &qh,
+        1..=2,
+        (),
+    )?;
+    let vkb_mgr = globals.bind::<virtual_keyboard::client::zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1, _, _>(
+        &qh,
+        1..=1,
+        (),
+    )?;
+
+    let vptr = vptr_mgr.create_virtual_pointer(Some(&seat), &qh, ());
+    let vkb = vkb_mgr.create_virtual_keyboard(&seat, &qh, ());
+    let mut vptr_version = 1;
+    if let Some(v) = globals.contents().with_list(|list| {
+        list.iter()
+            .find(|g| g.interface == "zwlr_virtual_pointer_manager_v1")
+            .map(|g| g.version)
+    }) {
+        vptr_version = v.min(2);
+    }
+    conn.flush()?;
+
+    while let Ok(cmd) = rx.recv() {
+        match cmd {
+            Cmd::Keymap(bytes) => {
+                let file = tempfile_in_shm(&bytes)?;
+                let size = bytes.len() as u32;
+                vkb.keymap(1, file.as_fd(), size);
+            }
+            Cmd::Key { code, state, time } => {
+                vkb.key(time, code, state);
+            }
+            Cmd::Btn { code, state, time } => {
+                vptr.button(time, code, wl_pointer::ButtonState::try_from(state as u32).unwrap_or(wl_pointer::ButtonState::Pressed));
+                if vptr_version >= 2 {
+                    vptr.frame();
+                }
+            }
+            Cmd::Motion { x, y, time } => {
+                vptr.motion_absolute(time, x, y, 65535, 65535);
+                if vptr_version >= 2 {
+                    vptr.frame();
+                }
+            }
+            Cmd::Mods { depressed, latched, locked, group } => {
+                vkb.modifiers(depressed, latched, locked, group);
+            }
+            Cmd::Wheel { axis, steps, time } => {
+                let a = if axis == 1 {
+                    wl_pointer::Axis::HorizontalScroll
+                } else {
+                    wl_pointer::Axis::VerticalScroll
+                };
+                vptr.axis(time, a, steps as f64 * 10.0);
+                if vptr_version >= 2 {
+                    vptr.frame();
+                }
+            }
+            // The Wayland fallback has no gamepad device.
+            Cmd::Gamepad { .. } => {}
+        }
+        // We do not need events: virtual devices do not emit any. Should the
+        // compositor send something anyway, flush to be safe.
+        conn.flush().ok();
+    }
+    Ok(())
+}
+
+/// File in /dev/shm holding the keymap; the compositor mmaps it by fd.
+fn tempfile_in_shm(bytes: &[u8]) -> std::io::Result<std::fs::File> {
+    let mut path = std::env::temp_dir();
+    path.push(format!("lgx-keymap-{}", std::process::id()));
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .open(path)?;
+    f.write_all(bytes)?;
+    Ok(f)
+}

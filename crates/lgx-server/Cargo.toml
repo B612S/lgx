@@ -1,0 +1,15 @@
+[package]
+name = "lgx-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "lgx server: zero-copy HEVC streaming of a wlroots session"
+
+[dependencies]
+lgx-proto = { path = "../lgx-proto" }
+libc = "0.2"
+memmap2 = "0.9"
+wayland-client = "0.31"
+wayland-backend = "0.3"
+wayland-scanner = "0.31"
+bitflags = "2"

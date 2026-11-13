@@ -1,0 +1,31 @@
+# Maintainer: B612S
+pkgname=lgx-client
+pkgver=0.2.0
+pkgrel=10
+pkgdesc='lgx: zero-copy HEVC client (NVDEC/VAAPI decode)'
+arch=('x86_64')
+url='https://github.com/B612S/lgx'
+license=('MIT')
+depends=('gcc-libs' 'sdl3' 'ffmpeg' 'vulkan-icd-loader' 'mesa' 'libxkbcommon' 'wl-clipboard' 'pipewire' 'libpulse')
+makedepends=('cargo' 'rust' 'ffmpeg')
+source=("lgx-$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+  cd "lgx-$pkgver"
+  cargo build --release --locked
+}
+
+package() {
+  cd "lgx-$pkgver"
+  install -Dm755 target/release/lgx-client "$pkgdir/usr/bin/lgx-client"
+  install -Dm644 packaging/lgx-client/lgx-client.desktop \
+    "$pkgdir/usr/share/applications/lgx-client.desktop"
+  install -Dm644 assets/lgx.svg \
+    "$pkgdir/usr/share/icons/hicolor/scalable/apps/lgx.svg"
+  for size in 32 48 64 128 256; do
+    install -Dm644 "assets/lgx-$size.png" \
+      "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/lgx.png"
+  done
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

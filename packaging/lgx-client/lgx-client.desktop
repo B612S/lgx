@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=lgx
+Icon=lgx
+Comment=HEVC remote desktop (Vulkan)
+Exec=lgx-client
+Terminal=false
+Categories=Network;RemoteAccess;
+Keywords=remote;desktop;stream;wayland;hevc;

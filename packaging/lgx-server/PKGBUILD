@@ -1,0 +1,31 @@
+# Maintainer: B612S
+pkgname=lgx-server
+pkgver=0.2.0
+pkgrel=7
+pkgdesc='lgx: zero-copy HEVC streaming of a wlroots session (server)'
+arch=('x86_64')
+url='https://github.com/B612S/lgx'
+license=('MIT')
+depends=('gcc-libs' 'ffmpeg' 'libva' 'wl-clipboard' 'pipewire' 'libpulse')
+makedepends=('cargo' 'rust' 'ffmpeg' 'libva')
+source=("lgx-$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+  cd "lgx-$pkgver"
+  cargo build --release --locked
+  gcc -O2 -o lgx-uinput helper/lgx-uinput.c
+  gcc -O2 -o lgx-vaenc helper/lgx-vaenc.c -lavcodec -lavutil -lva -lva-drm
+}
+
+package() {
+  cd "lgx-$pkgver"
+  install -Dm755 target/release/lgx-server "$pkgdir/usr/bin/lgx-server"
+  install -Dm755 lgx-uinput "$pkgdir/usr/lib/lgx/lgx-uinput"
+  install -Dm755 lgx-vaenc "$pkgdir/usr/lib/lgx/lgx-vaenc"
+  install -Dm644 packaging/lgx-server/lgx-server.service \
+    "$pkgdir/usr/lib/systemd/user/lgx-server.service"
+  install -Dm644 packaging/lgx-server/lgx-input.service \
+    "$pkgdir/usr/lib/systemd/system/lgx-input.service"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

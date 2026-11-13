@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = ["crates/lgx-proto", "crates/lgx-server", "crates/lgx-client"]
+
+[workspace.package]
+version = "0.2.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/B612S/lgx"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"

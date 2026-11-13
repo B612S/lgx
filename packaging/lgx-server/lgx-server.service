@@ -1,0 +1,13 @@
+[Unit]
+Description=lgx HEVC server (stream this Wayland session)
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Environment=WAYLAND_DISPLAY=wayland-1
+ExecStart=/usr/bin/lgx-server --listen 0.0.0.0:5902 --audio
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target
