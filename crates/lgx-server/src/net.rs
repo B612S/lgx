@@ -373,30 +373,8 @@ fn handle(
             msg::CLIP_SET => {
                 if let Ok(text) = String::from_utf8(payload) {
                     clip_set(&text);
-                    // Only the explicit "paste" shortcut (F9, code=1) injects
-                    // Ctrl+V; the automatic clipboard poll must not paste.
-                    if m.code == 1 {
-                        eprintln!("lgx-server: paste shortcut from client");
-                        let t = now_ms();
-                        let _ = input.send(Cmd::Key { code: 29, state: 1, time: t });
-                        let _ = input.send(Cmd::Key { code: 47, state: 1, time: t });
-                        let _ = input.send(Cmd::Key { code: 47, state: 0, time: t });
-                        let _ = input.send(Cmd::Key { code: 29, state: 0, time: t });
-                    }
                 }
             }
-            msg::CLIP_GET => match crate::clip::get() {
-                Ok(clip::Clip::Text(text)) => {
-                    *last_remote.lock().unwrap() =
-                        clip::signature(&clip::Clip::Text(text.clone()));
-                    let _ = tx.try_send(Out::Clip(text));
-                }
-                Ok(clip::Clip::Files(paths)) => {
-                    *last_remote.lock().unwrap() = files::signature(&paths);
-                    hub.broadcast_files(&paths);
-                }
-                Err(e) => eprintln!("lgx-server: clip get: {e}"),
-            },
             msg::FILE_BEGIN => match files::decode_offer(&payload) {
                 Some(entries) => {
                     eprintln!("lgx-server: incoming file clipboard: {} entries", entries.len());

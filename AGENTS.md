@@ -68,9 +68,10 @@ Commit format: `area: short imperative summary`, for example
 
 - The window title is `lgx — <server IP>` and must not contain live stats.
   `LGX_DEBUG_FPS` still prints per-second diagnostics to stderr.
-- `Ctrl+Shift+Alt+F` toggles fullscreen. The F keydown/keyup is swallowed;
-  the modifiers were already forwarded, so the handler sends their key-up
-  events to clear the guest state. F11 keeps working.
+- `Ctrl+Shift+Alt+F` is the only client hotkey; it toggles fullscreen. The F
+  keydown/keyup is swallowed; the modifiers were already forwarded, so the
+  handler sends their key-up events to clear the guest state. F9/F10/F11/F12
+  are ordinary keys and must reach the guest.
 - After a fullscreen toggle the client skips drawing until SDL reports the
   new window size (1.2 s cap). Vulkan acquire uses a 100 ms timeout and
   recreates the swapchain/semaphores on timeout; a UI watchdog calls
@@ -130,9 +131,9 @@ the Vulkan shader converts full-range BT.709, and the HEVC VUI says
   modifiers.
 - Clipboard is polled every 300 ms on both sides, with `last_remote`/`last_sent`
   signature strings (`t:<text>` or `f:<paths>`) to avoid echo loops.
-- `CLIP_SET code=1` is the explicit F9 paste and injects Ctrl+V; `code=0` only
-  sets the clipboard. Never inject a paste for code=0: that made every host
-  copy paste into the guest.
+- `CLIP_SET` only replaces the guest clipboard. Never inject a paste: text and
+  files synchronise automatically in both directions, and the user presses
+  Ctrl+V in the target application.
 - Files/directories are exchanged with `FILE_BEGIN`/`FILE_DATA`/`FILE_END`.
   The offer lists `(kind, relative path, size)`; data is sequential 64 KiB
   chunks. Both sides write into `~/.cache/lgx/clipboard/<pid>-<stamp>/`,

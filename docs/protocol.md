@@ -29,8 +29,7 @@ the header and its length is in `a`.
 | 7 | WHEEL | `code` = axis, `a` = steps | — |
 | 8 | MODS | `a` = depressed, `b` = latched, `code` = locked, `flags` = group | — |
 | 9 | KEYMAP | `a` = length | xkb keymap |
-| 10 | CLIP_SET | `a` = length, `code` = 1 to paste | text |
-| 11 | CLIP_GET | — | — |
+| 10 | CLIP_SET | `a` = length | text |
 | 12 | CLIP_DATA | `a` = length | text |
 | 13 | CURSOR | `code` = 1 overlay the guest pointer, 0 draw locally | — |
 | 14 | PING | — | — |

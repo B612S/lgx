@@ -204,22 +204,20 @@ its own `text/uri-list` to those paths, so a normal paste in Dolphin/Thunar
 copies them to the destination. Symlinks are skipped; paths are sanitised and
 transfers are chunked (64 KiB) and interleaved with video.
 
-Text is synchronised in both directions too, but **only F9** injects Ctrl+V;
-the automatic poll only sets the clipboard, so copying on the host no longer
-pastes into the guest by itself.
+Text is synchronised in both directions too. Nothing is pasted automatically:
+copy on one side, then press Ctrl+V in the target application on the other.
 
 ## Hotkeys
 
 | key | action |
 |---|---|
-| F9 | host text clipboard -> guest (plus Ctrl+V) |
-| F10 | guest clipboard -> host |
 | Ctrl+Shift+Alt+F | toggle client fullscreen (never forwarded) |
-| F11 | toggle client fullscreen |
-| F11 | fullscreen |
-| F12 | screenshot to `lgx-<pid>.ppm` |
 | Ctrl+Alt+Q | quit |
 | Ctrl+Alt+G | release/grab compositor shortcuts |
+
+Text and files synchronise through the clipboard automatically in both
+directions; no paste shortcut is injected. F9/F10/F11/F12 are ordinary keys
+for the guest.
 
 ## Measured (VM: Hyprland 1920x1080@160, Intel UHD 770; host RTX 4070 SUPER)
 

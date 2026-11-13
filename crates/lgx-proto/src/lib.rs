@@ -23,7 +23,6 @@ pub mod msg {
     pub const MODS: u8 = 8;
     pub const KEYMAP: u8 = 9;
     pub const CLIP_SET: u8 = 10;
-    pub const CLIP_GET: u8 = 11;
     pub const CLIP_DATA: u8 = 12;
     /// `code` = 1 to overlay the guest pointer, 0 to draw it on the client.
     pub const CURSOR: u8 = 13;

@@ -541,11 +541,6 @@ fn main() {
                         pad::send(&conn, p, true);
                     }
                 }
-                Event::KeyDown { keycode: Some(sdl3::keyboard::Keycode::F11), .. } => {
-                    fullscreen_hold = Some((Instant::now(), renderer.size()));
-                    toggle_fullscreen(&mut window);
-                    redraw = true;
-                }
                 Event::KeyDown {
                     keycode: Some(sdl3::keyboard::Keycode::F),
                     keymod,
@@ -569,31 +564,6 @@ fn main() {
                     }
                     swallow_f_keyup = true;
                     eprintln!("lgx-client: fullscreen toggled (Ctrl+Shift+Alt+F)");
-                }
-                Event::KeyDown { keycode: Some(sdl3::keyboard::Keycode::F9), .. } => {
-                    match clip::get() {
-                        Ok(clip::Clip::Text(text)) if !text.is_empty() => {
-                            let _ = conn.send(
-                                Msg::new(msg::CLIP_SET, 1, text.len() as i32, 0),
-                                text.as_bytes(),
-                            );
-                        }
-                        Ok(clip::Clip::Files(_)) => eprintln!(
-                            "lgx-client: file clipboard is transferred automatically; paste in the guest"
-                        ),
-                        _ => eprintln!("lgx-client: host clipboard is empty"),
-                    }
-                }
-                Event::KeyDown { keycode: Some(sdl3::keyboard::Keycode::F10), .. } => {
-                    let _ = conn.send(Msg::new(msg::CLIP_GET, 0, 0, 0), &[]);
-                }
-                Event::KeyDown { keycode: Some(sdl3::keyboard::Keycode::F12), .. } => {
-                    let path = format!("lgx-{}.ppm", std::process::id());
-                    if let Some(frame) = &last_frame {
-                        save_frame(&path, frame);
-                    } else {
-                        screenshot = Some(path);
-                    }
                 }
                 Event::KeyDown {
                     keycode: Some(sdl3::keyboard::Keycode::G),
