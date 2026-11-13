@@ -80,6 +80,7 @@ pub struct Renderer {
     desc_pool: vk::DescriptorPool,
     desc_set: vk::DescriptorSet,
     sampler: vk::Sampler,
+    osd_sampler: vk::Sampler,
     tex_y: Texture,
     tex_uv: Texture,
     stage_y: Staging,
@@ -261,6 +262,7 @@ impl Renderer {
         let render_pass = create_render_pass(&device, format.format)?;
         let desc_layout = create_desc_layout(&device)?;
         let sampler = create_sampler(&device)?;
+        let osd_sampler = create_osd_sampler(&device)?;
 
         // OSD atlas: generated once from system fonts, uploaded before the
         // first frame. A missing font still leaves a blank card rather than
@@ -292,7 +294,7 @@ impl Renderer {
                     .set_layouts(&[osd_desc_layout]),
             )
             .map_err(|e| format!("OSD descriptor set: {e:?}"))?[0];
-        write_osd_descriptor(&device, osd_desc_set, &osd_tex, sampler);
+        write_osd_descriptor(&device, osd_desc_set, &osd_tex, osd_sampler);
         let osd_push = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
             .offset(0)
@@ -407,6 +409,7 @@ impl Renderer {
             desc_pool,
             desc_set,
             sampler,
+            osd_sampler,
             tex_y,
             tex_uv,
             stage_y,
@@ -595,7 +598,7 @@ impl Renderer {
         let sh = self.extent.height as f32;
         let card_w = self.osd_card.0 as f32;
         let card_h = self.osd_card.1 as f32;
-        let x0 = (sw - card_w) / 2.0;
+        let x0 = ((sw - card_w) / 2.0).round();
         let y0 = 40.0;
         let y1 = y0 + card_h;
         let nx0 = 2.0 * x0 / sw - 1.0;
@@ -998,6 +1001,7 @@ impl Drop for Renderer {
         unsafe {
             let _ = self.device.device_wait_idle();
             self.device.destroy_sampler(self.sampler, None);
+            self.device.destroy_sampler(self.osd_sampler, None);
             self.device.destroy_descriptor_pool(self.desc_pool, None);
             self.device.destroy_pipeline(self.pipeline, None);
             self.device.destroy_pipeline_layout(self.pipeline_layout, None);
@@ -1307,6 +1311,22 @@ fn create_rgba_texture(
             Texture { image, view, memory, width: w.max(1), height: h.max(1) },
             Staging { buffer, memory: bmem, ptr },
         ))
+    }
+}
+
+fn create_osd_sampler(device: &ash::Device) -> Result<vk::Sampler, String> {
+    unsafe {
+        device
+            .create_sampler(
+                &vk::SamplerCreateInfo::default()
+                    .mag_filter(vk::Filter::NEAREST)
+                    .min_filter(vk::Filter::NEAREST)
+                    .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE),
+                None,
+            )
+            .map_err(|e| format!("OSD sampler: {e:?}"))
     }
 }
 

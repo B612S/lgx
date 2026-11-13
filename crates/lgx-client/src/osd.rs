@@ -142,15 +142,14 @@ fn blend(pixels: &mut [u8], stride: u32, x: i32, y: i32, r: u8, g: u8, b: u8, a:
 fn draw_text(
     pixels: &mut [u8],
     stride: u32,
-    center_x: f32,
+    x: f32,
     baseline: f32,
     font: &Font,
     px: f32,
     color: (u8, u8, u8),
     text: &str,
 ) {
-    let width = text_width(font, px, text);
-    let mut x = center_x - width / 2.0;
+    let mut x = x;
     for ch in text.chars() {
         let (metrics, bitmap) = font.rasterize(ch, px);
         let gx = (x + metrics.xmin as f32).round() as i32;
@@ -226,12 +225,12 @@ fn draw_card(
         }
     }
 
-    let center = offset as f32 + card_w as f32 / 2.0;
+    let x = offset as f32 + (PAD_X * SS) as f32;
     let baseline = h as f32 / 2.0 + FONT_PX * SS as f32 * 0.35;
     draw_text(
         pixels,
         stride,
-        center,
+        x,
         baseline,
         font,
         FONT_PX * SS as f32,
