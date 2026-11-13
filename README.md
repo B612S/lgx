@@ -76,6 +76,9 @@ enabled = true
 
 [input]
 gamepads = true
+clipboard = true
+clipboard_rich = true
+clipboard_max_bytes = 1048576
 
 [archlinux]
 server = 192.168.122.25:5902
@@ -86,7 +89,9 @@ Run an instance with `lgx-client archlinux`; the section name is also the
 public client ID. `[video]`/`[audio]`/`[input]` are shared; every client section has its
 own `server` and `token`. `[input] gamepads = false` (or
 `--no-gamepads`) disables gamepad forwarding without affecting keyboard or
-mouse. There is no `[network]`, no `[default]` and no
+mouse. `clipboard = false` disables clipboard sync, `clipboard_rich = false`
+sends only plain text, and `clipboard_max_bytes` limits both directions
+(`0` means unlimited). There is no `[network]`, no `[default]` and no
 migration. `[audio] connect` is an optional audio-port override; normally
 omit it, the port is derived from `server` as `host:5903`. The file contains
 tokens and is written `0600`.
@@ -194,6 +199,12 @@ lgx-client archlinux
 The client reads the server geometry from `HELLO` and sizes the window to it
 on the first run; the size is stored in `~/.config/lgx/client.conf`.
 Select a profile with `lgx-client <name>`.
+
+The client reconnects automatically after a network/server drop: it retries
+with exponential backoff and restarts the session (window and audio are
+re-created). Use `--no-reconnect` for tests. `lgx-client --list` prints
+profiles without tokens, and `lgx-client --check <name>` validates that a
+profile has a server and token.
 
 ### Client configuration
 

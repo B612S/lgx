@@ -71,7 +71,9 @@ Commit format: `area: short imperative summary`, for example
   host exits before connecting or creating a window; different hosts use
   different locks.
 - The window title is `lgx — <name> — <server IP>` and must not contain live
-  stats. The `<name>` is the profile section selected on the command line.
+  stats. The client reconnects with exponential backoff after a lost session by
+  exec'ing itself (window/audio are re-created); `--no-reconnect` disables it.
+  `--list`/`--check NAME` inspect profiles without printing tokens. The `<name>` is the profile section selected on the command line.
   `LGX_DEBUG_FPS` still prints per-second diagnostics to stderr.
 - `Ctrl+Shift+Alt+F` is the only client hotkey; it toggles fullscreen. The F
   keydown/keyup is swallowed and modifier key-ups clear the guest state.
@@ -85,7 +87,9 @@ Commit format: `area: short imperative summary`, for example
   `input` sections plus `[archlinux]`, `[client2]` sections with only `server`
   and `token`. `[input] gamepads = false` (or `--no-gamepads`) skips the SDL
   gamepad subsystem and sends no `GAMEPAD` packets; keyboard/mouse are
-  unaffected. Launch with `lgx-client archlinux`; the section name is the public
+  unaffected. `clipboard = false` disables sync, `clipboard_rich = false`
+  forces plain text, and `clipboard_max_bytes` limits both directions (0 =
+  unlimited). Launch with `lgx-client archlinux`; the section name is the public
   client ID. There is no `[network]`, no `[default]`, no `client_id` field and
   no config migration. The file is mode 0600. `[audio] connect` is an
   optional audio-port override; omit it and derive `host:5903` from `server`.
@@ -194,6 +198,9 @@ the Vulkan shader converts full-range BT.709, and the HEVC VUI says
   verifies that the server ID equals NAME, and writes `[NAME]` in
   `client.conf` (mode 0600). There is no global client token file and no
   config migration.
+- `lgx-server --rotate ID|NAME` replaces the token and prints it; the running
+  server watches token fingerprints and closes the old session within a
+  second. Update the matching `[NAME] token` in `client.conf`.
 - `lgx-server --list` prints the registry. `lgx-server --revoke ID|NAME`
   removes entries. A watcher in the running server reloads the registry every
   second and closes the secure stream of any active client whose ID vanished.

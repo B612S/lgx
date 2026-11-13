@@ -5,7 +5,7 @@
 //! data are serialised there. Encoded frames are never copied to the CPU: the
 //! writer takes ownership of the encoder's buffer.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::io;
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -40,6 +40,9 @@ struct Client {
     id: u64,
     /// Registry id of the authenticated client; used for revocation.
     client: String,
+    /// Fingerprint of the token used at handshake; token rotation closes the
+    /// old session on the next registry watcher tick.
+    token: [u8; 32],
     tx: SyncSender<Out>,
     /// A freshly registered client may only see an IDR; delayed packets from
     /// the previous client's encoder state are dropped for it.
@@ -103,10 +106,10 @@ impl Hub {
         self.cursor_overlay.load(Ordering::Relaxed)
     }
 
-    pub fn revoke_missing(&self, valid: &HashSet<String>) {
+    pub fn revoke_missing(&self, valid: &HashMap<String, [u8; 32]>) {
         let mut list = self.clients.lock().unwrap();
         list.retain(|c| {
-            if valid.contains(&c.client) {
+            if valid.get(&c.client).is_some_and(|h| *h == c.token) {
                 true
             } else {
                 eprintln!("lgx-server: revoking active client {}", c.client);
@@ -259,9 +262,11 @@ fn handle(
     }
 
     let (tx, rx) = std::sync::mpsc::sync_channel::<Out>(2);
+    let token_hash = clients::token_fingerprint(&token);
     hub.clients.lock().unwrap().push(Client {
         id,
         client: client_id,
+        token: token_hash,
         tx: tx.clone(),
         needs_idr: true,
         secure: secure.clone(),

@@ -16,6 +16,26 @@ pub struct Hello {
     pub codec: u16,
 }
 
+#[derive(Clone, Copy)]
+pub struct ClipPolicy {
+    pub enabled: bool,
+    pub rich: bool,
+    /// 0 means no limit.
+    pub max_bytes: usize,
+}
+
+impl Default for ClipPolicy {
+    fn default() -> Self {
+        Self { enabled: true, rich: true, max_bytes: 1024 * 1024 }
+    }
+}
+
+impl ClipPolicy {
+    fn allows(&self, len: usize) -> bool {
+        self.enabled && (self.max_bytes == 0 || len <= self.max_bytes)
+    }
+}
+
 pub struct Conn {
     secure: Arc<Secure>,
     pub last_remote: Arc<Mutex<String>>,
@@ -47,6 +67,7 @@ pub fn connect(
     client_id: &str,
     token: &str,
     video: std::sync::mpsc::Sender<Chunk>,
+    clipboard: ClipPolicy,
 ) -> std::io::Result<(Arc<Conn>, Hello)> {
     let stream = TcpStream::connect(addr)?;
     let secure = Arc::new(secure::client_handshake_id(stream, client_id, token)?);
@@ -88,7 +109,7 @@ pub fn connect(
     let conn_for_reader = conn.clone();
     std::thread::Builder::new()
         .name("lgx-reader".into())
-        .spawn(move || reader(secure, conn_for_reader, lr, video))
+        .spawn(move || reader(secure, conn_for_reader, lr, video, clipboard))
         .expect("reader thread");
     Ok((conn, hello))
 }
@@ -99,6 +120,7 @@ fn reader(
     conn: Arc<Conn>,
     last_remote: Arc<Mutex<String>>,
     video: std::sync::mpsc::Sender<Chunk>,
+    clipboard: ClipPolicy,
 ) {
     loop {
         let (m, payload) = match secure.recv_msg() {
@@ -113,17 +135,31 @@ fn reader(
                 }
             }
             msg::CLIP_DATA_HTML => {
+                if !clipboard.allows(payload.len()) {
+                    continue;
+                }
                 if let Some((html, text)) = lgx_proto::decode_rich(&payload) {
-                    *last_remote.lock().unwrap() = crate::clip::signature(&crate::clip::Clip::Rich {
-                        html: html.clone(),
-                        text: text.clone(),
-                    });
-                    if let Err(e) = crate::clip::set_rich(&html, &text) {
-                        eprintln!("lgx-client: rich clipboard: {e}");
+                    if clipboard.rich {
+                        *last_remote.lock().unwrap() =
+                            crate::clip::signature(&crate::clip::Clip::Rich {
+                                html: html.clone(),
+                                text: text.clone(),
+                            });
+                        if let Err(e) = crate::clip::set_rich(&html, &text) {
+                            eprintln!("lgx-client: rich clipboard: {e}");
+                        }
+                    } else if !text.is_empty() {
+                        *last_remote.lock().unwrap() = text.clone();
+                        if let Err(e) = crate::clip::set_text(&text) {
+                            eprintln!("lgx-client: wl-copy: {e}");
+                        }
                     }
                 }
             }
             msg::CLIP_DATA => {
+                if !clipboard.allows(payload.len()) {
+                    continue;
+                }
                 let text = String::from_utf8_lossy(&payload).to_string();
                 *last_remote.lock().unwrap() = text.clone();
                 if let Err(e) = crate::clip::set_text(&text) {
@@ -137,4 +173,20 @@ fn reader(
         }
     }
     conn.closed.store(true, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clipboard_policy_limits() {
+        let mut p = ClipPolicy::default();
+        assert!(p.allows(1024));
+        assert!(!p.allows(1024 * 1024 + 1));
+        p.max_bytes = 0;
+        assert!(p.allows(usize::MAX));
+        p.enabled = false;
+        assert!(!p.allows(1));
+    }
 }

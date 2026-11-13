@@ -60,6 +60,9 @@ fn canonical(key: &str) -> String {
         "audio" => ("audio", "enabled"),
         "audio_connect" => ("audio", "connect"),
         "gamepads" => ("input", "gamepads"),
+        "clipboard" => ("input", "clipboard"),
+        "clipboard_rich" => ("input", "clipboard_rich"),
+        "clipboard_max_bytes" => ("input", "clipboard_max_bytes"),
         _ => ("misc", key),
     };
     format!("{section}.{name}")
@@ -117,9 +120,16 @@ impl Config {
             cfg.set("cursor", "remote");
             cfg.set("audio", "true");
         }
-        if cfg.get("gamepads").is_none() {
-            cfg.set("gamepads", "true");
-            changed = true;
+        for (key, value) in [
+            ("gamepads", "true"),
+            ("clipboard", "true"),
+            ("clipboard_rich", "true"),
+            ("clipboard_max_bytes", "1048576"),
+        ] {
+            if cfg.get(key).is_none() {
+                cfg.set(key, value);
+                changed = true;
+            }
         }
         if changed {
             if let Err(e) = cfg.save() {
@@ -150,6 +160,26 @@ impl Config {
     pub fn set_instance(&mut self, name: &str, key: &str, value: impl ToString) {
         self.values
             .insert(format!("{name}.{key}"), value.to_string());
+    }
+
+    pub fn instances(&self) -> Vec<String> {
+        let mut names = std::collections::BTreeSet::new();
+        for key in self.values.keys() {
+            if let Some((section, _)) = key.split_once('.') {
+                if ["video", "audio", "input", "misc", "network", "default"]
+                    .contains(&section)
+                {
+                    continue;
+                }
+                names.insert(section.to_string());
+            }
+        }
+        names.into_iter().collect()
+    }
+
+    pub fn has_instance(&self, name: &str) -> bool {
+        let prefix = format!("{name}.");
+        self.values.keys().any(|k| k.starts_with(&prefix))
     }
 
     pub fn get_u32(&self, key: &str) -> Option<u32> {
@@ -212,5 +242,47 @@ impl Config {
         f.sync_all()?;
         fs::set_permissions(&p, fs::Permissions::from_mode(0o600))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn names_are_safe_sections() {
+        assert!(validate_name("archlinux").is_ok());
+        assert!(validate_name("home-2").is_ok());
+        assert!(validate_name("").is_err());
+        assert!(validate_name("../x").is_err());
+        assert!(validate_name("video").is_err());
+        assert!(validate_name("input").is_err());
+        assert!(validate_name("default").is_err());
+    }
+
+    #[test]
+    fn instance_values_are_namespaced() {
+        let mut cfg = Config::default();
+        cfg.set_instance("archlinux", "server", "192.168.122.25:5902");
+        cfg.set_instance("archlinux", "token", "abc");
+        cfg.set_instance("home", "server", "10.0.0.5:5902");
+        assert_eq!(cfg.instance_get("archlinux", "token"), Some("abc"));
+        assert_eq!(cfg.instance_get("home", "server"), Some("10.0.0.5:5902"));
+        assert_eq!(cfg.instances(), vec!["archlinux", "home"]);
+        assert!(cfg.has_instance("archlinux"));
+        assert!(!cfg.has_instance("missing"));
+    }
+
+    #[test]
+    fn shared_input_settings_are_typed() {
+        let mut cfg = Config::default();
+        cfg.set("gamepads", "false");
+        cfg.set("clipboard", "false");
+        cfg.set("clipboard_rich", "false");
+        cfg.set("clipboard_max_bytes", "4096");
+        assert_eq!(cfg.get_bool("gamepads"), Some(false));
+        assert_eq!(cfg.get_bool("clipboard"), Some(false));
+        assert_eq!(cfg.get_bool("clipboard_rich"), Some(false));
+        assert_eq!(cfg.get_u32("clipboard_max_bytes"), Some(4096));
     }
 }

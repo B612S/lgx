@@ -43,6 +43,7 @@ struct Args {
     pair_listen: String,
     pair_name: Option<String>,
     revoke: Option<String>,
+    rotate: Option<String>,
     list: bool,
 }
 
@@ -81,6 +82,7 @@ fn parse_args() -> Result<Args, String> {
             .to_string(),
         pair_name: None,
         revoke: None,
+        rotate: None,
         list: false,
     };
     let mut it = std::env::args().skip(1);
@@ -109,6 +111,7 @@ fn parse_args() -> Result<Args, String> {
             "--pair-listen" => a.pair_listen = it.next().ok_or("--pair-listen")?,
             "--pair-name" => a.pair_name = Some(it.next().ok_or("--pair-name")?),
             "--revoke" => a.revoke = Some(it.next().ok_or("--revoke")?),
+            "--rotate" => a.rotate = Some(it.next().ok_or("--rotate")?),
             "--list" => a.list = true,
             "-h" | "--help" => {
                 println!(
@@ -118,7 +121,7 @@ fn parse_args() -> Result<Args, String> {
                      \x20          [--token T] [--no-audio]\n\
                      \x20          [--audio-listen ADDR] [--vpp|--no-vpp]\n\
                      \x20          [--pair] [--pair-listen ADDR] [--pair-name NAME]\n\
-                     \x20          [--list] [--revoke ID|NAME]\n\
+                     \x20          [--list] [--revoke ID|NAME] [--rotate ID|NAME]\n\
                      \x20          settings: ~/.config/lgx/server.conf"
                 );
                 std::process::exit(0);
@@ -489,6 +492,19 @@ fn main() {
         }
         return;
     }
+    if let Some(key) = args.rotate.clone() {
+        match clients::rotate(&key) {
+            Ok(Some(token)) => {
+                println!("{token}");
+                eprintln!(
+                    "lgx-server: rotated {key}; put this token into [{key}] in client.conf"
+                );
+            }
+            Ok(None) => eprintln!("lgx-server: no client matching {key}"),
+            Err(e) => eprintln!("lgx-server: rotate: {e}"),
+        }
+        return;
+    }
     if args.pair {
         if let Err(e) = pair::run(&args.pair_listen, args.pair_name.as_deref()) {
             eprintln!("lgx-server: pairing: {e}");
@@ -504,7 +520,7 @@ fn main() {
             .name("lgx-revoke-watch".into())
             .spawn(move || loop {
                 std::thread::sleep(Duration::from_secs(1));
-                if let Some(valid) = clients::valid_ids() {
+                if let Some(valid) = clients::valid_tokens() {
                     hub.revoke_missing(&valid);
                 }
             })

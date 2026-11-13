@@ -128,3 +128,26 @@ pub fn eq(a: &str, b: &str) -> bool {
     }
     diff == 0
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tokens_have_full_entropy_length() {
+        let code = generate();
+        let token = generate_token();
+        assert_eq!(code.len(), 32);
+        assert_eq!(token.len(), 64);
+        assert!(code.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert!(token.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_ne!(generate_token(), generate_token());
+    }
+
+    #[test]
+    fn constant_time_eq() {
+        assert!(eq("abc", "abc"));
+        assert!(!eq("abc", "abd"));
+        assert!(!eq("abc", "ab"));
+    }
+}

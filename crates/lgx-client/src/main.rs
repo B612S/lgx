@@ -19,6 +19,8 @@ mod pair;
 mod protocols;
 
 use std::io::Write;
+use std::os::unix::process::CommandExt;
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use lgx_proto::{evdev, msg, Msg};
@@ -42,6 +44,12 @@ struct Args {
     decoder: Option<String>,
     cursor: Option<bool>,
     gamepads: Option<bool>,
+    connections: bool,
+    list_profiles: bool,
+    check_profile: bool,
+    clipboard: Option<bool>,
+    clipboard_rich: Option<bool>,
+    clipboard_max: Option<usize>,
     frames: Option<u64>,
     pair: Option<String>,
     pair_code: Option<String>,
@@ -61,6 +69,10 @@ struct Settings {
     decoder: String,
     cursor_remote: bool,
     gamepads: bool,
+    clipboard: bool,
+    clipboard_rich: bool,
+    clipboard_max_bytes: usize,
+    reconnect: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -80,6 +92,12 @@ fn parse_args() -> Result<Args, String> {
         decoder: None,
         cursor: None,
         gamepads: None,
+        connections: true,
+        list_profiles: false,
+        check_profile: false,
+        clipboard: None,
+        clipboard_rich: None,
+        clipboard_max: None,
         frames: None,
         pair: None,
         pair_code: None,
@@ -101,6 +119,19 @@ fn parse_args() -> Result<Args, String> {
             "--audio-connect" => a.audio_connect = Some(it.next().ok_or("--audio-connect")?),
             "--gamepads" => a.gamepads = Some(true),
             "--no-gamepads" => a.gamepads = Some(false),
+            "--no-reconnect" => a.connections = false,
+            "--list" => a.list_profiles = true,
+            "--check" => a.check_profile = true,
+            "--no-clipboard" => a.clipboard = Some(false),
+            "--no-rich-clipboard" => a.clipboard_rich = Some(false),
+            "--clipboard-max-bytes" => {
+                a.clipboard_max = Some(
+                    it.next()
+                        .ok_or("--clipboard-max-bytes")?
+                        .parse()
+                        .map_err(|_| "--clipboard-max-bytes")?,
+                )
+            }
             "--screenshot" => a.screenshot = Some(it.next().ok_or("--screenshot")?),
             "--token" => a.token = Some(it.next().ok_or("--token")?),
             "--client-id" => a.client_id = Some(it.next().ok_or("--client-id")?),
@@ -126,7 +157,9 @@ fn parse_args() -> Result<Args, String> {
                      \x20          [--decoder auto|cuda|vaapi|software]\n\
                      \x20          [--cursor local|remote] [--fullscreen|--windowed]\n\
                      \x20          [--vsync] [--audio] [--audio-connect ADDR]\n\
-                     \x20          [--gamepads|--no-gamepads]\n\
+                     \x20          [--gamepads|--no-gamepads] [--no-reconnect]\n\
+                     \x20          [--list] [--check]\n\
+                     \x20          [--no-clipboard] [--no-rich-clipboard]\n\
                      \x20          [--no-window] [--bench SECONDS] [--frames N]\n\
                      \x20          [--screenshot FILE]\n\
                      \x20          [--pair HOST:PORT --pair-code CODE] [--client-id ID]"
@@ -145,10 +178,12 @@ fn parse_args() -> Result<Args, String> {
     if let Some(name) = profile {
         a.name = name;
     }
-    if a.name.is_empty() {
+    if a.name.is_empty() && !a.list_profiles {
         return Err("usage: lgx-client NAME [options]".into());
     }
-    config::validate_name(&a.name).map_err(|e| e.to_string())?;
+    if !a.name.is_empty() {
+        config::validate_name(&a.name).map_err(|e| e.to_string())?;
+    }
     Ok(a)
 }
 
@@ -236,6 +271,46 @@ fn main() {
             std::process::exit(2);
         }
     };
+
+    if args.list_profiles {
+        let cfg = config::Config::load_or_create();
+        let profiles = cfg.instances();
+        if profiles.is_empty() {
+            println!("no profiles in {}", config::path().display());
+        } else {
+            println!("{}", config::path().display());
+            for name in profiles {
+                let server = cfg.instance_get(&name, "server").unwrap_or("-");
+                let token = if cfg.instance_get(&name, "token").is_some_and(|t| !t.is_empty()) {
+                    "token"
+                } else {
+                    "no-token"
+                };
+                println!("  {name:<20} {server:<28} {token}");
+            }
+        }
+        return;
+    }
+    if args.check_profile {
+        let cfg = config::Config::load();
+        let name = &args.name;
+        let server = cfg.instance_get(name, "server");
+        let token = cfg.instance_get(name, "token").filter(|t| !t.is_empty());
+        if !cfg.has_instance(name) || server.is_none() || token.is_none() {
+            eprintln!(
+                "lgx-client: [{name}] invalid: server={} token={}",
+                if server.is_some() { "yes" } else { "no" },
+                if token.is_some() { "yes" } else { "no" }
+            );
+            std::process::exit(2);
+        }
+        println!(
+            "[{name}] ok: server={} token=yes config={}",
+            server.unwrap(),
+            config::path().display()
+        );
+        return;
+    }
 
     if let Some(addr) = args.pair.clone() {
         let code = match args.pair_code.as_deref() {
@@ -339,6 +414,16 @@ fn main() {
             .gamepads
             .or_else(|| cfg.get_bool("gamepads"))
             .unwrap_or(true),
+        clipboard: args.clipboard.or_else(|| cfg.get_bool("clipboard")).unwrap_or(true),
+        clipboard_rich: args
+            .clipboard_rich
+            .or_else(|| cfg.get_bool("clipboard_rich"))
+            .unwrap_or(true),
+        clipboard_max_bytes: args
+            .clipboard_max
+            .or_else(|| cfg.get_u32("clipboard_max_bytes").map(|v| v as usize))
+            .unwrap_or(1024 * 1024),
+        reconnect: args.connections,
     };
     if s.token.is_empty() {
         eprintln!("lgx-client: no token in [{}] for {}", s.name, s.server);
@@ -369,34 +454,68 @@ fn main() {
         }
     };
 
-    let (video_tx, video_rx) = std::sync::mpsc::channel::<dec::Chunk>();
-    let (conn, hello) = match net::connect(&server, &keymap, &s.client_id, &token, video_tx) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("lgx-client: cannot connect to {server}: {e}");
-            std::process::exit(1);
+    let mut connect_attempt = reconnect_attempt();
+    let (conn, hello, video_rx) = loop {
+        let (video_tx, video_rx) = std::sync::mpsc::channel::<dec::Chunk>();
+        let clip_policy = net::ClipPolicy {
+            enabled: s.clipboard,
+            rich: s.clipboard_rich,
+            max_bytes: s.clipboard_max_bytes,
+        };
+        match net::connect(&server, &keymap, &s.client_id, &token, video_tx, clip_policy) {
+            Ok((conn, hello)) => break (conn, hello, video_rx),
+            Err(e) => {
+                if !s.reconnect || connect_attempt >= MAX_RECONNECT_ATTEMPTS {
+                    eprintln!("lgx-client: cannot connect to {server}: {e}");
+                    std::process::exit(1);
+                }
+                connect_attempt += 1;
+                let delay = reconnect_delay(connect_attempt);
+                eprintln!(
+                    "lgx-client: cannot connect to {server}: {e}; retrying in {}s (attempt {connect_attempt}/{MAX_RECONNECT_ATTEMPTS})",
+                    delay.as_secs()
+                );
+                std::thread::sleep(delay);
+            }
         }
     };
+    // Remember the attempt count in case this session drops quickly.
+    std::env::set_var(RECONNECT_ATTEMPT_ENV, connect_attempt.to_string());
     let _ = conn.send(
         Msg::new(msg::CURSOR, s.cursor_remote as u16, 0, 0),
         &[],
     );
     eprintln!("lgx-client: server HEVC {}x{}", hello.width, hello.height);
 
-    {
+    if s.clipboard {
         let conn = conn.clone();
+        let rich = s.clipboard_rich;
+        let max_bytes = s.clipboard_max_bytes;
         clip::watch(
             move |clip| {
                 let sig = clip::signature(&clip);
                 if sig == *conn.last_remote.lock().unwrap() {
                     return;
                 }
+                let size = match &clip {
+                    clip::Clip::Text(text) => text.len(),
+                    clip::Clip::Rich { html, text } => html.len() + text.len(),
+                };
+                if max_bytes != 0 && size > max_bytes {
+                    return;
+                }
                 match clip {
-                    clip::Clip::Rich { html, text } if !html.is_empty() => {
+                    clip::Clip::Rich { html, text } if !html.is_empty() && rich => {
                         let payload = lgx_proto::encode_rich(&html, &text);
                         let _ = conn.send(
                             Msg::new(msg::CLIP_SET_HTML, 0, payload.len() as i32, 0),
                             &payload,
+                        );
+                    }
+                    clip::Clip::Rich { text, .. } if !text.is_empty() => {
+                        let _ = conn.send(
+                            Msg::new(msg::CLIP_SET, 0, text.len() as i32, 0),
+                            text.as_bytes(),
                         );
                     }
                     clip::Clip::Text(text) if !text.is_empty() => {
@@ -410,6 +529,8 @@ fn main() {
             },
             true,
         );
+    } else {
+        eprintln!("lgx-client: clipboard forwarding disabled");
     }
 
     if s.audio {
@@ -432,6 +553,7 @@ fn main() {
             .ok();
     }
 
+    let session_started = Instant::now();
     let deadline = args.bench.map(|secs| Instant::now() + Duration::from_secs_f64(secs));
     let max_frames = args.frames;
 
@@ -576,6 +698,7 @@ fn main() {
     let mut draw_count = 0u64;
     let started = Instant::now();
     let mut quit = false;
+    let mut connection_lost = false;
     let mut redraw = true;
     let mut swallow_f_keyup = false;
     let mut fullscreen_hold: Option<(Instant, (u32, u32))> = None;
@@ -602,6 +725,7 @@ fn main() {
         }
         if conn.closed.load(std::sync::atomic::Ordering::Relaxed) {
             eprintln!("lgx-client: server closed the connection");
+            connection_lost = true;
             quit = true;
         }
 
@@ -867,6 +991,60 @@ fn main() {
     // a decode thread is still using its context during process exit.
     conn.close();
     let _ = decoder.join();
+
+    if connection_lost && s.reconnect {
+        let attempt = if session_started.elapsed() > Duration::from_secs(30) {
+            0
+        } else {
+            reconnect_attempt()
+        };
+        let next = attempt + 1;
+        if next > MAX_RECONNECT_ATTEMPTS {
+            eprintln!(
+                "lgx-client: giving up after {MAX_RECONNECT_ATTEMPTS} reconnect attempts"
+            );
+            std::process::exit(1);
+        }
+        reconnect_exec(next);
+    }
+}
+
+const RECONNECT_ATTEMPT_ENV: &str = "LGX_RECONNECT_ATTEMPT";
+const MAX_RECONNECT_ATTEMPTS: u32 = 10;
+
+fn reconnect_attempt() -> u32 {
+    std::env::var(RECONNECT_ATTEMPT_ENV)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
+fn reconnect_delay(attempt: u32) -> Duration {
+    let secs = 1u64 << attempt.min(4);
+    Duration::from_secs(secs.min(15))
+}
+
+fn reconnect_exec(attempt: u32) -> ! {
+    let delay = reconnect_delay(attempt);
+    eprintln!(
+        "lgx-client: reconnecting in {}s (attempt {attempt}/{MAX_RECONNECT_ATTEMPTS})",
+        delay.as_secs()
+    );
+    std::thread::sleep(delay);
+    let exe = match std::env::current_exe() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("lgx-client: cannot find own executable: {e}");
+            std::process::exit(1);
+        }
+    };
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    let err = Command::new(exe)
+        .args(args)
+        .env(RECONNECT_ATTEMPT_ENV, attempt.to_string())
+        .exec();
+    eprintln!("lgx-client: cannot restart for reconnect: {err}");
+    std::process::exit(1);
 }
 
 fn toggle_fullscreen(window: &mut sdl3::video::Window) {
@@ -1029,5 +1207,25 @@ fn btn_code(b: sdl3::mouse::MouseButton) -> Option<u16> {
         X1 => Some(evdev::BTN_SIDE),
         X2 => Some(evdev::BTN_EXTRA),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reconnect_backoff_is_bounded() {
+        assert_eq!(reconnect_delay(0), Duration::from_secs(1));
+        assert_eq!(reconnect_delay(1), Duration::from_secs(2));
+        assert_eq!(reconnect_delay(4), Duration::from_secs(15));
+        assert_eq!(reconnect_delay(99), Duration::from_secs(15));
+    }
+
+    #[test]
+    fn host_display_strips_ports() {
+        assert_eq!(display_host("192.168.122.25:5902"), "192.168.122.25");
+        assert_eq!(display_host("[::1]:5902"), "::1");
+        assert_eq!(display_host("example"), "example");
     }
 }

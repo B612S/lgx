@@ -7,7 +7,7 @@
 //! Format (tab separated, mode 0600):
 //!   id<TAB>name<TAB>token<TAB>created-unix
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
@@ -339,8 +339,66 @@ pub fn print_list() {
     }
 }
 
-pub fn valid_ids() -> Option<HashSet<String>> {
-    load()
-        .ok()
-        .map(|list| list.into_iter().map(|e| e.id).collect())
+pub fn token_fingerprint(token: &str) -> [u8; 32] {
+    let digest = ring::digest::digest(&ring::digest::SHA256, token.as_bytes());
+    let mut out = [0u8; 32];
+    out.copy_from_slice(digest.as_ref());
+    out
+}
+
+/// Registry id -> token fingerprint. The running server compares this against
+/// active clients so a rotated token also terminates the old session.
+pub fn valid_tokens() -> Option<HashMap<String, [u8; 32]>> {
+    load().ok().map(|list| {
+        list.into_iter()
+            .map(|e| (e.id, token_fingerprint(&e.token)))
+            .collect()
+    })
+}
+
+/// Replaces the token of an existing client (matched by id or name). Returns
+/// the new token for the administrator to put into the client profile.
+pub fn rotate(key: &str) -> io::Result<Option<String>> {
+    let _guard = lock()?;
+    let mut list = load()?;
+    let Some(pos) = list.iter().position(|e| e.id == key || e.name == key) else {
+        return Ok(None);
+    };
+    let token = auth::generate_token();
+    list[pos].token = token.clone();
+    save(&list)?;
+    Ok(Some(token))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn token_seal_roundtrip_and_wrong_key() {
+        let master = [7u8; 32];
+        let sealed = seal_token(&master, "0123456789abcdef").unwrap();
+        assert!(sealed.starts_with("enc:"));
+        assert!(!sealed.contains("0123456789abcdef"));
+        assert_eq!(open_token(&master, &sealed).unwrap(), "0123456789abcdef");
+        let other = [8u8; 32];
+        assert!(open_token(&other, &sealed).is_err());
+        assert!(open_token(&master, "plaintext").is_err());
+        assert!(open_token(&master, "enc:zz:zz").is_err());
+    }
+
+    #[test]
+    fn fingerprints_are_stable_and_distinct() {
+        assert_eq!(token_fingerprint("abc"), token_fingerprint("abc"));
+        assert_ne!(token_fingerprint("abc"), token_fingerprint("abd"));
+        assert_eq!(token_fingerprint("abc").len(), 32);
+    }
+
+    #[test]
+    fn names_are_restricted() {
+        assert_eq!(clean_name("arch linux"), "archlinux");
+        assert_eq!(clean_name("../x"), "..x");
+        assert_eq!(clean_name(""), "client");
+        assert!(clean_name(&"a".repeat(100)).len() <= 64);
+    }
 }
