@@ -37,6 +37,8 @@ it encodes at 160 fps; `--fps` is only an override, not the default.
   server reads the refresh rate from `wl_output`.
 - Vulkan presentation with a full-range BT.709 shader, immediate present mode
   and letterboxing; no OpenGL/EGL dependency.
+- Only one client instance can run per server IP. A second launch for the same
+  IP exits immediately without a window; different IPs can run side by side.
 - Client decoder selection is automatic: the Vulkan device vendor says NVIDIA
   -> CUDA/NVDEC, otherwise VAAPI, with a software fallback. `--decoder`
   overrides it.

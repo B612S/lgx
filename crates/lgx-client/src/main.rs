@@ -12,6 +12,7 @@ mod dec;
 mod vk;
 mod hid;
 mod inhibit;
+mod instance;
 mod net;
 mod pad;
 mod protocols;
@@ -245,6 +246,18 @@ fn main() {
             .cursor
             .or_else(|| cfg.get("cursor").map(|v| v != "local"))
             .unwrap_or(true),
+    };
+    let this_host = display_host(&s.server).to_string();
+    let _instance = match instance::acquire(&this_host) {
+        Ok(Some(guard)) => Some(guard),
+        Ok(None) => {
+            eprintln!("lgx-client: already running for {this_host}");
+            return;
+        }
+        Err(e) => {
+            eprintln!("lgx-client: cannot take the instance lock: {e}");
+            None
+        }
     };
     let (server, token) = (s.server.clone(), s.token.clone());
     let (mut keyboard, keymap) = match Keyboard::new() {

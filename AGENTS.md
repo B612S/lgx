@@ -66,6 +66,10 @@ Commit format: `area: short imperative summary`, for example
 
 ## Client UI
 
+- One instance per server host: the client takes a non-blocking `flock` on
+  `$XDG_RUNTIME_DIR/lgx-client-<uid>-<hash>.lock`. A second launch for the same
+  host exits before connecting or creating a window; different hosts use
+  different locks.
 - The window title is `lgx — <server IP>` and must not contain live stats.
   `LGX_DEBUG_FPS` still prints per-second diagnostics to stderr.
 - `Ctrl+Shift+Alt+F` is the only client hotkey; it toggles fullscreen. The F
