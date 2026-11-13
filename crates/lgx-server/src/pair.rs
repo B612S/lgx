@@ -19,7 +19,7 @@ use crate::clients;
 pub fn run(addr: &str, name: Option<&str>) -> io::Result<()> {
     clients::ensure()?;
     let id = auth::generate();
-    let token = auth::generate();
+    let token = auth::generate_token();
     let name = name
         .map(clients::clean_name)
         .unwrap_or_else(|| format!("client-{}", &id[..8]));

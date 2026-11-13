@@ -97,15 +97,23 @@ pub fn save(token: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// 16 random bytes from the OS CSPRNG. Fail closed: a predictable token or
-/// pairing code is worse than refusing to start.
-pub fn generate() -> String {
+fn random_hex(bytes: usize) -> String {
     use ring::rand::{SecureRandom, SystemRandom};
-    let mut buf = [0u8; 16];
+    let mut buf = vec![0u8; bytes];
     SystemRandom::new()
         .fill(&mut buf)
         .expect("lgx: system CSPRNG unavailable");
     buf.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// 128-bit one-time pairing code.
+pub fn generate() -> String {
+    random_hex(16)
+}
+
+/// 256-bit long-term client token.
+pub fn generate_token() -> String {
+    random_hex(32)
 }
 
 /// Constant-time comparison.

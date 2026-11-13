@@ -16,6 +16,8 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use lgx_proto::auth;
+use ring::aead;
+use ring::rand::{SecureRandom, SystemRandom};
 
 pub const DEFAULT_ID: &str = "default";
 
@@ -76,6 +78,111 @@ fn parse(text: &str) -> Vec<Entry> {
     out
 }
 
+fn master_path() -> PathBuf {
+    path().with_file_name("master.key")
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn unhex(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let b = s.as_bytes();
+    for i in (0..b.len()).step_by(2) {
+        let hi = (b[i] as char).to_digit(16)? as u8;
+        let lo = (b[i + 1] as char).to_digit(16)? as u8;
+        out.push((hi << 4) | lo);
+    }
+    Some(out)
+}
+
+fn master_key() -> io::Result<[u8; 32]> {
+    let p = master_path();
+    match fs::read(&p) {
+        Ok(v) if v.len() == 32 => {
+            let _ = fs::set_permissions(&p, fs::Permissions::from_mode(0o600));
+            Ok(v.try_into().expect("32 bytes"))
+        }
+        Ok(_) => Err(io::Error::other("master.key has the wrong length")),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            let mut key = [0u8; 32];
+            SystemRandom::new()
+                .fill(&mut key)
+                .map_err(|_| io::Error::other("system CSPRNG unavailable"))?;
+            match OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&p)
+            {
+                Ok(mut f) => {
+                    use std::io::Write;
+                    f.write_all(&key)?;
+                    f.sync_all()?;
+                    if let Some(dir) = p.parent() {
+                        if let Ok(d) = File::open(dir) {
+                            let _ = d.sync_all();
+                        }
+                    }
+                    Ok(key)
+                }
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => master_key(),
+                Err(e) => Err(e),
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn seal_token(master: &[u8; 32], token: &str) -> io::Result<String> {
+    let key = aead::UnboundKey::new(&aead::AES_256_GCM, master)
+        .map_err(|_| io::Error::other("token key"))?;
+    let key = aead::LessSafeKey::new(key);
+    let mut nonce = [0u8; 12];
+    SystemRandom::new()
+        .fill(&mut nonce)
+        .map_err(|_| io::Error::other("system CSPRNG unavailable"))?;
+    let mut ct = token.as_bytes().to_vec();
+    key.seal_in_place_append_tag(
+        aead::Nonce::assume_unique_for_key(nonce),
+        aead::Aad::from(b"lgx-client-token-v1"),
+        &mut ct,
+    )
+    .map_err(|_| io::Error::other("token encryption"))?;
+    Ok(format!("enc:{}:{}", hex(&nonce), hex(&ct)))
+}
+
+fn open_token(master: &[u8; 32], stored: &str) -> io::Result<String> {
+    let rest = stored
+        .strip_prefix("enc:")
+        .ok_or_else(|| io::Error::other("legacy plaintext token"))?;
+    let (nhex, chex) = rest
+        .split_once(':')
+        .ok_or_else(|| io::Error::other("malformed encrypted token"))?;
+    let nonce = unhex(nhex).ok_or_else(|| io::Error::other("malformed token nonce"))?;
+    let mut ct = unhex(chex).ok_or_else(|| io::Error::other("malformed token ciphertext"))?;
+    if nonce.len() != 12 {
+        return Err(io::Error::other("malformed token nonce"));
+    }
+    let key = aead::UnboundKey::new(&aead::AES_256_GCM, master)
+        .map_err(|_| io::Error::other("token key"))?;
+    let key = aead::LessSafeKey::new(key);
+    let nonce: [u8; 12] = nonce.try_into().expect("12 bytes");
+    let pt = key
+        .open_in_place(
+            aead::Nonce::assume_unique_for_key(nonce),
+            aead::Aad::from(b"lgx-client-token-v1"),
+            &mut ct,
+        )
+        .map_err(|_| io::Error::other("token decryption failed (master.key changed?)"))?;
+    String::from_utf8(pt.to_vec()).map_err(|_| io::Error::other("token is not UTF-8"))
+}
+
 fn lock() -> io::Result<File> {
     let p = path().with_extension("lock");
     if let Some(dir) = p.parent() {
@@ -98,7 +205,14 @@ pub fn load() -> io::Result<Vec<Entry>> {
     match fs::read_to_string(path()) {
         Ok(text) => {
             let _ = fs::set_permissions(path(), fs::Permissions::from_mode(0o600));
-            Ok(parse(&text))
+            let mut entries = parse(&text);
+            let master = master_key()?;
+            for e in &mut entries {
+                if e.token.starts_with("enc:") {
+                    e.token = open_token(&master, &e.token)?;
+                }
+            }
+            Ok(entries)
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(e) => Err(e),
@@ -119,14 +233,12 @@ pub fn save(entries: &[Entry]) -> io::Result<()> {
         .custom_flags(libc::O_NOFOLLOW)
         .open(&tmp)?;
     writeln!(f, "# lgx clients: id\tname\ttoken\tcreated")?;
+    let master = master_key()?;
     let mut sorted: Vec<_> = entries.to_vec();
     sorted.sort_by_key(|e| e.created);
     for e in &sorted {
-        writeln!(
-            f,
-            "{}\t{}\t{}\t{}",
-            e.id, e.name, e.token, e.created
-        )?;
+        let sealed = seal_token(&master, &e.token)?;
+        writeln!(f, "{}\t{}\t{}\t{}", e.id, e.name, sealed, e.created)?;
     }
     f.sync_all()?;
     fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
@@ -145,12 +257,15 @@ pub fn save(entries: &[Entry]) -> io::Result<()> {
 pub fn ensure() -> io::Result<()> {
     let _guard = lock()?;
     if path().exists() {
+        // Re-save so legacy plaintext tokens are moved under master.key.
+        let list = load()?;
+        save(&list)?;
         return Ok(());
     }
     let token = match auth::load() {
         Some(t) => t,
         None => {
-            let t = auth::generate();
+            let t = auth::generate_token();
             let _ = auth::save(&t);
             t
         }

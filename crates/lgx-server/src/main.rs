@@ -544,39 +544,24 @@ fn main() {
     {
         let hub = hub.clone();
         let last_remote = last_remote.clone();
-        std::thread::Builder::new()
-            .name("lgx-clip-poll".into())
-            .spawn(move || {
-                // Do not push a pre-existing guest clipboard to a new client:
-                // the client sends its own host text first, and that wins.
-                let mut last_sent = match clip::get() {
-                    Ok(clip) => clip::signature(&clip),
-                    _ => String::new(),
-                };
-                loop {
-                    std::thread::sleep(Duration::from_millis(300));
-                    let clip = match clip::get() {
-                        Ok(clip) => clip,
-                        _ => continue,
-                    };
-                    let sig = clip::signature(&clip);
-                    if sig == last_sent || sig == *last_remote.lock().unwrap() {
-                        last_sent = sig;
-                        continue;
-                    }
-                    match clip {
-                        clip::Clip::Rich { html, text } if !html.is_empty() => {
-                            hub.broadcast_rich(&html, &text);
-                        }
-                        clip::Clip::Text(text) if !text.is_empty() => {
-                            hub.broadcast_clip(&text);
-                        }
-                        _ => {}
-                    }
-                    last_sent = sig;
+        clip::watch(
+            move |clip| {
+                let sig = clip::signature(&clip);
+                if sig == *last_remote.lock().unwrap() {
+                    return;
                 }
-            })
-            .ok();
+                match clip {
+                    clip::Clip::Rich { html, text } if !html.is_empty() => {
+                        hub.broadcast_rich(&html, &text);
+                    }
+                    clip::Clip::Text(text) if !text.is_empty() => {
+                        hub.broadcast_clip(&text);
+                    }
+                    _ => {}
+                }
+            },
+            false,
+        );
     }
 
     let stream = match Stream::new(&args) {

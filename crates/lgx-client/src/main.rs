@@ -325,41 +325,31 @@ fn main() {
 
     {
         let conn = conn.clone();
-        std::thread::Builder::new()
-            .name("lgx-clip-poll".into())
-            .spawn(move || {
-                let mut last_sent = String::new();
-                loop {
-                    std::thread::sleep(Duration::from_millis(300));
-                    let clip = match clip::get() {
-                        Ok(clip) => clip,
-                        _ => continue,
-                    };
-                    let sig = clip::signature(&clip);
-                    if sig == last_sent || sig == *conn.last_remote.lock().unwrap() {
-                        last_sent = sig;
-                        continue;
-                    }
-                    match clip {
-                        clip::Clip::Rich { html, text } if !html.is_empty() => {
-                            let payload = lgx_proto::encode_rich(&html, &text);
-                            let _ = conn.send(
-                                Msg::new(msg::CLIP_SET_HTML, 0, payload.len() as i32, 0),
-                                &payload,
-                            );
-                        }
-                        clip::Clip::Text(text) if !text.is_empty() => {
-                            let _ = conn.send(
-                                Msg::new(msg::CLIP_SET, 0, text.len() as i32, 0),
-                                text.as_bytes(),
-                            );
-                        }
-                        _ => {}
-                    }
-                    last_sent = sig;
+        clip::watch(
+            move |clip| {
+                let sig = clip::signature(&clip);
+                if sig == *conn.last_remote.lock().unwrap() {
+                    return;
                 }
-            })
-            .ok();
+                match clip {
+                    clip::Clip::Rich { html, text } if !html.is_empty() => {
+                        let payload = lgx_proto::encode_rich(&html, &text);
+                        let _ = conn.send(
+                            Msg::new(msg::CLIP_SET_HTML, 0, payload.len() as i32, 0),
+                            &payload,
+                        );
+                    }
+                    clip::Clip::Text(text) if !text.is_empty() => {
+                        let _ = conn.send(
+                            Msg::new(msg::CLIP_SET, 0, text.len() as i32, 0),
+                            text.as_bytes(),
+                        );
+                    }
+                    _ => {}
+                }
+            },
+            true,
+        );
     }
 
     if s.audio {

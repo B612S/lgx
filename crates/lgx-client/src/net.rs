@@ -85,28 +85,6 @@ pub fn connect(
         bytes: AtomicU64::new(0),
         closed: std::sync::atomic::AtomicBool::new(false),
     });
-    // Host clipboard wins over a pre-existing guest clipboard on connect.
-    if let Ok(clip) = crate::clip::get() {
-        let sig = crate::clip::signature(&clip);
-        match clip {
-            crate::clip::Clip::Rich { html, text } if !html.is_empty() => {
-                let payload = lgx_proto::encode_rich(&html, &text);
-                let _ = secure.send_msg(
-                    Msg::new(msg::CLIP_SET_HTML, 0, payload.len() as i32, 0),
-                    &payload,
-                );
-                *conn.last_remote.lock().unwrap() = sig;
-            }
-            crate::clip::Clip::Text(text) if !text.is_empty() => {
-                let _ = secure.send_msg(
-                    Msg::new(msg::CLIP_SET, 0, text.len() as i32, 0),
-                    text.as_bytes(),
-                );
-                *conn.last_remote.lock().unwrap() = sig;
-            }
-            _ => {}
-        }
-    }
     let conn_for_reader = conn.clone();
     std::thread::Builder::new()
         .name("lgx-reader".into())

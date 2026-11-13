@@ -155,6 +155,7 @@ dependencies = [
  "lgx-proto",
  "libc",
  "memmap2",
+ "ring",
  "wayland-backend",
  "wayland-client",
  "wayland-scanner",

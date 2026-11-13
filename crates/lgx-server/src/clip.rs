@@ -1,7 +1,10 @@
-//! Guest clipboard through wl-clipboard, including file lists.
+//! Guest clipboard through wl-clipboard-rs (text and HTML).
 
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::process::{Command, Stdio};
+use std::time::Duration;
+
+use wl_clipboard_rs::{paste, watch};
 
 
 #[derive(Clone, Debug)]
@@ -50,34 +53,75 @@ pub fn set_rich(html: &str, text: &str) -> io::Result<()> {
 }
 
 
-pub fn get() -> io::Result<Clip> {
-    let types = Command::new("timeout")
-        .args(["3", "wl-paste", "--list-types"])
-        .stderr(Stdio::null())
-        .output()?;
-    let types = String::from_utf8_lossy(&types.stdout);
-    if types.lines().any(|t| t.trim().starts_with("text/html")) {
-        let html = Command::new("timeout")
-            .args(["3", "wl-paste", "--type", "text/html", "--no-newline"])
-            .stderr(Stdio::null())
-            .output()?;
-        let html = String::from_utf8_lossy(&html.stdout).into_owned();
-        if !html.is_empty() {
-            let plain = Command::new("timeout")
-                .args(["3", "wl-paste", "--no-newline"])
-                .stderr(Stdio::null())
-                .output()?;
-            let text = String::from_utf8_lossy(&plain.stdout).into_owned();
-            return Ok(Clip::Rich { html, text });
+
+fn read_offer(mime_types: &[String], offer: &mut watch::Offer<'_>) -> Option<Clip> {
+    if mime_types.iter().any(|m| m == "text/uri-list") {
+        return None;
+    }
+    fn read(offer: &mut watch::Offer<'_>, mime: &str) -> Option<String> {
+        let mut pipe = offer.receive(mime).ok()?;
+        let mut text = String::new();
+        pipe.read_to_string(&mut text).ok()?;
+        Some(text)
+    }
+    if let Some(html_mime) = mime_types.iter().find(|m| m.starts_with("text/html")) {
+        if let Some(html) = read(offer, html_mime) {
+            if !html.is_empty() {
+                let text = ["text/plain;charset=utf-8", "text/plain"]
+                    .iter()
+                    .find_map(|m| read(offer, m))
+                    .unwrap_or_default();
+                return Some(Clip::Rich { html, text });
+            }
         }
     }
-    // File clipboard is intentionally not synchronized.
-    if types.lines().any(|t| t.trim() == "text/uri-list") {
-        return Ok(Clip::Text(String::new()));
+    for mime in ["text/plain;charset=utf-8", "text/plain"] {
+        if let Some(text) = read(offer, mime) {
+            if !text.is_empty() {
+                return Some(Clip::Text(text));
+            }
+        }
     }
-    let out = Command::new("timeout")
-        .args(["3", "wl-paste", "--no-newline"])
-        .stderr(Stdio::null())
-        .output()?;
-    Ok(Clip::Text(String::from_utf8_lossy(&out.stdout).into_owned()))
+    None
+}
+
+/// Event-driven clipboard watcher. The first event may be skipped on the
+/// server so an old guest clipboard cannot overwrite the host on connect.
+pub fn watch(mut on_clip: impl FnMut(Clip) + Send + 'static, send_initial: bool) {
+    std::thread::Builder::new()
+        .name("lgx-clip-watch".into())
+        .spawn(move || {
+            let mut watcher = match watch::Watcher::new(
+                watch::ClipboardType::Regular,
+                paste::Seat::Unspecified,
+            ) {
+                Ok(w) => w,
+                Err(e) => {
+                    eprintln!("lgx: clipboard watcher: {e}");
+                    return;
+                }
+            };
+            let mut first = true;
+            loop {
+                match watcher.next_event() {
+                    Ok(Some(watch::ClipboardEvent::Changed { mime_types, mut offer, .. })) => {
+                        let initial = first;
+                        first = false;
+                        if initial && !send_initial {
+                            continue;
+                        }
+                        if let Some(clip) = read_offer(&mime_types, &mut offer) {
+                            on_clip(clip);
+                        }
+                    }
+                    Ok(Some(watch::ClipboardEvent::Cleared { .. })) => {}
+                    Ok(None) => break,
+                    Err(e) => {
+                        eprintln!("lgx: clipboard watcher: {e}");
+                        std::thread::sleep(Duration::from_secs(1));
+                    }
+                }
+            }
+        })
+        .ok();
 }

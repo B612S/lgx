@@ -223,6 +223,16 @@ first run after upgrading, the server migrates the old global token into a
 `default` registry entry, so an existing client keeps working. Old clients
 that do not send an ID must be updated.
 
+### Token protection at rest
+
+New pairings issue 256-bit tokens. The server does not store them in plaintext:
+`~/.config/lgx/clients` contains AES-256-GCM ciphertext under a separate
+random `~/.config/lgx/master.key` (32 bytes, mode 0600). A leaked registry
+alone cannot be used without the master key; the client keeps its token in
+`~/.config/lgx/token` (mode 0600), because it is the shared PSK. Back up
+`master.key` with the registry: if it is lost, every client must be paired
+again. The source code alone cannot derive a token.
+
 `--pair-listen` defaults to `0.0.0.0:5904`; the address printed in the example
 is the server's LAN address.
 

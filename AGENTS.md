@@ -134,17 +134,19 @@ the Vulkan shader converts full-range BT.709, and the HEVC VUI says
 - Client scancodes must be masked with `& 0x1ff`.
 - `MODS` is sent before every `KEY`; the virtual keyboard needs explicit
   modifiers.
-- **Rich text only.** Both sides poll every 300 ms and ignore file clipboard
-  entries. If the source offers `text/html`, `clip::get` returns
+- **Rich text only, event-driven.** Both sides use
+  `wl-clipboard_rs::watch::Watcher`; no 300 ms polling and no `wl-paste`
+  subprocess. The server skips the watcher's initial event so an old guest
+  clipboard cannot overwrite the host on connect; the client sends its initial
+  host clipboard. If the offer contains `text/html`, the reader returns
   `Clip::Rich { html, text }`; otherwise `Clip::Text`. The client sends
   `CLIP_SET_HTML` (u32 html length + HTML + plain) and the server broadcasts
   `CLIP_DATA_HTML`; plain uses `CLIP_SET`/`CLIP_DATA`.
 - Rich clipboard is installed with `wl-clipboard-rs::copy_multi`, offering
   plain text first and `text/html` second. Plain must be first so the extra
   text MIME fallbacks use it; never put HTML first. Files are not synchronized.
-- On connect the client sends its current host clipboard first and the server
-  starts its poll with the pre-existing guest clipboard already marked as
-  sent, so the host clipboard wins and an old guest one is not pushed over it.
+- On connect the client's watcher sends its current host clipboard; the server
+  ignores its watcher's first event, so the host clipboard wins.
 - Never add file synchronization, clipboard hotkeys, `CLIP_GET`/`CLIP_ACK` or
   a paste injection back. Normal Ctrl+C/Ctrl+V is the whole UX.
 - Audio is on by default (`--no-audio` disables it) and uses the same secure
@@ -161,9 +163,14 @@ the Vulkan shader converts full-range BT.709, and the HEVC VUI says
   accepts exactly one client for three minutes and exits after five failed
   attempts. It must not become a remote, always-on endpoint.
 - Per-client registry: `~/.config/lgx/clients`, mode 0600, tab-separated
-  `id<TAB>name<TAB>token<TAB>created`. `clients::ensure` migrates a legacy
-  single-line `token` file into the `default` entry. The registry is the source
-  of truth; do not add a global token path back.
+  `id<TAB>name<TAB>enc:nonce:token-ciphertext<TAB>created`. Tokens are
+  AES-256-GCM sealed under `~/.config/lgx/master.key` (32 random bytes, 0600),
+  so the registry alone is useless. New tokens are 256-bit; legacy 128-bit
+  tokens are re-encrypted on startup. `clients::ensure` migrates a legacy
+  single-line `token` file into the `default` entry. The registry and master
+  key are the source of truth; do not add a global token path back.
+- Back up `master.key` with the registry. Losing it makes encrypted tokens
+  undecryptable and requires re-pairing every client; never log or commit it.
 - Pairing generates a new ID and token, sends `id\ntoken` over the
   code-authenticated secure channel, waits for `ok`, and only then adds the
   entry. A failed pairing must not create an entry.
