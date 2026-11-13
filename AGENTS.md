@@ -149,7 +149,8 @@ the Vulkan shader converts full-range BT.709, and the HEVC VUI says
 - A newly connected client receives the server's current clipboard (text or
   files) in `handle()`, and the server sets `last_remote` so its poll does not
   immediately echo it back.
-- Audio is on by default (`--no-audio` disables it). The server records
+- Audio is on by default (`--no-audio` disables it) and uses the same secure
+  handshake/record layer with the same token PSK. The server records
   `parec --device=@DEFAULT_MONITOR@` (48 kHz s16le stereo, 20 ms latency) and
   the client plays `pacat --playback --device=@DEFAULT_SINK@`. `pw-cat` is not
   used: its `--target` auto-connected to `easyeffects_source` (the microphone)
@@ -157,8 +158,17 @@ the Vulkan shader converts full-range BT.709, and the HEVC VUI says
 
 ## Transport
 
+- **No plaintext TCP.** Both the main port and the audio port start with an
+  `LGX1` handshake: ephemeral X25519, two random 32-byte nonces, and the auth
+  token mixed as the HKDF-SHA256 IKM. Each direction gets an AES-256-GCM key
+  and an independent nonce counter. Never add a plaintext fallback.
+- `crates/lgx-proto/src/secure.rs` owns the handshake and record layer:
+  records are split into 32 KiB chunks; the length/index/chunk length are
+  included in the AEAD associated data. `Secure::close` shuts down a raw clone
+  because the reader may hold the recv mutex while blocked in `read_exact`.
 - One TCP connection per client: 12-byte header + optional payload; `a` is the
-  payload length for `AUTH`/`VIDEO`/`KEYMAP`/`CLIP_*`.
+  payload length for `AUTH`/`VIDEO`/`KEYMAP`/`CLIP_*`; the header and payload
+  are inside a secure record.
 - First message is `AUTH`; the server then sends `HELLO` (codec, width,
   height) before registering the client.
 - One writer thread per client; video is never copied in the server beyond
@@ -228,3 +238,7 @@ driver. The server needs libva headers for the helper.
     a Wayland fullscreen/resize transition. Never wait forever there. Reset
     the in-flight fence only after a successful acquire, and recreate the
     frame semaphores when the swapchain is recreated.
+15. The secure layer is mandatory. An old plaintext client fails the `LGX1`
+    handshake and is disconnected; update client and server together. The auth
+    token is the PSK and is never transmitted, so it must be identical on both
+    sides.

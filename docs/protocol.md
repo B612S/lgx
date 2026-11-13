@@ -92,6 +92,32 @@ Sticks are -32768..32767; triggers 0..32767. The server forwards the snapshot
 to the root uinput helper, which applies only changed buttons/axes to a
 `lgx virtual gamepad`.
 
+## Encrypted transport
+
+Every TCP connection (video/control and audio) starts with `LGX1`:
+
+```
+client -> server: u32 len=68, "LGX1", X25519 public key (32), random (32)
+server -> client: u32 len=68, "LGX1", X25519 public key (32), random (32)
+```
+
+Both sides run X25519, then HKDF-SHA256 with the shared auth token as IKM and
+the two random values as salt. Directional 32-byte AES-256-GCM keys are
+derived. The token never appears on the wire.
+
+A record is:
+
+```
+u32 total_plaintext_len
+repeated:
+  u32 ciphertext_len
+  ciphertext (plaintext chunk <= 32 KiB + 16-byte tag)
+```
+
+The total length, chunk index and chunk length are authenticated as AEAD
+associated data. The 12-byte lgx message header and its payload are both
+inside the plaintext, so message types and HEVC frames are not visible.
+
 ## Audio
 
 A separate TCP connection on the port following the control port. The first

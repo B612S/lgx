@@ -3,12 +3,14 @@
 //! The guest records the monitor of its default sink with `pw-cat` (raw
 //! s16le, 48 kHz, stereo) and streams the samples to every connected client.
 
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+use lgx_proto::secure;
 
 pub const RATE: u32 = 48_000;
 pub const CHANNELS: u32 = 2;
@@ -88,30 +90,25 @@ fn handle(
     clients: Arc<Mutex<Vec<Client>>>,
     token: Option<Arc<String>>,
 ) -> io::Result<()> {
-    let mut rstream = stream.try_clone()?;
-    if let Some(expected) = token {
-        let mut len = [0u8; 4];
-        rstream.read_exact(&mut len)?;
-        let n = u32::from_le_bytes(len) as usize;
-        if n > 4096 {
-            return Ok(());
-        }
-        let mut tok = vec![0u8; n];
-        rstream.read_exact(&mut tok)?;
+    let token_secret = token.as_ref().map(|s| s.as_str()).unwrap_or("");
+    let secure = Arc::new(secure::server_handshake(stream, token_secret)?);
+    let tok = secure.recv_bytes()?;
+    if let Some(expected) = &token {
         let got = String::from_utf8_lossy(&tok).trim().to_string();
-        if !lgx_proto::auth::eq(&got, &expected) {
+        if !lgx_proto::auth::eq(&got, expected) {
             eprintln!("lgx-server: audio: authentication failed");
+            secure.close();
             return Ok(());
         }
     }
 
     let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(16);
     clients.lock().unwrap().push(Client { tx });
-    let mut w = stream;
     while let Ok(chunk) = rx.recv() {
-        if w.write_all(&chunk).is_err() {
+        if secure.send_bytes(&chunk).is_err() {
             break;
         }
     }
+    secure.close();
     Ok(())
 }

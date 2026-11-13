@@ -12,7 +12,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 
-use lgx_proto::{codec, files, msg, write_msg, Msg};
+use lgx_proto::secure::{self, Secure};
+use lgx_proto::{codec, files, msg, Msg};
 
 use crate::clip;
 use crate::input::Cmd;
@@ -38,7 +39,7 @@ struct Client {
     /// A freshly registered client may only see an IDR; delayed packets from
     /// the previous client's encoder state are dropped for it.
     needs_idr: bool,
-    wstream: Arc<Mutex<TcpStream>>,
+    secure: Arc<Secure>,
     file_busy: Arc<AtomicBool>,
 }
 
@@ -139,11 +140,11 @@ impl Hub {
             if c.file_busy.swap(true, Ordering::Relaxed) {
                 continue;
             }
-            let w = c.wstream.clone();
+            let secure = c.secure.clone();
             let busy = c.file_busy.clone();
             let paths = paths.to_vec();
             std::thread::spawn(move || {
-                if let Err(e) = send_files_chunked(&w, &paths) {
+                if let Err(e) = send_files_chunked(&secure, &paths) {
                     eprintln!("lgx-server: file send: {e}");
                 }
                 busy.store(false, Ordering::Relaxed);
@@ -154,39 +155,27 @@ impl Hub {
 
 /// Streams a file clipboard to one client, locking the socket per message so
 /// video packets interleave instead of freezing for the whole transfer.
-fn send_files_chunked(w: &Arc<Mutex<TcpStream>>, paths: &[PathBuf]) -> io::Result<()> {
+fn send_files_chunked(secure: &Arc<Secure>, paths: &[PathBuf]) -> io::Result<()> {
     let local = files::collect(paths)?;
     if local.is_empty() {
         return Ok(());
     }
     let entries: Vec<_> = local.iter().map(|e| e.entry.clone()).collect();
     let offer = files::encode_offer(&entries);
-    {
-        let mut w = w.lock().unwrap();
-        write_msg(
-            &mut *w,
-            Msg::new(msg::FILE_BEGIN, 0, offer.len() as i32, 0),
-            &offer,
-        )?;
-    }
+    secure.send_msg(
+        Msg::new(msg::FILE_BEGIN, 0, offer.len() as i32, 0),
+        &offer,
+    )?;
     let mut total = 0u64;
     for e in &local {
         if e.entry.kind == files::KIND_FILE {
             total += e.entry.size;
             files::stream_file(&e.source, &mut |chunk| {
-                let mut w = w.lock().unwrap();
-                write_msg(
-                    &mut *w,
-                    Msg::new(msg::FILE_DATA, 0, chunk.len() as i32, 0),
-                    chunk,
-                )
+                secure.send_msg(Msg::new(msg::FILE_DATA, 0, chunk.len() as i32, 0), chunk)
             })?;
         }
     }
-    {
-        let mut w = w.lock().unwrap();
-        write_msg(&mut *w, Msg::new(msg::FILE_END, 0, 0, 0), &[])?;
-    }
+    secure.send_msg(Msg::new(msg::FILE_END, 0, 0, 0), &[])?;
     eprintln!(
         "lgx-server: sent {} file(s), {} KiB",
         entries.iter().filter(|e| e.kind == files::KIND_FILE).count(),
@@ -237,16 +226,24 @@ fn handle(
     token: Option<Arc<String>>,
     last_remote: Arc<Mutex<String>>,
 ) -> io::Result<()> {
-    if let Some(expected) = token {
-        let mut probe = stream.try_clone()?;
-        let (m, payload) = lgx_proto::read_msg(&mut probe)?;
+    let token_secret = token.as_ref().map(|s| s.as_str()).unwrap_or("");
+    let secure = match secure::server_handshake(stream, token_secret) {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            eprintln!("lgx-server: client #{id}: secure handshake failed: {e}");
+            return Ok(());
+        }
+    };
+    let (m, payload) = secure.recv_msg()?;
+    if let Some(expected) = &token {
         let ok = m.typ == msg::AUTH
             && lgx_proto::auth::eq(
                 String::from_utf8_lossy(&payload).trim(),
-                &expected,
+                expected,
             );
         if !ok {
             eprintln!("lgx-server: client #{id}: authentication failed");
+            secure.close();
             return Ok(());
         }
         eprintln!("lgx-server: client #{id}: authenticated");
@@ -256,18 +253,16 @@ fn handle(
     // before it can size its window or create a decoder.
     {
         let (w, h) = hub.geometry();
-        let mut hello = stream.try_clone()?;
-        write_msg(&mut hello, Msg::new(msg::HELLO, codec::HEVC, w as i32, h as i32), &[])?;
+        secure.send_msg(Msg::new(msg::HELLO, codec::HEVC, w as i32, h as i32), &[])?;
     }
 
-    let wstream = Arc::new(Mutex::new(stream.try_clone()?));
     let (tx, rx) = std::sync::mpsc::sync_channel::<Out>(2);
     let file_busy = Arc::new(AtomicBool::new(false));
     hub.clients.lock().unwrap().push(Client {
         id,
         tx: tx.clone(),
         needs_idr: true,
-        wstream: wstream.clone(),
+        secure: secure.clone(),
         file_busy: file_busy.clone(),
     });
     hub.request_keyframe();
@@ -283,10 +278,10 @@ fn handle(
         Ok(clip::Clip::Files(paths)) => {
             *last_remote.lock().unwrap() = files::signature(&paths);
             if !file_busy.swap(true, Ordering::Relaxed) {
-                let w = wstream.clone();
+                let secure = secure.clone();
                 let busy = file_busy.clone();
                 std::thread::spawn(move || {
-                    if let Err(e) = send_files_chunked(&w, &paths) {
+                    if let Err(e) = send_files_chunked(&secure, &paths) {
                         eprintln!("lgx-server: file send: {e}");
                     }
                     busy.store(false, Ordering::Relaxed);
@@ -296,26 +291,24 @@ fn handle(
         _ => {}
     }
 
-    let w2 = wstream.clone();
+    let w2 = secure.clone();
     let hubw = hub.clone();
     let writer = std::thread::Builder::new()
         .name(format!("lgx-writer-{id}"))
         .spawn(move || {
             while let Ok(item) = rx.recv() {
-                let mut w = w2.lock().unwrap();
                 let ok = match item {
                     Out::Video(chunk) => {
-                        write_msg(&mut *w, Msg::new(msg::VIDEO, 0, chunk.len() as i32, 0), &chunk)
+                        w2.send_msg(Msg::new(msg::VIDEO, 0, chunk.len() as i32, 0), &chunk)
                             .is_ok()
                     }
-                    Out::Clip(text) => write_msg(
-                        &mut *w,
-                        Msg::new(msg::CLIP_DATA, 0, text.len() as i32, 0),
-                        text.as_bytes(),
-                    )
-                    .is_ok(),
+                    Out::Clip(text) => w2
+                        .send_msg(
+                            Msg::new(msg::CLIP_DATA, 0, text.len() as i32, 0),
+                            text.as_bytes(),
+                        )
+                        .is_ok(),
                 };
-                drop(w);
                 if !ok {
                     hubw.request_keyframe_soon();
                     break;
@@ -323,10 +316,9 @@ fn handle(
             }
         })?;
 
-    let mut rstream = stream;
     let mut file_recv: Option<files::Receiver> = None;
     loop {
-        let (m, payload) = match lgx_proto::read_msg(&mut rstream) {
+        let (m, payload) = match secure.recv_msg() {
             Ok(v) => v,
             Err(_) => break,
         };
@@ -440,6 +432,7 @@ fn handle(
     hub.clients.lock().unwrap().retain(|c| c.id != id);
     drop(tx);
     let _ = writer.join();
+    secure.close();
     Ok(())
 }
 

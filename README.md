@@ -221,6 +221,10 @@ Text and files synchronise through the clipboard automatically in both
 directions; no paste shortcut is injected. F9/F10/F11/F12 are ordinary keys
 for the guest.
 
+All traffic — video, input, clipboard, files and audio — is inside AES-256-GCM
+records. AES-NI makes the cost negligible at the stream's few MB/s; only
+record sizes are visible to a passive observer, never HEVC frames or tokens.
+
 ## Measured (VM: Hyprland 1920x1080@160, Intel UHD 770; host RTX 4070 SUPER)
 
 | check | result |
@@ -229,6 +233,8 @@ for the guest.
 | server breakdown | wait 0.83 ms, render 2.84 ms, encode 0.59 ms |
 | client, RTX 4070 SUPER, CUDA/NVDEC + Vulkan, 960x540 window | 171.0 fps |
 | client, RTX 4070 SUPER, CUDA/NVDEC + Vulkan, 1920x1080 window | 166.7 fps |
+| server, encrypted transport, HEVC 1080p | 157.9 fps |
+| client, encrypted transport + audio | 165.5 fps, 0 dropped |
 | server, VPP conversion, two 4K60 videos + workspace switches | 152-156 fps |
 | server, GL conversion, same load | 130-137 fps |
 | client Vulkan device | Vulkan 1.4.363, NVIDIA GeForce RTX 4070 SUPER |

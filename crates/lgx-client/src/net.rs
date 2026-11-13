@@ -1,12 +1,13 @@
 //! Client networking: one TCP stream for HEVC video, input and clipboard.
 
-use std::io::{self, Write};
+use std::io;
 use std::net::TcpStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use lgx_proto::{codec, files, msg, read_msg, Msg};
+use lgx_proto::secure::{self, Secure};
+use lgx_proto::{codec, files, msg, Msg};
 
 use crate::dec::Chunk;
 
@@ -17,32 +18,25 @@ pub struct Hello {
 }
 
 pub struct Conn {
-    write: Mutex<TcpStream>,
+    secure: Arc<Secure>,
     pub last_remote: Arc<Mutex<String>>,
     pub bytes: AtomicU64,
 }
 
 impl Conn {
     pub fn send(&self, m: Msg, payload: &[u8]) -> std::io::Result<()> {
-        let mut w = self.write.lock().unwrap();
-        w.write_all(&m.to_bytes())?;
-        if !payload.is_empty() {
-            w.write_all(payload)?;
-        }
-        Ok(())
+        self.secure.send_msg(m, payload)
     }
 
     pub fn take_bytes(&self) -> u64 {
         self.bytes.swap(0, Ordering::Relaxed)
     }
 
-    /// Shuts the socket down so the reader thread leaves read_msg() and drops
+    /// Shuts the socket down so the reader thread leaves recv_msg() and drops
     /// the video sender, which lets the decoder thread exit before GL/CUDA
     /// teardown.
     pub fn close(&self) {
-        if let Ok(stream) = self.write.lock() {
-            let _ = stream.shutdown(std::net::Shutdown::Both);
-        }
+        self.secure.close();
     }
 }
 
@@ -53,22 +47,14 @@ pub fn connect(
     video: std::sync::mpsc::Sender<Chunk>,
 ) -> std::io::Result<(Arc<Conn>, Hello)> {
     let stream = TcpStream::connect(addr)?;
-    stream.set_nodelay(true)?;
-    let mut w = stream.try_clone()?;
-
-    lgx_proto::write_msg(
-        &mut w,
+    let secure = Arc::new(secure::client_handshake(stream, token)?);
+    secure.send_msg(
         Msg::new(msg::AUTH, 0, token.len() as i32, 0),
         token.as_bytes(),
     )?;
-    lgx_proto::write_msg(
-        &mut w,
-        Msg::new(msg::KEYMAP, 1, keymap.len() as i32, 0),
-        keymap,
-    )?;
+    secure.send_msg(Msg::new(msg::KEYMAP, 1, keymap.len() as i32, 0), keymap)?;
 
-    let mut hello_stream = stream.try_clone()?;
-    let (hello_msg, _) = read_msg(&mut hello_stream)?;
+    let (hello_msg, _) = secure.recv_msg()?;
     if hello_msg.typ != msg::HELLO {
         return Err(std::io::Error::other(format!(
             "expected HELLO, got message {:#x}",
@@ -90,15 +76,14 @@ pub fn connect(
     let last_remote: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
     let lr = last_remote.clone();
     let conn = Arc::new(Conn {
-        write: Mutex::new(w),
+        secure: secure.clone(),
         last_remote,
         bytes: AtomicU64::new(0),
     });
     let conn_for_reader = conn.clone();
-    let mut r = stream;
     std::thread::Builder::new()
         .name("lgx-reader".into())
-        .spawn(move || reader(&mut r, conn_for_reader, lr, video))
+        .spawn(move || reader(secure, conn_for_reader, lr, video))
         .expect("reader thread");
     Ok((conn, hello))
 }
@@ -133,14 +118,14 @@ pub fn send_files(conn: &Conn, paths: &[PathBuf]) -> io::Result<()> {
 }
 
 fn reader(
-    r: &mut TcpStream,
+    secure: Arc<Secure>,
     conn: Arc<Conn>,
     last_remote: Arc<Mutex<String>>,
     video: std::sync::mpsc::Sender<Chunk>,
 ) {
     let mut recv: Option<files::Receiver> = None;
     loop {
-        let (m, payload) = match read_msg(r) {
+        let (m, payload) = match secure.recv_msg() {
             Ok(v) => v,
             Err(_) => break,
         };

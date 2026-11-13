@@ -123,6 +123,7 @@ pub fn read_msg<R: Read>(r: &mut R) -> io::Result<(Msg, Vec<u8>)> {
 
 pub mod auth;
 pub mod files;
+pub mod secure;
 
 #[cfg(test)]
 mod tests {
