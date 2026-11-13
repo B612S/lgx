@@ -70,8 +70,8 @@ Commit format: `area: short imperative summary`, for example
   `$XDG_RUNTIME_DIR/lgx-client-<uid>-<hash>.lock`. A second launch for the same
   host exits before connecting or creating a window; different hosts use
   different locks.
-- The window title is `lgx — <name> — <server IP>` and must not contain live
-  stats. The client reconnects with exponential backoff after a lost session by
+- The window title is `lgx — <name>` and must not contain live stats or the
+  server address; the profile name is enough. The client reconnects with exponential backoff after a lost session by
   exec'ing itself (window/audio are re-created); `--no-reconnect` disables it.
   The reconnect wait uses the child `lgx-reconnect-qt` (Qt Widgets, system
   style, indeterminate progress bar, Cancel -> exit 2); the client itself must

@@ -2,12 +2,14 @@
 //! `lgx-reconnect-qt` shows the system-styled window and exits with 2 when
 //! the user cancels.
 
+use std::io::Write;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::time::{Duration, Instant};
 
 pub struct Dialog {
     child: Child,
+    stdin: Option<ChildStdin>,
 }
 
 fn helper_path() -> Option<PathBuf> {
@@ -28,7 +30,7 @@ fn helper_path() -> Option<PathBuf> {
 }
 
 impl Dialog {
-    pub fn spawn(server: &str, attempt: u32) -> Option<Self> {
+    pub fn spawn(name: &str, attempt: u32) -> Option<Self> {
         let helper = match helper_path() {
             Some(p) => p,
             None => {
@@ -36,12 +38,12 @@ impl Dialog {
                 return None;
             }
         };
-        let child = match Command::new(&helper)
-            .arg("--server")
-            .arg(server)
+        let mut child = match Command::new(&helper)
+            .arg("--name")
+            .arg(name)
             .arg("--attempt")
             .arg(attempt.to_string())
-            .stdin(Stdio::null())
+            .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -55,7 +57,16 @@ impl Dialog {
                 return None;
             }
         };
-        Some(Self { child })
+        let stdin = child.stdin.take();
+        Some(Self { child, stdin })
+    }
+
+    /// Update the attempt number in the already visible window.
+    pub fn update(&mut self, attempt: u32) {
+        if let Some(stdin) = self.stdin.as_mut() {
+            let _ = writeln!(stdin, "attempt {attempt}");
+            let _ = stdin.flush();
+        }
     }
 
     /// Waits for the backoff delay. Returns true if the user cancelled or the

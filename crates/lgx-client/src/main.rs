@@ -482,8 +482,13 @@ fn main() {
                     "lgx-client: cannot connect to {server}: {e}; retrying in {}s (attempt {connect_attempt}/{MAX_RECONNECT_ATTEMPTS})",
                     delay.as_secs()
                 );
-                if !args.no_window && dialog.is_none() {
-                    dialog = reconnect_ui::Dialog::spawn(&server, connect_attempt);
+                if !args.no_window {
+                    if dialog.is_none() {
+                        dialog = reconnect_ui::Dialog::spawn(&s.name, connect_attempt);
+                    }
+                    if let Some(d) = dialog.as_mut() {
+                        d.update(connect_attempt);
+                    }
                 }
                 if let Some(d) = dialog.as_mut() {
                     if d.wait_or_cancel(delay) {
@@ -609,9 +614,8 @@ fn main() {
         .vulkan()
         .build()
         .expect("window");
-    let display_host = display_host(&s.server);
     window
-        .set_title(&format!("lgx — {} — {display_host}", s.name))
+        .set_title(&format!("lgx — {}", s.name))
         .ok();
     if std::env::var_os("LGX_DEBUG_FPS").is_some() {
         eprintln!("lgx-client: title {:?}", window.title());

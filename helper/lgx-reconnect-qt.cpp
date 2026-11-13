@@ -3,6 +3,7 @@
 //! exits with 2 when the user cancels.
 
 #include <QApplication>
+#include <QByteArray>
 #include <QCommandLineParser>
 #include <QCloseEvent>
 #include <QFont>
@@ -12,16 +13,19 @@
 #include <QProgressBar>
 #include <QPushButton>
 #include <QScreen>
+#include <QSocketNotifier>
 #include <QVBoxLayout>
 #include <QWidget>
 
 #include <csignal>
+#include <memory>
 #include <sys/prctl.h>
+#include <unistd.h>
 
 class ReconnectWindow final : public QWidget {
 public:
-    ReconnectWindow(const QString &server, int attempt) {
-        setWindowTitle(QStringLiteral("lgx — reconnecting"));
+    ReconnectWindow(const QString &name, int attempt) : name_(name) {
+        setWindowTitle(QStringLiteral("lgx — %1").arg(name_));
         setWindowFlag(Qt::WindowStaysOnTopHint, true);
         setAttribute(Qt::WA_DeleteOnClose);
 
@@ -36,11 +40,10 @@ public:
         title->setFont(title_font);
         layout->addWidget(title);
 
-        auto *status = new QLabel(
-            QStringLiteral("Reconnecting to %1 (attempt %2)…").arg(server).arg(attempt),
-            this);
-        status->setWordWrap(true);
-        layout->addWidget(status);
+        status_ = new QLabel(this);
+        status_->setWordWrap(true);
+        layout->addWidget(status_);
+        set_attempt(attempt);
 
         auto *bar = new QProgressBar(this);
         bar->setRange(0, 0); // indeterminate "running line"
@@ -65,37 +68,78 @@ public:
         }
     }
 
+public:
+    void set_attempt(int attempt) {
+        status_->setText(
+            QStringLiteral("Reconnecting to %1 (attempt %2)…").arg(name_).arg(attempt));
+    }
+
 protected:
     void closeEvent(QCloseEvent *event) override {
         event->ignore();
         QCoreApplication::exit(2);
     }
+
+private:
+    QString name_;
+    QLabel *status_ = nullptr;
 };
 
 int main(int argc, char **argv) {
     // Do not leave an orphan dialog if the client process dies.
     prctl(PR_SET_PDEATHSIG, SIGTERM);
     QApplication app(argc, argv);
-    QApplication::setApplicationName(QStringLiteral("lgx-reconnect"));
-    QApplication::setApplicationDisplayName(QStringLiteral("lgx"));
+    QApplication::setApplicationName(QStringLiteral("lgx"));
     QApplication::setDesktopFileName(QStringLiteral("lgx-client"));
 
     QCommandLineParser parser;
     parser.setApplicationDescription(QStringLiteral("lgx reconnect dialog"));
     parser.addHelpOption();
-    QCommandLineOption server_option(
-        QStringList{QStringLiteral("s"), QStringLiteral("server")},
-        QStringLiteral("Server address shown in the dialog."),
-        QStringLiteral("server"));
+    QCommandLineOption name_option(
+        QStringList{QStringLiteral("n"), QStringLiteral("name")},
+        QStringLiteral("Profile name shown in the dialog."),
+        QStringLiteral("name"),
+        QStringLiteral("lgx"));
     QCommandLineOption attempt_option(
         QStringList{QStringLiteral("a"), QStringLiteral("attempt")},
         QStringLiteral("Reconnect attempt number."),
         QStringLiteral("attempt"),
         QStringLiteral("1"));
-    parser.addOptions({server_option, attempt_option});
+    parser.addOptions({name_option, attempt_option});
     parser.process(app);
 
-    ReconnectWindow window(parser.value(server_option), parser.value(attempt_option).toInt());
+    ReconnectWindow window(parser.value(name_option), parser.value(attempt_option).toInt());
     window.show();
+
+    // The parent updates the attempt number over stdin; no polling and no
+    // process restart for every backoff step.
+    auto buffer = std::make_shared<QByteArray>();
+    auto *notifier = new QSocketNotifier(STDIN_FILENO, QSocketNotifier::Read, &window);
+    QObject::connect(notifier, &QSocketNotifier::activated, notifier,
+                     [notifier, buffer, &window] {
+        char data[256];
+        const ssize_t n = ::read(STDIN_FILENO, data, sizeof(data));
+        if (n <= 0) {
+            notifier->setEnabled(false);
+            return;
+        }
+        buffer->append(data, static_cast<int>(n));
+        for (;;) {
+            const int nl = buffer->indexOf('\n');
+            if (nl < 0) {
+                return;
+            }
+            const QString line = QString::fromUtf8(buffer->left(nl)).trimmed();
+            buffer->remove(0, nl + 1);
+            if (line.startsWith(QStringLiteral("attempt "))) {
+                bool ok = false;
+                const int attempt = line.mid(8).toInt(&ok);
+                if (ok) {
+                    window.set_attempt(attempt);
+                }
+            }
+        }
+    });
+
     return app.exec();
 }
