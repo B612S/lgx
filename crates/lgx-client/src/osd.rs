@@ -8,7 +8,7 @@ use std::process::Command;
 use fontdue::{Font, FontSettings};
 
 const CARD_H: u32 = 40;
-const SS: u32 = 2; // supersampling
+const SS: u32 = 1; // render at the system font size, no downscale blur
 const PAD_X: u32 = 16;
 const FONT_PX: f32 = 16.0;
 const RADIUS: f32 = 8.0;
