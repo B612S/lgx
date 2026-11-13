@@ -13,7 +13,7 @@ use freetype::{Face, Library};
 
 const CARD_H: u32 = 40;
 const PAD_X: u32 = 16;
-const FONT_PX: u32 = 16;
+const DEFAULT_POINT_SIZE: f32 = 10.0;
 const RADIUS: f32 = 8.0;
 
 const FALLBACK_FONTS: &[&str] = &[
@@ -34,9 +34,11 @@ pub struct Atlas {
 struct SystemFont {
     _library: Library,
     face: Face,
+    pixels: f32,
+    hint_flags: LoadFlag,
 }
 
-fn kdeglobals_family() -> Option<String> {
+fn kdeglobals_font() -> Option<(String, f32)> {
     let mut paths = Vec::new();
     if let Some(base) = std::env::var_os("XDG_CONFIG_HOME") {
         paths.push(PathBuf::from(base).join("kdeglobals"));
@@ -57,10 +59,16 @@ fn kdeglobals_family() -> Option<String> {
             }
             if general {
                 if let Some(value) = line.strip_prefix("font=") {
-                    let family = value.split(',').next().unwrap_or_default().trim();
-                    if !family.is_empty() {
-                        return Some(family.to_string());
+                    let mut parts = value.split(',');
+                    let family = parts.next().unwrap_or_default().trim();
+                    if family.is_empty() {
+                        continue;
                     }
+                    let point = parts
+                        .next()
+                        .and_then(|v| v.trim().parse::<f32>().ok())
+                        .unwrap_or(DEFAULT_POINT_SIZE);
+                    return Some((family.to_string(), point));
                 }
             }
         }
@@ -85,40 +93,81 @@ fn fc_match(pattern: &str) -> Option<PathBuf> {
     }
 }
 
-fn system_font_paths() -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-    if let Some(family) = kdeglobals_family() {
-        if let Some(path) = fc_match(&family) {
-            paths.push(path);
+fn fc_attr(pattern: &str, format: &str) -> Option<String> {
+    let output = Command::new("fc-match")
+        .args(["-f", format, pattern])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout).ok().map(|s| s.trim().to_string())
+}
+
+fn xft_dpi() -> Option<f32> {
+    let output = Command::new("xrdb").args(["-query"]).output().ok()?;
+    let text = String::from_utf8(output.stdout).ok()?;
+    for line in text.lines() {
+        if let Some(value) = line.trim().strip_prefix("Xft.dpi:") {
+            return value.trim().parse().ok();
         }
+    }
+    None
+}
+
+fn system_font(scale: f32) -> Option<(SystemFont, String, f32)> {
+    let (family, point) = kdeglobals_font()
+        .unwrap_or_else(|| ("sans-serif".to_string(), DEFAULT_POINT_SIZE));
+    let dpi = xft_dpi().unwrap_or(96.0 * scale.max(0.5));
+    let hint_style = fc_attr(&family, "%{hintstyle}")
+        .and_then(|v| v.parse::<i32>().ok())
+        .unwrap_or(1);
+    let hint_flags = match hint_style {
+        0 => LoadFlag::NO_HINTING,
+        1 => LoadFlag::TARGET_LIGHT,
+        _ => LoadFlag::TARGET_NORMAL,
+    };
+    let mut paths = Vec::new();
+    if let Some(path) = fc_match(&family) {
+        paths.push(path);
     }
     if let Some(path) = fc_match("sans-serif") {
         paths.push(path);
     }
     paths.extend(FALLBACK_FONTS.iter().map(PathBuf::from));
-    paths
-}
 
-fn load_font() -> Option<SystemFont> {
     let library = Library::init().ok()?;
     let mut seen = std::collections::HashSet::new();
-    for path in system_font_paths() {
+    for path in paths {
         if !seen.insert(path.clone()) {
             continue;
         }
         let Ok(face) = library.new_face(&path, 0) else {
             continue;
         };
-        if face.set_pixel_sizes(0, FONT_PX).is_err() {
+        let char_height = (point * 64.0).round() as isize;
+        if face
+            .set_char_size(0, char_height, dpi.round() as u32, dpi.round() as u32)
+            .is_err()
+        {
             continue;
         }
-        return Some(SystemFont { _library: library, face });
+        let pixels = face
+            .size_metrics()
+            .map(|m| m.x_ppem as f32)
+            .filter(|p| *p > 0.0)
+            .unwrap_or(point * dpi / 72.0);
+        return Some((
+            SystemFont { _library: library, face, pixels, hint_flags },
+            family,
+            point,
+        ));
     }
     None
 }
 
 fn glyph(font: &SystemFont, ch: char, render: bool) -> (i32, i32, i32, Vec<u8>) {
-    let mut flags = LoadFlag::TARGET_LIGHT;
+    let mut flags = font.hint_flags;
     if render {
         flags |= LoadFlag::RENDER;
     }
@@ -248,12 +297,13 @@ fn draw_card(pixels: &mut [u8], stride: u32, offset: u32, card_w: u32, text: &st
     }
 
     let x = offset as f32 + PAD_X as f32;
-    let baseline = h as f32 / 2.0 + FONT_PX as f32 * 0.35;
+    let baseline = h as f32 / 2.0 + font.pixels * 0.35;
     draw_text(pixels, stride, x, baseline, font, text);
 }
 
-pub fn atlas() -> Option<Atlas> {
-    let font = load_font()?;
+pub fn atlas(scale: f32) -> Option<Atlas> {
+    let (font, family, point) = system_font(scale)?;
+    eprintln!("lgx-client: OSD font {family}, {point} pt ({} px)", font.pixels);
     let on = "Background audio: On";
     let off = "Background audio: Off";
     let text_w = text_width(&font, on).max(text_width(&font, off));
@@ -278,9 +328,9 @@ mod tests {
 
     #[test]
     fn atlas_uses_a_system_font() {
-        let font = load_font().expect("a system sans font");
+        let (font, _, _) = system_font(1.0).expect("a system sans font");
         assert!(text_width(&font, "Background audio: On") > 0.0);
-        let atlas = atlas().expect("OSD atlas");
+        let atlas = atlas(1.0).expect("OSD atlas");
         assert!(atlas.card_width >= 180);
         assert_eq!(atlas.rgba.len(), (atlas.width * atlas.height * 4) as usize);
     }

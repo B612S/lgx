@@ -267,7 +267,8 @@ impl Renderer {
         // OSD atlas: generated once from system fonts, uploaded before the
         // first frame. A missing font still leaves a blank card rather than
         // breaking video.
-        let (osd_w, osd_h, osd_card, osd_rgba) = match crate::osd::atlas() {
+        let scale = window.display_scale().clamp(0.5, 4.0);
+        let (osd_w, osd_h, osd_card, osd_rgba) = match crate::osd::atlas(scale) {
             Some(atlas) => (atlas.width, atlas.height, (atlas.card_width, atlas.card_height), atlas.rgba),
             None => {
                 eprintln!("lgx-client: OSD font not found; OSD overlay disabled");

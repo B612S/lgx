@@ -740,6 +740,10 @@ fn main() {
     let mut swallow_m_keyup = false;
     let mut osd_until: Option<Instant> = None;
     let mut osd_enabled = false;
+    if let Ok(state) = std::env::var("LGX_OSD_DEMO") {
+        osd_enabled = state != "off";
+        osd_until = Some(Instant::now() + Duration::from_secs(10));
+    }
     let mut fullscreen_hold: Option<(Instant, (u32, u32))> = None;
     let mut dst = vk::fit_rect(win_w, win_h, win_w, win_h);
     let mut config_saved = s.width.is_some() && s.height.is_some();
