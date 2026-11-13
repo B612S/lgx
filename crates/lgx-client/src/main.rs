@@ -738,7 +738,9 @@ fn main() {
     let mut redraw = true;
     let mut swallow_f_keyup = false;
     let mut swallow_m_keyup = false;
-    let mut osd_child: Option<std::process::Child> = None;
+    let mut osd_started: Option<Instant> = None;
+    let mut osd_until: Option<Instant> = None;
+    let mut osd_enabled = false;
     let mut fullscreen_hold: Option<(Instant, (u32, u32))> = None;
     let mut dst = vk::fit_rect(win_w, win_h, win_w, win_h);
     let mut config_saved = s.width.is_some() && s.height.is_some();
@@ -870,11 +872,10 @@ fn main() {
                         "lgx-client: background audio {} (Ctrl+Shift+Alt+M)",
                         if now_mute { "disabled" } else { "enabled" }
                     );
-                    if let Some(mut old) = osd_child.take() {
-                        let _ = old.kill();
-                        let _ = old.wait();
-                    }
-                    osd_child = osd::spawn(!now_mute);
+                    osd_enabled = !now_mute;
+                    osd_started = Some(Instant::now());
+                    osd_until = Some(Instant::now() + Duration::from_millis(1600));
+                    redraw = true;
                 }
                 Event::KeyDown {
                     keycode: Some(sdl3::keyboard::Keycode::G),
@@ -971,6 +972,23 @@ fn main() {
         }
         let mut drawn = false;
         if !hold_draw {
+        let osd = match (osd_started, osd_until) {
+            (Some(started), Some(until)) => {
+                let now = Instant::now();
+                if now >= until {
+                    osd_started = None;
+                    osd_until = None;
+                    None
+                } else {
+                    let elapsed = now.saturating_duration_since(started).as_secs_f32();
+                    let left = until.saturating_duration_since(now).as_secs_f32();
+                    let alpha = (elapsed / 0.14).min(left / 0.22).clamp(0.0, 1.0);
+                    Some((osd_enabled, alpha))
+                }
+            }
+            _ => None,
+        };
+        renderer.set_osd(osd);
         if let Some(frame) = frame {
             let (w, h) = (frame.width, frame.height);
             if auto_size && (w, h) != img_size {

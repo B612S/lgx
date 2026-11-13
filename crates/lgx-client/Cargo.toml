@@ -16,3 +16,4 @@ wayland-backend = { version = "0.3", features = ["client_system"] }
 wayland-scanner = "0.31"
 bitflags = "2"
 ash = { version = "0.38", features = ["loaded"] }
+fontdue = "0.9"

@@ -12,6 +12,15 @@ use ash::vk;
 
 const VERT_SPV: &[u8] = include_bytes!("../shaders/video.vert.spv");
 const FRAG_SPV: &[u8] = include_bytes!("../shaders/video.frag.spv");
+const OSD_VERT_SPV: &[u8] = include_bytes!("../shaders/osd.vert.spv");
+const OSD_FRAG_SPV: &[u8] = include_bytes!("../shaders/osd.frag.spv");
+
+#[repr(C)]
+struct OsdPush {
+    rect: [f32; 4],
+    uv: [f32; 4],
+    alpha: f32,
+}
 
 pub struct Rect {
     pub x: i32,
@@ -75,6 +84,15 @@ pub struct Renderer {
     tex_uv: Texture,
     stage_y: Staging,
     stage_uv: Staging,
+    osd_tex: Texture,
+    osd_stage: Staging,
+    osd_ready: bool,
+    osd_draw: Option<(bool, f32)>,
+    osd_desc_layout: vk::DescriptorSetLayout,
+    osd_desc_pool: vk::DescriptorPool,
+    osd_desc_set: vk::DescriptorSet,
+    osd_pipeline_layout: vk::PipelineLayout,
+    osd_pipeline: vk::Pipeline,
     cmd_pool: vk::CommandPool,
     cmd: vk::CommandBuffer,
     image_available: vk::Semaphore,
@@ -242,6 +260,52 @@ impl Renderer {
         let render_pass = create_render_pass(&device, format.format)?;
         let desc_layout = create_desc_layout(&device)?;
         let sampler = create_sampler(&device)?;
+
+        // OSD atlas: generated once from system fonts, uploaded before the
+        // first frame. A missing font still leaves a blank card rather than
+        // breaking video.
+        let (osd_w, osd_h, osd_rgba) = match crate::osd::atlas() {
+            Some(atlas) => (atlas.width, atlas.height, atlas.rgba),
+            None => {
+                eprintln!("lgx-client: OSD font not found; OSD overlay disabled");
+                (2, 1, vec![0u8; 8])
+            }
+        };
+        let (osd_tex, osd_stage) =
+            create_rgba_texture(&device, &instance, pd, osd_w, osd_h, &osd_rgba)?;
+        let osd_desc_layout = create_osd_desc_layout(&device)?;
+        let osd_desc_pool = device
+            .create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::default()
+                    .max_sets(1)
+                    .pool_sizes(&[vk::DescriptorPoolSize::default()
+                        .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                        .descriptor_count(1)]),
+                None,
+            )
+            .map_err(|e| format!("OSD descriptor pool: {e:?}"))?;
+        let osd_desc_set = device
+            .allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(osd_desc_pool)
+                    .set_layouts(&[osd_desc_layout]),
+            )
+            .map_err(|e| format!("OSD descriptor set: {e:?}"))?[0];
+        write_osd_descriptor(&device, osd_desc_set, &osd_tex, sampler);
+        let osd_push = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
+            .offset(0)
+            .size(std::mem::size_of::<OsdPush>() as u32)];
+        let osd_pipeline_layout = device
+            .create_pipeline_layout(
+                &vk::PipelineLayoutCreateInfo::default()
+                    .set_layouts(&[osd_desc_layout])
+                    .push_constant_ranges(&osd_push),
+                None,
+            )
+            .map_err(|e| format!("OSD pipeline layout: {e:?}"))?;
+        let osd_pipeline = create_osd_pipeline(&device, render_pass, osd_pipeline_layout)?;
+
         let desc_pool = device
             .create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
@@ -346,6 +410,15 @@ impl Renderer {
             tex_uv,
             stage_y,
             stage_uv,
+            osd_tex,
+            osd_stage,
+            osd_ready: false,
+            osd_draw: None,
+            osd_desc_layout,
+            osd_desc_pool,
+            osd_desc_set,
+            osd_pipeline_layout,
+            osd_pipeline,
             cmd_pool,
             cmd,
             image_available,
@@ -366,6 +439,10 @@ impl Renderer {
 
     pub fn size(&self) -> (u32, u32) {
         (self.extent.width, self.extent.height)
+    }
+
+    pub fn set_osd(&mut self, osd: Option<(bool, f32)>) {
+        self.osd_draw = osd;
     }
 
     /// Clears the window once so it never shows undefined memory.
@@ -439,6 +516,139 @@ impl Renderer {
         Ok(())
     }
 
+    unsafe fn upload_osd(&mut self, cmd: vk::CommandBuffer) -> Result<(), String> {
+        let range = vk::ImageSubresourceRange::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .base_mip_level(0)
+            .level_count(1)
+            .base_array_layer(0)
+            .layer_count(1);
+        let barrier = [vk::ImageMemoryBarrier::default()
+            .old_layout(vk::ImageLayout::UNDEFINED)
+            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(self.osd_tex.image)
+            .subresource_range(range)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)];
+        self.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &barrier,
+        );
+        let region = [vk::BufferImageCopy::default()
+            .buffer_offset(0)
+            .buffer_row_length(0)
+            .buffer_image_height(0)
+            .image_subresource(
+                vk::ImageSubresourceLayers::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .mip_level(0)
+                    .base_array_layer(0)
+                    .layer_count(1),
+            )
+            .image_extent(vk::Extent3D {
+                width: self.osd_tex.width,
+                height: self.osd_tex.height,
+                depth: 1,
+            })];
+        self.device.cmd_copy_buffer_to_image(
+            cmd,
+            self.osd_stage.buffer,
+            self.osd_tex.image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &region,
+        );
+        let read = [vk::ImageMemoryBarrier::default()
+            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(self.osd_tex.image)
+            .subresource_range(range)
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ)];
+        self.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &read,
+        );
+        self.osd_ready = true;
+        Ok(())
+    }
+
+    unsafe fn draw_osd(&self, cmd: vk::CommandBuffer, enabled: bool, alpha: f32) {
+        if alpha <= 0.0 {
+            return;
+        }
+        let sw = self.extent.width as f32;
+        let sh = self.extent.height as f32;
+        let scale = (sh / 1080.0).clamp(0.8, 1.75);
+        let card_w = 360.0 * scale;
+        let card_h = 84.0 * scale;
+        let x0 = (sw - card_w) / 2.0;
+        let y1 = sh - 64.0 * scale;
+        let y0 = y1 - card_h;
+        let nx0 = 2.0 * x0 / sw - 1.0;
+        let nx1 = 2.0 * (x0 + card_w) / sw - 1.0;
+        let ny0 = 2.0 * y0 / sh - 1.0;
+        let ny1 = 2.0 * y1 / sh - 1.0;
+        let uv = if enabled {
+            [0.0, 0.0, 0.5, 1.0]
+        } else {
+            [0.5, 0.0, 1.0, 1.0]
+        };
+        let push = OsdPush {
+            rect: [nx0, ny0, nx1, ny1],
+            uv,
+            alpha,
+        };
+        let bytes = std::slice::from_raw_parts(
+            (&push as *const OsdPush).cast::<u8>(),
+            std::mem::size_of::<OsdPush>(),
+        );
+        let viewport = [vk::Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: sw,
+            height: sh,
+            min_depth: 0.0,
+            max_depth: 1.0,
+        }];
+        let scissor = [vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent: self.extent,
+        }];
+        self.device.cmd_set_viewport(cmd, 0, &viewport);
+        self.device.cmd_set_scissor(cmd, 0, &scissor);
+        self.device
+            .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.osd_pipeline);
+        self.device.cmd_bind_descriptor_sets(
+            cmd,
+            vk::PipelineBindPoint::GRAPHICS,
+            self.osd_pipeline_layout,
+            0,
+            &[self.osd_desc_set],
+            &[],
+        );
+        self.device.cmd_push_constants(
+            cmd,
+            self.osd_pipeline_layout,
+            vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+            0,
+            bytes,
+        );
+        self.device.cmd_draw(cmd, 4, 1, 0, 0);
+    }
+
     unsafe fn present(&mut self, win: (u32, u32)) -> Result<(), String> {
         // A fullscreen transition can briefly report a zero-sized window.
         // Do not touch the swapchain until SDL has a real size again.
@@ -485,6 +695,10 @@ impl Renderer {
         self.device
             .begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default())
             .map_err(|e| format!("begin cmd: {e:?}"))?;
+
+        if !self.osd_ready {
+            self.upload_osd(cmd)?;
+        }
 
         let range = vk::ImageSubresourceRange::default()
             .aspect_mask(vk::ImageAspectFlags::COLOR)
@@ -629,6 +843,9 @@ impl Renderer {
             &[],
         );
         self.device.cmd_draw(cmd, 3, 1, 0, 0);
+        if let Some((enabled, alpha)) = self.osd_draw {
+            self.draw_osd(cmd, enabled, alpha);
+        }
         self.device.cmd_end_render_pass(cmd);
         self.device
             .end_command_buffer(cmd)
@@ -792,8 +1009,14 @@ impl Drop for Renderer {
             }
             destroy_texture(&self.device, &mut self.tex_y);
             destroy_texture(&self.device, &mut self.tex_uv);
+            destroy_texture(&self.device, &mut self.osd_tex);
             destroy_staging(&self.device, &mut self.stage_y);
             destroy_staging(&self.device, &mut self.stage_uv);
+            destroy_staging(&self.device, &mut self.osd_stage);
+            self.device.destroy_pipeline(self.osd_pipeline, None);
+            self.device.destroy_pipeline_layout(self.osd_pipeline_layout, None);
+            self.device.destroy_descriptor_pool(self.osd_desc_pool, None);
+            self.device.destroy_descriptor_set_layout(self.osd_desc_layout, None);
             self.swapchain_loader.destroy_swapchain(self.swapchain, None);
             self.device.destroy_command_pool(self.cmd_pool, None);
             self.device.destroy_semaphore(self.image_available, None);
@@ -894,6 +1117,195 @@ fn create_sampler(device: &ash::Device) -> Result<vk::Sampler, String> {
                 None,
             )
             .map_err(|e| format!("sampler: {e:?}"))
+    }
+}
+
+fn create_osd_desc_layout(device: &ash::Device) -> Result<vk::DescriptorSetLayout, String> {
+    unsafe {
+        let bindings = [vk::DescriptorSetLayoutBinding::default()
+            .binding(0)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT)];
+        device
+            .create_descriptor_set_layout(
+                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
+                None,
+            )
+            .map_err(|e| format!("OSD descriptor layout: {e:?}"))
+    }
+}
+
+fn write_osd_descriptor(device: &ash::Device, set: vk::DescriptorSet, tex: &Texture, sampler: vk::Sampler) {
+    unsafe {
+        let info = [vk::DescriptorImageInfo::default()
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .image_view(tex.view)
+            .sampler(sampler)];
+        device.update_descriptor_sets(
+            &[vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&info)],
+            &[],
+        );
+    }
+}
+
+fn create_osd_pipeline(
+    device: &ash::Device,
+    render_pass: vk::RenderPass,
+    layout: vk::PipelineLayout,
+) -> Result<vk::Pipeline, String> {
+    unsafe {
+        let vert = shader_module(device, OSD_VERT_SPV)?;
+        let frag = shader_module(device, OSD_FRAG_SPV)?;
+        let stages = [
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::VERTEX)
+                .module(vert)
+                .name(c"main"),
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(frag)
+                .name(c"main"),
+        ];
+        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
+        let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+            .topology(vk::PrimitiveTopology::TRIANGLE_STRIP);
+        let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+            .viewport_count(1)
+            .scissor_count(1);
+        let raster = vk::PipelineRasterizationStateCreateInfo::default()
+            .polygon_mode(vk::PolygonMode::FILL)
+            .cull_mode(vk::CullModeFlags::NONE)
+            .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+            .line_width(1.0);
+        let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+        let blend_attachment = vk::PipelineColorBlendAttachmentState::default()
+            .blend_enable(true)
+            .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
+            .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+            .color_blend_op(vk::BlendOp::ADD)
+            .src_alpha_blend_factor(vk::BlendFactor::ONE)
+            .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+            .alpha_blend_op(vk::BlendOp::ADD)
+            .color_write_mask(vk::ColorComponentFlags::RGBA);
+        let blend_attachments = [blend_attachment];
+        let blend = vk::PipelineColorBlendStateCreateInfo::default()
+            .attachments(&blend_attachments);
+        let dynamic = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+        let dynamic_state = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic);
+        let info = vk::GraphicsPipelineCreateInfo::default()
+            .stages(&stages)
+            .vertex_input_state(&vertex_input)
+            .input_assembly_state(&input_assembly)
+            .viewport_state(&viewport_state)
+            .rasterization_state(&raster)
+            .multisample_state(&multisample)
+            .color_blend_state(&blend)
+            .dynamic_state(&dynamic_state)
+            .layout(layout)
+            .render_pass(render_pass)
+            .subpass(0);
+        let pipelines = device
+            .create_graphics_pipelines(vk::PipelineCache::null(), &[info], None)
+            .map_err(|(_, e)| format!("OSD pipeline: {e:?}"))?;
+        device.destroy_shader_module(vert, None);
+        device.destroy_shader_module(frag, None);
+        Ok(pipelines[0])
+    }
+}
+
+fn create_rgba_texture(
+    device: &ash::Device,
+    instance: &ash::Instance,
+    pd: vk::PhysicalDevice,
+    w: u32,
+    h: u32,
+    rgba: &[u8],
+) -> Result<(Texture, Staging), String> {
+    unsafe {
+        if rgba.len() < (w as usize) * (h as usize) * 4 {
+            return Err("OSD atlas is smaller than its extent".into());
+        }
+        let format = vk::Format::R8G8B8A8_UNORM;
+        let image_info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(format)
+            .extent(vk::Extent3D { width: w.max(1), height: h.max(1), depth: 1 })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        let image = device.create_image(&image_info, None).map_err(|e| format!("OSD image: {e:?}"))?;
+        let req = device.get_image_memory_requirements(image);
+        let mem_type = find_memory(instance, pd, req.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
+        let memory = device
+            .allocate_memory(
+                &vk::MemoryAllocateInfo::default()
+                    .allocation_size(req.size)
+                    .memory_type_index(mem_type),
+                None,
+            )
+            .map_err(|e| format!("OSD image memory: {e:?}"))?;
+        device.bind_image_memory(image, memory, 0).map_err(|e| format!("bind OSD image: {e:?}"))?;
+        let view = device
+            .create_image_view(
+                &vk::ImageViewCreateInfo::default()
+                    .image(image)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(format)
+                    .subresource_range(
+                        vk::ImageSubresourceRange::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .base_mip_level(0)
+                            .level_count(1)
+                            .base_array_layer(0)
+                            .layer_count(1),
+                    ),
+                None,
+            )
+            .map_err(|e| format!("OSD image view: {e:?}"))?;
+        let size = (w as u64) * (h as u64) * 4;
+        let buffer = device
+            .create_buffer(
+                &vk::BufferCreateInfo::default()
+                    .size(size)
+                    .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE),
+                None,
+            )
+            .map_err(|e| format!("OSD staging buffer: {e:?}"))?;
+        let breq = device.get_buffer_memory_requirements(buffer);
+        let btype = find_memory(
+            instance,
+            pd,
+            breq.memory_type_bits,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )?;
+        let bmem = device
+            .allocate_memory(
+                &vk::MemoryAllocateInfo::default()
+                    .allocation_size(breq.size)
+                    .memory_type_index(btype),
+                None,
+            )
+            .map_err(|e| format!("OSD staging memory: {e:?}"))?;
+        device.bind_buffer_memory(buffer, bmem, 0).map_err(|e| format!("bind OSD staging: {e:?}"))?;
+        let ptr = device
+            .map_memory(bmem, 0, breq.size, vk::MemoryMapFlags::empty())
+            .map_err(|e| format!("map OSD staging: {e:?}"))? as *mut u8;
+        std::ptr::copy_nonoverlapping(rgba.as_ptr(), ptr, (w as usize) * (h as usize) * 4);
+        Ok((
+            Texture { image, view, memory, width: w.max(1), height: h.max(1) },
+            Staging { buffer, memory: bmem, ptr },
+        ))
     }
 }
 
