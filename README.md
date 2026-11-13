@@ -200,9 +200,10 @@ Command-line flags win over the file. Unknown keys survive a save round trip.
 
 #### Text clipboard
 
-Only **text** is synchronized automatically, with normal Ctrl+C / Ctrl+V in
-both directions. The client polls the host text clipboard and the server polls
-the guest text clipboard; signatures prevent echo loops. Files and directories
+**Rich text** is synchronized automatically with normal Ctrl+C / Ctrl+V in
+both directions. The client and server copy the source `text/html` plus a
+plain-text fallback, and the peer offers both MIME types, so rich editors keep
+bold/links/lists while terminals still paste plain text. Files and directories
 are **not** synchronized at all, and there are no clipboard hotkeys.
 
 ### Revoking a client

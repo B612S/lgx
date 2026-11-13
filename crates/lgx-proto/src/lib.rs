@@ -24,6 +24,9 @@ pub mod msg {
     pub const KEYMAP: u8 = 9;
     pub const CLIP_SET: u8 = 10;
     pub const CLIP_DATA: u8 = 12;
+    /// Rich text: u32 html length, HTML bytes, then plain text.
+    pub const CLIP_SET_HTML: u8 = 20;
+    pub const CLIP_DATA_HTML: u8 = 21;
     /// `code` = 1 to overlay the guest pointer, 0 to draw it on the client.
     pub const CURSOR: u8 = 13;
     pub const PING: u8 = 14;
@@ -93,11 +96,34 @@ pub fn payload_len(m: &Msg) -> usize {
         | msg::KEYMAP
         | msg::CLIP_SET
         | msg::CLIP_DATA
+        | msg::CLIP_SET_HTML
+        | msg::CLIP_DATA_HTML
         | msg::FILE_BEGIN
         | msg::FILE_DATA
         | msg::GAMEPAD => m.a.max(0) as usize,
         _ => 0,
     }
+}
+
+pub fn encode_rich(html: &str, text: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + html.len() + text.len());
+    out.extend_from_slice(&(html.len() as u32).to_le_bytes());
+    out.extend_from_slice(html.as_bytes());
+    out.extend_from_slice(text.as_bytes());
+    out
+}
+
+pub fn decode_rich(payload: &[u8]) -> Option<(String, String)> {
+    if payload.len() < 4 {
+        return None;
+    }
+    let n = u32::from_le_bytes(payload[..4].try_into().ok()?) as usize;
+    if 4 + n > payload.len() {
+        return None;
+    }
+    let html = std::str::from_utf8(&payload[4..4 + n]).ok()?.to_string();
+    let text = std::str::from_utf8(&payload[4 + n..]).ok()?.to_string();
+    Some((html, text))
 }
 
 pub fn write_msg<W: Write>(w: &mut W, m: Msg, payload: &[u8]) -> io::Result<()> {

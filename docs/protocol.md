@@ -31,6 +31,8 @@ the header and its length is in `a`.
 | 9 | KEYMAP | `a` = length | xkb keymap |
 | 10 | CLIP_SET | `a` = length | text |
 | 12 | CLIP_DATA | `a` = length | text |
+| 20 | CLIP_SET_HTML | `a` = length | rich text |
+| 21 | CLIP_DATA_HTML | `a` = length | rich text |
 | 13 | CURSOR | `code` = 1 overlay the guest pointer, 0 draw locally | — |
 | 14 | PING | — | — |
 | 15 | FILE_BEGIN | `a` = length | file offer |
@@ -56,11 +58,14 @@ frame, and each is sent as its own `VIDEO` message.
 
 ## Clipboard
 
-Only text is synchronized. Each side polls its local clipboard every 300 ms
-and sends only text: the client uses `CLIP_SET`, the server broadcasts
-`CLIP_DATA`. `last_remote`/`last_sent` signatures prevent echo loops. File
-clipboard contents are not synchronized, and there are no clipboard hotkeys
-or automatic pastes.
+Only rich/plain text is synchronized. Each side polls every 300 ms and ignores
+file clipboard contents. The client uses `CLIP_SET`/`CLIP_DATA` for plain text
+and `CLIP_SET_HTML`/`CLIP_DATA_HTML` for rich text; `last_remote`/`last_sent`
+signatures prevent echo loops. Rich payloads are `u32 html_len` (LE), HTML
+bytes, then plain text. The receiver installs both `text/html` and plain MIME
+types (via `wl-clipboard-rs::copy_multi`), so formatting survives in rich
+editors and terminals still get plain text. There are no clipboard hotkeys or
+automatic pastes.
 
 ## Pairing and revocation
 

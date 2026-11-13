@@ -17,11 +17,13 @@ use lgx_proto::secure::{self, Secure};
 use lgx_proto::{codec, files, msg, Msg};
 
 use crate::clients;
+use crate::clip;
 use crate::input::Cmd;
 
 enum Out {
     Video(Vec<u8>),
     Clip(String),
+    ClipHtml(Vec<u8>),
 }
 
 pub struct Hub {
@@ -145,6 +147,15 @@ impl Hub {
     pub fn broadcast_clip(&self, text: &str) {
         let mut list = self.clients.lock().unwrap();
         list.retain(|c| match c.tx.try_send(Out::Clip(text.to_string())) {
+            Ok(()) | Err(TrySendError::Full(_)) => true,
+            Err(TrySendError::Disconnected(_)) => false,
+        });
+    }
+
+    pub fn broadcast_rich(&self, html: &str, text: &str) {
+        let payload = lgx_proto::encode_rich(html, text);
+        let mut list = self.clients.lock().unwrap();
+        list.retain(|c| match c.tx.try_send(Out::ClipHtml(payload.clone())) {
             Ok(()) | Err(TrySendError::Full(_)) => true,
             Err(TrySendError::Disconnected(_)) => false,
         });
@@ -310,6 +321,12 @@ fn handle(
                             text.as_bytes(),
                         )
                         .is_ok(),
+                    Out::ClipHtml(payload) => w2
+                        .send_msg(
+                            Msg::new(msg::CLIP_DATA_HTML, 0, payload.len() as i32, 0),
+                            &payload,
+                        )
+                        .is_ok(),
                 };
                 if !ok {
                     hubw.request_keyframe_soon();
@@ -367,6 +384,17 @@ fn handle(
             msg::CLIP_SET => {
                 if let Ok(text) = String::from_utf8(payload) {
                     clip_set(&text);
+                }
+            }
+            msg::CLIP_SET_HTML => {
+                if let Some((html, text)) = lgx_proto::decode_rich(&payload) {
+                    *last_remote.lock().unwrap() = clip::signature(&clip::Clip::Rich {
+                        html: html.clone(),
+                        text: text.clone(),
+                    });
+                    if let Err(e) = crate::clip::set_rich(&html, &text) {
+                        eprintln!("lgx-server: rich clipboard: {e}");
+                    }
                 }
             }
             msg::FILE_BEGIN => match files::decode_offer(&payload) {

@@ -84,14 +84,26 @@ pub fn connect(
         bytes: AtomicU64::new(0),
         closed: std::sync::atomic::AtomicBool::new(false),
     });
-    // Host text wins over a pre-existing guest clipboard on connect.
-    if let Ok(crate::clip::Clip::Text(text)) = crate::clip::get() {
-        if !text.is_empty() {
-            let _ = secure.send_msg(
-                Msg::new(msg::CLIP_SET, 0, text.len() as i32, 0),
-                text.as_bytes(),
-            );
-            *conn.last_remote.lock().unwrap() = text;
+    // Host clipboard wins over a pre-existing guest clipboard on connect.
+    if let Ok(clip) = crate::clip::get() {
+        let sig = crate::clip::signature(&clip);
+        match clip {
+            crate::clip::Clip::Rich { html, text } if !html.is_empty() => {
+                let payload = lgx_proto::encode_rich(&html, &text);
+                let _ = secure.send_msg(
+                    Msg::new(msg::CLIP_SET_HTML, 0, payload.len() as i32, 0),
+                    &payload,
+                );
+                *conn.last_remote.lock().unwrap() = sig;
+            }
+            crate::clip::Clip::Text(text) if !text.is_empty() => {
+                let _ = secure.send_msg(
+                    Msg::new(msg::CLIP_SET, 0, text.len() as i32, 0),
+                    text.as_bytes(),
+                );
+                *conn.last_remote.lock().unwrap() = sig;
+            }
+            _ => {}
         }
     }
     let conn_for_reader = conn.clone();
@@ -148,6 +160,17 @@ fn reader(
                 conn.bytes.fetch_add(payload.len() as u64, Ordering::Relaxed);
                 if video.send(Chunk { data: payload, at: std::time::Instant::now() }).is_err() {
                     break;
+                }
+            }
+            msg::CLIP_DATA_HTML => {
+                if let Some((html, text)) = lgx_proto::decode_rich(&payload) {
+                    *last_remote.lock().unwrap() = crate::clip::signature(&crate::clip::Clip::Rich {
+                        html: html.clone(),
+                        text: text.clone(),
+                    });
+                    if let Err(e) = crate::clip::set_rich(&html, &text) {
+                        eprintln!("lgx-client: rich clipboard: {e}");
+                    }
                 }
             }
             msg::CLIP_DATA => {

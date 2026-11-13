@@ -331,19 +331,32 @@ fn main() {
                 let mut last_sent = String::new();
                 loop {
                     std::thread::sleep(Duration::from_millis(300));
-                    let text = match clip::get() {
-                        Ok(clip::Clip::Text(text)) if !text.is_empty() => text,
+                    let clip = match clip::get() {
+                        Ok(clip) => clip,
                         _ => continue,
                     };
-                    if text == last_sent || text == *conn.last_remote.lock().unwrap() {
-                        last_sent = text;
+                    let sig = clip::signature(&clip);
+                    if sig == last_sent || sig == *conn.last_remote.lock().unwrap() {
+                        last_sent = sig;
                         continue;
                     }
-                    let _ = conn.send(
-                        Msg::new(msg::CLIP_SET, 0, text.len() as i32, 0),
-                        text.as_bytes(),
-                    );
-                    last_sent = text;
+                    match clip {
+                        clip::Clip::Rich { html, text } if !html.is_empty() => {
+                            let payload = lgx_proto::encode_rich(&html, &text);
+                            let _ = conn.send(
+                                Msg::new(msg::CLIP_SET_HTML, 0, payload.len() as i32, 0),
+                                &payload,
+                            );
+                        }
+                        clip::Clip::Text(text) if !text.is_empty() => {
+                            let _ = conn.send(
+                                Msg::new(msg::CLIP_SET, 0, text.len() as i32, 0),
+                                text.as_bytes(),
+                            );
+                        }
+                        _ => {}
+                    }
+                    last_sent = sig;
                 }
             })
             .ok();

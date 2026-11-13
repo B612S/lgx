@@ -6,6 +6,7 @@ license.workspace = true
 description = "lgx client: hardware HEVC decode and zero-copy presentation"
 
 [dependencies]
+wl-clipboard-rs = "0.9.5"
 lgx-proto = { path = "../lgx-proto" }
 libc = "0.2"
 sdl3 = { version = "0.16", features = ["ash"] }

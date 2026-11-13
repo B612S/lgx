@@ -132,13 +132,17 @@ the Vulkan shader converts full-range BT.709, and the HEVC VUI says
 - Client scancodes must be masked with `& 0x1ff`.
 - `MODS` is sent before every `KEY`; the virtual keyboard needs explicit
   modifiers.
-- **Text only.** Both sides poll their local clipboard every 300 ms and send
-  only `Clip::Text`; file clipboard entries are ignored. The client sends
-  `CLIP_SET` for changed host text and the server broadcasts `CLIP_DATA` for
-  changed guest text. `last_remote`/`last_sent` strings prevent echo loops.
-- On connect the client sends its current host text first and the server
-  starts its poll with the pre-existing guest text already marked as sent, so
-  the host text wins and an old guest clipboard is not pushed over it.
+- **Rich text only.** Both sides poll every 300 ms and ignore file clipboard
+  entries. If the source offers `text/html`, `clip::get` returns
+  `Clip::Rich { html, text }`; otherwise `Clip::Text`. The client sends
+  `CLIP_SET_HTML` (u32 html length + HTML + plain) and the server broadcasts
+  `CLIP_DATA_HTML`; plain uses `CLIP_SET`/`CLIP_DATA`.
+- Rich clipboard is installed with `wl-clipboard-rs::copy_multi`, offering
+  plain text first and `text/html` second. Plain must be first so the extra
+  text MIME fallbacks use it; never put HTML first. Files are not synchronized.
+- On connect the client sends its current host clipboard first and the server
+  starts its poll with the pre-existing guest clipboard already marked as
+  sent, so the host clipboard wins and an old guest one is not pushed over it.
 - Never add file synchronization, clipboard hotkeys, `CLIP_GET`/`CLIP_ACK` or
   a paste injection back. Normal Ctrl+C/Ctrl+V is the whole UX.
 - Audio is on by default (`--no-audio` disables it) and uses the same secure
