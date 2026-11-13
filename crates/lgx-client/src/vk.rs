@@ -87,6 +87,7 @@ pub struct Renderer {
     osd_tex: Texture,
     osd_stage: Staging,
     osd_ready: bool,
+    osd_card: (u32, u32),
     osd_draw: Option<(bool, f32)>,
     osd_desc_layout: vk::DescriptorSetLayout,
     osd_desc_pool: vk::DescriptorPool,
@@ -264,11 +265,11 @@ impl Renderer {
         // OSD atlas: generated once from system fonts, uploaded before the
         // first frame. A missing font still leaves a blank card rather than
         // breaking video.
-        let (osd_w, osd_h, osd_rgba) = match crate::osd::atlas() {
-            Some(atlas) => (atlas.width, atlas.height, atlas.rgba),
+        let (osd_w, osd_h, osd_card, osd_rgba) = match crate::osd::atlas() {
+            Some(atlas) => (atlas.width, atlas.height, (atlas.card_width, atlas.card_height), atlas.rgba),
             None => {
                 eprintln!("lgx-client: OSD font not found; OSD overlay disabled");
-                (2, 1, vec![0u8; 8])
+                (2, 1, (1, 1), vec![0u8; 8])
             }
         };
         let (osd_tex, osd_stage) =
@@ -413,6 +414,7 @@ impl Renderer {
             osd_tex,
             osd_stage,
             osd_ready: false,
+            osd_card,
             osd_draw: None,
             osd_desc_layout,
             osd_desc_pool,
@@ -592,11 +594,11 @@ impl Renderer {
         let sw = self.extent.width as f32;
         let sh = self.extent.height as f32;
         let scale = (sh / 1080.0).clamp(0.8, 1.75);
-        let card_w = 360.0 * scale;
-        let card_h = 84.0 * scale;
+        let card_w = self.osd_card.0 as f32 * scale;
+        let card_h = self.osd_card.1 as f32 * scale;
         let x0 = (sw - card_w) / 2.0;
-        let y1 = sh - 64.0 * scale;
-        let y0 = y1 - card_h;
+        let y0 = 40.0 * scale;
+        let y1 = y0 + card_h;
         let nx0 = 2.0 * x0 / sw - 1.0;
         let nx1 = 2.0 * (x0 + card_w) / sw - 1.0;
         let ny0 = 2.0 * y0 / sh - 1.0;

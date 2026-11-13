@@ -738,7 +738,6 @@ fn main() {
     let mut redraw = true;
     let mut swallow_f_keyup = false;
     let mut swallow_m_keyup = false;
-    let mut osd_started: Option<Instant> = None;
     let mut osd_until: Option<Instant> = None;
     let mut osd_enabled = false;
     let mut fullscreen_hold: Option<(Instant, (u32, u32))> = None;
@@ -873,7 +872,6 @@ fn main() {
                         if now_mute { "disabled" } else { "enabled" }
                     );
                     osd_enabled = !now_mute;
-                    osd_started = Some(Instant::now());
                     osd_until = Some(Instant::now() + Duration::from_millis(1600));
                     redraw = true;
                 }
@@ -972,21 +970,20 @@ fn main() {
         }
         let mut drawn = false;
         if !hold_draw {
-        let osd = match (osd_started, osd_until) {
-            (Some(started), Some(until)) => {
+        let osd = match osd_until {
+            Some(until) => {
                 let now = Instant::now();
                 if now >= until {
-                    osd_started = None;
                     osd_until = None;
                     None
                 } else {
-                    let elapsed = now.saturating_duration_since(started).as_secs_f32();
+                    // luma appears immediately and fades out over 150 ms.
                     let left = until.saturating_duration_since(now).as_secs_f32();
-                    let alpha = (elapsed / 0.14).min(left / 0.22).clamp(0.0, 1.0);
+                    let alpha = (left / 0.15).clamp(0.0, 1.0);
                     Some((osd_enabled, alpha))
                 }
             }
-            _ => None,
+            None => None,
         };
         renderer.set_osd(osd);
         if let Some(frame) = frame {

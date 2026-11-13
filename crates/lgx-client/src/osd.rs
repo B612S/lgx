@@ -1,33 +1,34 @@
-//! Software rasterizer for the in-window OSD card. The resulting RGBA atlas is
-//! uploaded once and drawn by the Vulkan renderer as a transparent overlay.
+//! Software rasterizer for the in-window OSD card, styled after luma's
+//! `OsdToast.qml`: 40 px tall, 8 px radius, translucent theme background,
+//! a 20% text-colored border, 16 px centered text, top-center of the window.
 
 use fontdue::{Font, FontSettings};
 
-const CARD_W: u32 = 360;
-const CARD_H: u32 = 84;
-const SS: u32 = 2; // supersampling for crisp text and corners
+const CARD_H: u32 = 40;
+const SS: u32 = 2; // supersampling
+const PAD_X: u32 = 16;
+const FONT_PX: f32 = 16.0;
+const RADIUS: f32 = 8.0;
 
-const REGULAR_FONTS: &[&str] = &[
+const FONTS: &[&str] = &[
     "/usr/share/fonts/noto/NotoSans-Regular.ttf",
     "/usr/share/fonts/TTF/DejaVuSans.ttf",
     "/usr/share/fonts/liberation/LiberationSans-Regular.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
 ];
-const BOLD_FONTS: &[&str] = &[
-    "/usr/share/fonts/noto/NotoSans-Bold.ttf",
-    "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
-    "/usr/share/fonts/liberation/LiberationSans-Bold.ttf",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-];
 
 pub struct Atlas {
+    /// Texture width (both states side by side, supersampled).
     pub width: u32,
     pub height: u32,
+    /// Logical size of one card.
+    pub card_width: u32,
+    pub card_height: u32,
     pub rgba: Vec<u8>,
 }
 
-fn load_font(paths: &[&str]) -> Option<Font> {
-    for path in paths {
+fn load_font() -> Option<Font> {
+    for path in FONTS {
         let Ok(bytes) = std::fs::read(path) else {
             continue;
         };
@@ -75,7 +76,7 @@ fn draw_text(
     baseline: f32,
     font: &Font,
     px: f32,
-    (r, g, b): (u8, u8, u8),
+    color: (u8, u8, u8),
     text: &str,
 ) {
     let width = text_width(font, px, text);
@@ -88,7 +89,16 @@ fn draw_text(
             for col in 0..metrics.width {
                 let coverage = bitmap[row * metrics.width + col] as f32 / 255.0;
                 if coverage > 0.0 {
-                    blend(pixels, stride, gx + col as i32, gy + row as i32, r, g, b, coverage);
+                    blend(
+                        pixels,
+                        stride,
+                        gx + col as i32,
+                        gy + row as i32,
+                        color.0,
+                        color.1,
+                        color.2,
+                        coverage,
+                    );
                 }
             }
         }
@@ -104,14 +114,20 @@ fn rounded_distance(px: f32, py: f32, w: f32, h: f32, radius: f32) -> f32 {
     (ox * ox + oy * oy).sqrt() + qx.max(qy).min(0.0) - radius
 }
 
-fn draw_card(pixels: &mut [u8], stride: u32, offset: u32, enabled: bool, bold: &Font, regular: &Font) {
-    let w = CARD_W * SS;
+fn draw_card(
+    pixels: &mut [u8],
+    stride: u32,
+    offset: u32,
+    card_w: u32,
+    text: &str,
+    font: &Font,
+) {
     let h = CARD_H * SS;
-    let radius = 18.0 * SS as f32;
-    let (bg_r, bg_g, bg_b) = (30u8, 30u8, 36u8);
+    let radius = RADIUS * SS as f32;
+    let (bg_r, bg_g, bg_b) = (28u8, 28u8, 33u8); // luma dark background, 85%
     for y in 0..h {
-        for x in 0..w {
-            let d = rounded_distance(x as f32 + 0.5, y as f32 + 0.5, w as f32, h as f32, radius);
+        for x in 0..card_w {
+            let d = rounded_distance(x as f32 + 0.5, y as f32 + 0.5, card_w as f32, h as f32, radius);
             let coverage = (-d).clamp(0.0, 1.0);
             if coverage > 0.0 {
                 blend(
@@ -122,7 +138,7 @@ fn draw_card(pixels: &mut [u8], stride: u32, offset: u32, enabled: bool, bold: &
                     bg_r,
                     bg_g,
                     bg_b,
-                    (232.0 / 255.0) * coverage,
+                    (217.0 / 255.0) * coverage,
                 );
             }
             if d > -1.5 && d <= 0.0 {
@@ -131,62 +147,46 @@ fn draw_card(pixels: &mut [u8], stride: u32, offset: u32, enabled: bool, bold: &
                     stride,
                     (offset + x) as i32,
                     y as i32,
-                    255,
-                    255,
-                    255,
-                    (34.0 / 255.0) * (-d).clamp(0.0, 1.0),
+                    250,
+                    250,
+                    252,
+                    (51.0 / 255.0) * (-d).clamp(0.0, 1.0),
                 );
             }
         }
     }
 
-    let center = offset as f32 + w as f32 / 2.0;
+    let center = offset as f32 + card_w as f32 / 2.0;
+    let baseline = h as f32 / 2.0 + FONT_PX * SS as f32 * 0.35;
     draw_text(
         pixels,
         stride,
         center,
-        34.0 * SS as f32,
-        bold,
-        20.0 * SS as f32,
-        (247, 247, 250),
-        "Background audio",
+        baseline,
+        font,
+        FONT_PX * SS as f32,
+        (250, 250, 252),
+        text,
     );
-    if enabled {
-        draw_text(
-            pixels,
-            stride,
-            center,
-            61.0 * SS as f32,
-            regular,
-            15.0 * SS as f32,
-            (126, 229, 158),
-            "On",
-        );
-    } else {
-        draw_text(
-            pixels,
-            stride,
-            center,
-            61.0 * SS as f32,
-            regular,
-            14.0 * SS as f32,
-            (238, 179, 104),
-            "Off — muted when unfocused",
-        );
-    }
 }
 
 pub fn atlas() -> Option<Atlas> {
-    let regular = load_font(REGULAR_FONTS)?;
-    let bold = load_font(BOLD_FONTS).unwrap_or_else(|| {
-        // Reuse the regular face if no bold file is installed.
-        load_font(REGULAR_FONTS).expect("regular font")
-    });
-    let w = CARD_W * SS;
-    let h = CARD_H * SS;
-    let width = w * 2;
-    let mut rgba = vec![0u8; (width * h * 4) as usize];
-    draw_card(&mut rgba, width, 0, true, &bold, &regular);
-    draw_card(&mut rgba, width, w, false, &bold, &regular);
-    Some(Atlas { width, height: h, rgba })
+    let font = load_font()?;
+    let on = "Background audio: On";
+    let off = "Background audio: Off";
+    let text_w = text_width(&font, FONT_PX * SS as f32, on)
+        .max(text_width(&font, FONT_PX * SS as f32, off));
+    let card_w = (text_w.ceil() as u32 + PAD_X * 2 * SS).max(180 * SS);
+    let card_h = CARD_H * SS;
+    let width = card_w * 2;
+    let mut rgba = vec![0u8; (width * card_h * 4) as usize];
+    draw_card(&mut rgba, width, 0, card_w, on, &font);
+    draw_card(&mut rgba, width, card_w, card_w, off, &font);
+    Some(Atlas {
+        width,
+        height: card_h,
+        card_width: card_w / SS,
+        card_height: CARD_H,
+        rgba,
+    })
 }

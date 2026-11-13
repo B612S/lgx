@@ -80,9 +80,9 @@ Commit format: `area: short imperative summary`, for example
   `LGX_DEBUG_FPS` still prints per-second diagnostics to stderr.
 - Client hotkeys are `Ctrl+Shift+Alt+F` (fullscreen) and
   `Ctrl+Shift+Alt+M` (runtime-only toggle of background audio, not persisted;
-  startup value comes from `[audio] mute_unfocused`; the OSD is a text-only
-  alpha-blended card rendered inside the Vulkan swapchain, not a separate
-  window). The
+  startup value comes from `[audio] mute_unfocused`; the OSD is a luma-style
+  top-center text card (40 px, radius 8, 85% theme background, 20% border)
+  rendered inside the Vulkan swapchain, not a separate window). The
   keydown/keyup is swallowed and modifier key-ups clear the guest state.
   F9/F10/F11/F12 are ordinary keys and must reach the guest.
 - After a fullscreen toggle the client skips drawing until SDL reports the
