@@ -26,7 +26,8 @@ const FALLBACK_FONTS: &[&str] = &[
 pub struct Atlas {
     pub width: u32,
     pub height: u32,
-    pub card_width: u32,
+    pub card_width_on: u32,
+    pub card_width_off: u32,
     pub card_height: u32,
     pub rgba: Vec<u8>,
 }
@@ -301,22 +302,29 @@ fn draw_card(pixels: &mut [u8], stride: u32, offset: u32, card_w: u32, text: &st
     draw_text(pixels, stride, x, baseline, font, text);
 }
 
+fn card_width(font: &SystemFont, text: &str) -> u32 {
+    text_width(font, text).ceil() as u32 + PAD_X * 2
+}
+
 pub fn atlas(scale: f32) -> Option<Atlas> {
     let (font, family, point) = system_font(scale)?;
     eprintln!("lgx-client: OSD font {family}, {point} pt ({} px)", font.pixels);
     let on = "Background audio: On";
     let off = "Background audio: Off";
-    let text_w = text_width(&font, on).max(text_width(&font, off));
-    let card_w = (text_w.ceil() as u32 + PAD_X * 2).max(180);
+    // Each state gets the width its own text needs. Sharing the widest width
+    // (or a fixed minimum) left a visible empty strip on the shorter card.
+    let on_w = card_width(&font, on);
+    let off_w = card_width(&font, off);
     let card_h = CARD_H;
-    let width = card_w * 2;
+    let width = on_w + off_w;
     let mut rgba = vec![0u8; (width * card_h * 4) as usize];
-    draw_card(&mut rgba, width, 0, card_w, on, &font);
-    draw_card(&mut rgba, width, card_w, card_w, off, &font);
+    draw_card(&mut rgba, width, 0, on_w, on, &font);
+    draw_card(&mut rgba, width, on_w, off_w, off, &font);
     Some(Atlas {
         width,
         height: card_h,
-        card_width: card_w,
+        card_width_on: on_w,
+        card_width_off: off_w,
         card_height: card_h,
         rgba,
     })
@@ -331,7 +339,15 @@ mod tests {
         let (font, _, _) = system_font(1.0).expect("a system sans font");
         assert!(text_width(&font, "Background audio: On") > 0.0);
         let atlas = atlas(1.0).expect("OSD atlas");
-        assert!(atlas.card_width >= 180);
+        assert_eq!(
+            atlas.card_width_on as f32,
+            text_width(&font, "Background audio: On").ceil() + (PAD_X * 2) as f32
+        );
+        assert_eq!(
+            atlas.card_width_off as f32,
+            text_width(&font, "Background audio: Off").ceil() + (PAD_X * 2) as f32
+        );
+        assert_eq!(atlas.width, atlas.card_width_on + atlas.card_width_off);
         assert_eq!(atlas.rgba.len(), (atlas.width * atlas.height * 4) as usize);
     }
 }

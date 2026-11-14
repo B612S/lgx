@@ -775,6 +775,12 @@ fn main() {
         for ev in events {
             match ev {
                 Event::Quit { .. } => quit = true,
+                // The window decoration's close button arrives as a window
+                // event, not as SDL_EVENT_QUIT; without this the window goes
+                // away while the process keeps its video/audio threads alive.
+                Event::Window { win_event: sdl3::event::WindowEvent::CloseRequested, .. } => {
+                    quit = true;
+                }
                 Event::Window { win_event: sdl3::event::WindowEvent::FocusLost, .. } => {
                     audio_focus.store(false, std::sync::atomic::Ordering::Relaxed);
                 }
@@ -1092,6 +1098,10 @@ fn main() {
     let _ = decoder.join();
 
     if connection_lost && s.reconnect {
+        // `attempt` is the number of failed connection attempts already made.
+        // The restarted process increments it again when its own connection
+        // fails, so it must receive the old value, not the upcoming retry
+        // number; otherwise the first dialog says "attempt 2".
         let attempt = if session_started.elapsed() > Duration::from_secs(30) {
             0
         } else {
@@ -1104,7 +1114,7 @@ fn main() {
             );
             std::process::exit(1);
         }
-        reconnect_exec(next);
+        reconnect_exec(attempt);
     }
 }
 
@@ -1118,14 +1128,18 @@ fn reconnect_attempt() -> u32 {
         .unwrap_or(0)
 }
 
+/// 1-based retry number shown in the dialog: the first retry waits 1 s.
 fn reconnect_delay(attempt: u32) -> Duration {
-    let secs = 1u64 << attempt.min(4);
-    Duration::from_secs(secs.min(15))
+    let step = attempt.saturating_sub(1).min(4);
+    Duration::from_secs((1u64 << step).min(15))
 }
 
+/// `attempt` is the number of failed attempts so far. The new process will
+/// increment it before showing its first reconnect dialog.
 fn reconnect_exec(attempt: u32) -> ! {
     eprintln!(
-        "lgx-client: restarting session for reconnect (attempt {attempt}/{MAX_RECONNECT_ATTEMPTS})"
+        "lgx-client: restarting session for reconnect (attempt {}/{MAX_RECONNECT_ATTEMPTS})",
+        attempt + 1
     );
     let exe = match std::env::current_exe() {
         Ok(v) => v,
@@ -1312,9 +1326,9 @@ mod tests {
 
     #[test]
     fn reconnect_backoff_is_bounded() {
-        assert_eq!(reconnect_delay(0), Duration::from_secs(1));
-        assert_eq!(reconnect_delay(1), Duration::from_secs(2));
-        assert_eq!(reconnect_delay(4), Duration::from_secs(15));
+        assert_eq!(reconnect_delay(1), Duration::from_secs(1));
+        assert_eq!(reconnect_delay(2), Duration::from_secs(2));
+        assert_eq!(reconnect_delay(5), Duration::from_secs(15));
         assert_eq!(reconnect_delay(99), Duration::from_secs(15));
     }
 

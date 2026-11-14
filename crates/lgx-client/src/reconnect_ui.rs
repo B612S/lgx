@@ -69,17 +69,32 @@ impl Dialog {
         }
     }
 
-    /// Waits for the backoff delay. Returns true if the user cancelled or the
-    /// helper exited unexpectedly, in which case reconnect must stop.
+    fn set_remaining(&mut self, seconds: u32) {
+        if let Some(stdin) = self.stdin.as_mut() {
+            let _ = writeln!(stdin, "remaining {seconds}");
+            let _ = stdin.flush();
+        }
+    }
+
+    /// Waits for the backoff delay and keeps the dialog's countdown in sync.
+    /// Returns true if the user cancelled or the helper exited unexpectedly.
     pub fn wait_or_cancel(&mut self, delay: Duration) -> bool {
         let deadline = Instant::now() + delay;
+        let mut last_seconds = u32::MAX;
         loop {
             match self.child.try_wait() {
                 Ok(Some(_)) => return true,
                 Ok(None) => {}
                 Err(_) => return true,
             }
-            if Instant::now() >= deadline {
+            let now = Instant::now();
+            let left = deadline.saturating_duration_since(now);
+            let seconds = (left.as_secs() + u64::from(left.subsec_nanos() > 0)) as u32;
+            if seconds != last_seconds {
+                self.set_remaining(seconds);
+                last_seconds = seconds;
+            }
+            if now >= deadline {
                 return false;
             }
             std::thread::sleep(Duration::from_millis(100));

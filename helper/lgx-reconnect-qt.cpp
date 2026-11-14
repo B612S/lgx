@@ -70,8 +70,16 @@ public:
 
 public:
     void set_attempt(int attempt) {
-        status_->setText(
-            QStringLiteral("Reconnecting… attempt %1/10").arg(attempt));
+        attempt_ = attempt;
+        // The countdown belongs to the previous backoff; do not flash its
+        // final 0 while the parent prepares the next one.
+        remaining_ = -1;
+        update_status();
+    }
+
+    void set_remaining(int seconds) {
+        remaining_ = seconds;
+        update_status();
     }
 
 protected:
@@ -81,8 +89,19 @@ protected:
     }
 
 private:
+    void update_status() {
+        QString text = QStringLiteral("Reconnecting… attempt %1/10").arg(attempt_);
+        if (remaining_ > 0)
+            text += QStringLiteral(" — retrying in %1 s").arg(remaining_);
+        else if (remaining_ == 0)
+            text += QStringLiteral(" — connecting…");
+        status_->setText(text);
+    }
+
     QString name_;
     QLabel *status_ = nullptr;
+    int attempt_ = 1;
+    int remaining_ = -1;
 };
 
 int main(int argc, char **argv) {
@@ -136,6 +155,12 @@ int main(int argc, char **argv) {
                 const int attempt = line.mid(8).toInt(&ok);
                 if (ok) {
                     window.set_attempt(attempt);
+                }
+            } else if (line.startsWith(QStringLiteral("remaining "))) {
+                bool ok = false;
+                const int seconds = line.mid(10).toInt(&ok);
+                if (ok) {
+                    window.set_remaining(seconds);
                 }
             }
         }

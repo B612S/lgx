@@ -19,6 +19,8 @@ use crate::dmabuf::DumbBuffer;
 use lgx_server::gbm::GbmBuffer;
 use crate::protocols::{linux_dmabuf, screencopy, xdg_output};
 
+type FrameProxy = screencopy::client::zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1;
+
 pub struct FrameInfo {
     pub width: u32,
     pub height: u32,
@@ -53,6 +55,9 @@ pub struct CapState {
     gbm_bufs: [Option<(wl_buffer::WlBuffer, GbmBuffer)>; 2],
     pub cur: usize,
     pub overlay_cursor: bool,
+    /// The frame object waiting for the compositor. It must be destroyed
+    /// after `ready`; just dropping the proxy leaks the compositor resource.
+    pending: Option<FrameProxy>,
     pub pending_copy: bool,
     pub damage_only: bool,
     pub logged_format: bool,
@@ -142,6 +147,7 @@ impl Capture {
             gbm_bufs: [None, None],
             cur: 0,
             overlay_cursor: true,
+            pending: None,
             pending_copy: false,
             damage_only: false,
             logged_format: false,
@@ -227,6 +233,7 @@ impl Capture {
             }
             None => self.state.pending_copy = true,
         }
+        self.state.pending = Some(frame);
         self.state.in_flight = true;
         // Send the copy request now, not on the next blocking dispatch. That
         // lets the compositor blit frame N+1 while this process converts and
@@ -246,6 +253,7 @@ impl Capture {
         }
         self.state.done = false;
         self.state.in_flight = false;
+        release_frame(self.state.pending.take());
         if self.state.failed {
             self.state.failed = false;
             return Err(io::Error::other("frame was not copied"));
@@ -429,6 +437,18 @@ fn create_dmabuf_buffer(
 }
 
 // ---------- Dispatch ----------
+
+/// Destroy the screencopy frame object once it is no longer needed. The
+/// protocol asks the client to do this after `ready`; wlroots keeps the
+/// resource alive until then, so dropping the Rust proxy alone leaks one
+/// object per captured frame in the compositor.
+fn release_frame(frame: Option<FrameProxy>) {
+    if let Some(frame) = frame {
+        if frame.is_alive() {
+            frame.destroy();
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 struct OutputSlot {

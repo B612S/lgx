@@ -121,8 +121,10 @@ impl Hub {
 
     pub fn broadcast_video(&self, chunk: Vec<u8>) {
         let chunk = Arc::new(chunk);
-        let idr = is_idr(&chunk);
         let mut list = self.clients.lock().unwrap();
+        // Scanning every packet for an IDR is only needed while a newly
+        // registered client still waits for its first one.
+        let idr = list.iter().any(|c| c.needs_idr) && is_idr(&chunk);
         let mut dropped = false;
         list.retain_mut(|c| {
             if c.needs_idr && !idr {

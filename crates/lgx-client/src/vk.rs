@@ -88,7 +88,8 @@ pub struct Renderer {
     osd_tex: Texture,
     osd_stage: Staging,
     osd_ready: bool,
-    osd_card: (u32, u32),
+    /// On-card width, off-card width, card height (pixels of the atlas).
+    osd_cards: (u32, u32, u32),
     osd_draw: Option<(bool, f32)>,
     osd_desc_layout: vk::DescriptorSetLayout,
     osd_desc_pool: vk::DescriptorPool,
@@ -268,11 +269,16 @@ impl Renderer {
         // first frame. A missing font still leaves a blank card rather than
         // breaking video.
         let scale = window.display_scale().clamp(0.5, 4.0);
-        let (osd_w, osd_h, osd_card, osd_rgba) = match crate::osd::atlas(scale) {
-            Some(atlas) => (atlas.width, atlas.height, (atlas.card_width, atlas.card_height), atlas.rgba),
+        let (osd_w, osd_h, osd_cards, osd_rgba) = match crate::osd::atlas(scale) {
+            Some(atlas) => (
+                atlas.width,
+                atlas.height,
+                (atlas.card_width_on, atlas.card_width_off, atlas.card_height),
+                atlas.rgba,
+            ),
             None => {
                 eprintln!("lgx-client: OSD font not found; OSD overlay disabled");
-                (2, 1, (1, 1), vec![0u8; 8])
+                (2, 1, (1, 1, 1), vec![0u8; 8])
             }
         };
         let (osd_tex, osd_stage) =
@@ -418,7 +424,7 @@ impl Renderer {
             osd_tex,
             osd_stage,
             osd_ready: false,
-            osd_card,
+            osd_cards,
             osd_draw: None,
             osd_desc_layout,
             osd_desc_pool,
@@ -490,19 +496,38 @@ impl Renderer {
         uv: *const u8,
         uv_stride: u32,
     ) {
-        for row in 0..h as usize {
+        // The decoder usually pads rows to an aligned stride. When there is
+        // no padding the plane is contiguous and one large memcpy is much
+        // cheaper than one call per row.
+        if y_stride as usize == w as usize {
             std::ptr::copy_nonoverlapping(
-                y.add(row * y_stride as usize),
-                self.stage_y.ptr.add(row * w as usize),
-                w as usize,
+                y,
+                self.stage_y.ptr,
+                (w as usize) * (h as usize),
             );
+        } else {
+            for row in 0..h as usize {
+                std::ptr::copy_nonoverlapping(
+                    y.add(row * y_stride as usize),
+                    self.stage_y.ptr.add(row * w as usize),
+                    w as usize,
+                );
+            }
         }
-        for row in 0..(h / 2) as usize {
+        if uv_stride as usize == w as usize {
             std::ptr::copy_nonoverlapping(
-                uv.add(row * uv_stride as usize),
-                self.stage_uv.ptr.add(row * w as usize),
-                w as usize,
+                uv,
+                self.stage_uv.ptr,
+                (w as usize) * (h as usize / 2),
             );
+        } else {
+            for row in 0..(h / 2) as usize {
+                std::ptr::copy_nonoverlapping(
+                    uv.add(row * uv_stride as usize),
+                    self.stage_uv.ptr.add(row * w as usize),
+                    w as usize,
+                );
+            }
         }
     }
 
@@ -597,8 +622,19 @@ impl Renderer {
         }
         let sw = self.extent.width as f32;
         let sh = self.extent.height as f32;
-        let card_w = self.osd_card.0 as f32;
-        let card_h = self.osd_card.1 as f32;
+        let (on_w, off_w, card_h) = (
+            self.osd_cards.0 as f32,
+            self.osd_cards.1 as f32,
+            self.osd_cards.2 as f32,
+        );
+        let total_w = (on_w + off_w).max(1.0);
+        // Each card has its own width in the atlas; use exactly that slice
+        // instead of always sampling half of a shared width.
+        let (card_w, u0, u1) = if enabled {
+            (on_w, 0.0, on_w / total_w)
+        } else {
+            (off_w, on_w / total_w, 1.0)
+        };
         let x0 = ((sw - card_w) / 2.0).round();
         let y0 = 40.0;
         let y1 = y0 + card_h;
@@ -606,11 +642,7 @@ impl Renderer {
         let nx1 = 2.0 * (x0 + card_w) / sw - 1.0;
         let ny0 = 2.0 * y0 / sh - 1.0;
         let ny1 = 2.0 * y1 / sh - 1.0;
-        let uv = if enabled {
-            [0.0, 0.0, 0.5, 1.0]
-        } else {
-            [0.5, 0.0, 1.0, 1.0]
-        };
+        let uv = [u0, 0.0, u1, 1.0];
         let push = OsdPush {
             rect: [nx0, ny0, nx1, ny1],
             uv,
