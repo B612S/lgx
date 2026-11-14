@@ -87,7 +87,11 @@ Commit format: `area: short imperative summary`, for example
   size/DPI come from kdegobals/Xft/SDL scale and it is rasterized by FreeType
   with the fontconfig hintstyle). The
   keydown/keyup is swallowed and modifier key-ups clear the guest state.
-  F9/F10/F11/F12 are ordinary keys and must reach the guest.
+  F9/F10/F11/F12 are ordinary keys and must reach the guest. The window
+  decoration's close button must be handled as
+  `WindowEvent::CloseRequested` and set `quit`; SDL does not send
+  `Event::Quit` for it, and otherwise the process keeps running without a
+  window.
 - After a fullscreen toggle the client skips drawing until SDL reports the
   new window size (1.2 s cap). Vulkan acquire uses a 100 ms timeout and
   recreates the swapchain/semaphores on timeout; a UI watchdog calls
@@ -105,9 +109,9 @@ Commit format: `area: short imperative summary`, for example
   optional audio-port override; omit it and derive `host:5903` from `server`.
   Server settings are `~/.config/lgx/server.conf` (`network`, `video`,
   `audio`, `input`). CLI flags override. `[audio] mute_unfocused = true`
-  pauses the local pacat child on SDL `WindowFocusLost` (SIGSTOP) and resumes
-  on `WindowFocusGained` (SIGCONT); the audio stream is still drained and
-  discarded while paused, so the server does not back up.
+  discards received audio and outputs silence while the window is unfocused
+  (the native PipeWire playback stream stays active); the secure audio stream
+  is still drained, so the server does not back up.
 - Pairing with a name: `lgx-server --pair --pair-name archlinux` and
   `lgx-client archlinux --pair HOST:PAIRPORT --pair-code CODE` write
   `[archlinux]`; token and client id must never go to a global token file
@@ -178,11 +182,34 @@ the Vulkan shader converts full-range BT.709, and the HEVC VUI says
 - Never add file synchronization, clipboard hotkeys, `CLIP_GET`/`CLIP_ACK` or
   a paste injection back. Normal Ctrl+C/Ctrl+V is the whole UX.
 - Audio is on by default (`--no-audio` disables it) and uses the same secure
-  handshake/record layer with the same token PSK. The server records
-  `parec --device=@DEFAULT_MONITOR@` (48 kHz s16le stereo, 20 ms latency) and
-  the client plays `pacat --playback --device=@DEFAULT_SINK@`. `pw-cat` is not
-  used: its `--target` auto-connected to `easyeffects_source` (the microphone)
-  on the test VM and produced silence.
+  handshake/record layer with the same token PSK. Both sides use native
+  PipeWire streams (`pipewire-rs`); do not reintroduce `parec`/`pacat`,
+  PulseAudio compatibility or helper processes. The server opens an
+  `Audio/Capture` stream with `stream.capture.sink = true` and `AUTOCONNECT`
+  so it captures the default sink monitor, not the default source
+  (microphone); the client opens an `Audio/Playback` stream with
+  `AUTOCONNECT`. Both request 48 kHz s16le stereo via an `AudioInfoRaw` format
+  pod. The client's stream carries `application.name = lgx - <profile>`,
+  `media.name = lgx audio (<profile>)`, `application.process.binary =
+  lgx-client` and `application.icon_name = lgx`; host mixers show the profile
+  like the window title. Also set `node.name` and `node.description` to
+  `lgx - <profile>`, because some mixers label native streams by the node.
+  Both streams set `node.always-process = true`, `node.pause-on-idle = false`
+  and `node.suspend-on-idle = false`: otherwise WirePlumber suspends the idle
+  stream and the first sound after a pause is delayed or clipped. Both also
+  request a low graph latency; the client uses `1024/48000` and the server
+  `512/48000` (a 256/512 client quantum halved the video frame rate on this
+  host, so 1024 is the low-latency setting that still leaves the compositor
+  enough CPU). The client waits for the playback stream
+  to reach `Streaming` before connecting the audio socket, so the server
+  cannot fill the ring with a startup backlog. The ring is 64 KiB with an
+  8 KiB playout cushion (two server chunks); it is never trimmed to one
+  quantum on a normal callback, because that discarded most of each ~4 KiB
+  server chunk and caused constant underrun. A high-water trim from 48 KiB
+  to 16 KiB only handles a runaway backlog/clock drift. The server's
+  capture/fanout channels hold four chunks. `mute_unfocused`
+  discards received chunks and the process callback drains the ring buffer
+  and emits silence; no external process is stopped or left behind.
 
 ## Pairing and revocation
 
@@ -287,10 +314,17 @@ driver. The server needs libva headers for the helper.
    otherwise VPP silently emits limited-range NV12 and the colours are
    crushed.
 8. SDL3 needs `WAYLAND_DISPLAY`; on a systemd user service set it explicitly.
-9. `pw-cat -r --target <sink>.monitor` is not reliable on PipeWire: it can
-   auto-connect to the default source (`easyeffects_source`) and stream zeros.
-   Use `parec @DEFAULT_MONITOR@` for capture and `pacat @DEFAULT_SINK@` for
-   playback.
+9. Audio capture must set `stream.capture.sink = true` on an `Audio/Capture`
+   stream; without it PipeWire autoconnects to the default source (the
+   microphone) and the client hears silence. Do not use `@DEFAULT_MONITOR@`
+   or `parec`; those belong to the removed PulseAudio path. On playback, fill
+   exactly `buffer.requested()` frames (bytes = frames * 4) and set the chunk
+   size to that. Do not use `data.chunk().size()`, which can be zero, and do
+   not fill the whole mapped buffer: it can be 48 KiB even when the graph
+   wants 1024 bytes, which adds hundreds of milliseconds of latency or
+   silence. Set the PipeWire **client** properties via
+   `connect_rc(Some(properties))` as well as the stream properties, because
+   mixers label the application by the client.
 10. `wl-copy` over SSH keeps stdout open in its forked daemon; redirect
    stdout/stderr to `/dev/null` in manual tests or the SSH command hangs.
 11. The Vulkan swapchain needs `SDL_WINDOW_VULKAN` (`.vulkan()`) and
@@ -309,3 +343,18 @@ driver. The server needs libva headers for the helper.
     client's registry token is its PSK; the token itself is never transmitted.
 15. Revocation only works if `clients` stays the source of truth and the
     running server keeps watching it. Do not cache a token list at startup.
+16. Every screencopy frame object must be destroyed after `ready` (see
+    `release_frame`). wlroots and Hyprland keep the resource alive until the
+    client destroys it; dropping the Rust proxy leaks one compositor object
+    per captured frame.
+17. Continuous capture at the panel rate is intentional. A damage-driven
+    `copy_with_damage` experiment reduced idle CPU/GPU but made mouse motion
+    lag badly: a hardware cursor can move without committing a new output
+    frame, so the pending capture has no damage to complete on. If this is
+    revisited, keep a continuous plain-`copy` window while the pointer is
+    moving; do not make the whole stream damage-driven.
+18. HEVC 4:2:0 cannot carry RGB subpixel antialiasing. Guest text rendered
+    with `rgba=rgb` (GTK3 `gtk-xft-rgba=rgb`, KDE sub-pixel rendering) shows
+    coloured fringes after encoding, especially in screenshots. The fix is
+    grayscale antialiasing in the guest, not a colour-matrix change in the
+    Vulkan shader. HDR is unsupported end to end.
