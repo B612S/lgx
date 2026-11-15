@@ -38,6 +38,11 @@ for pkg in "$@"; do
     BUILDDIR="$root/target/pkgbuild" SRCDEST="$root/packaging" PKGDEST="$root" \
       makepkg -f --noconfirm
   )
+  # Keep only the package just built; older versions in the root are stale.
+  for old in "$root/$pkg-"*.pkg.tar.zst; do
+    [ -e "$old" ] || continue
+    [ "$old" = "$root/$pkg-$built-x86_64.pkg.tar.zst" ] || rm -f "$old"
+  done
 done
 
 ls -1 "$root"/*.pkg.tar.zst
