@@ -135,6 +135,10 @@ Commit format: `area: short imperative summary`, for example
   LAN discovery, list-paired/unpair command or multi-client fan-out.
 - SDL3 gamepads are opened through `GamepadSubsystem`; duplicate
   `ControllerDeviceAdded` events are filtered by device path.
+- Mouse motion is coalesced per SDL event batch: only the newest motion before
+  a non-motion event is sent, so a 1000 Hz mouse does not produce 1000 secure
+  records per second. Button, wheel and key events are never coalesced, which
+  keeps click positions exact.
 
 ## Client decoding
 
@@ -277,8 +281,13 @@ the Vulkan shader converts full-range BT.709, and the HEVC VUI says
   and an independent nonce counter. Never add a plaintext fallback.
 - `crates/lgx-proto/src/secure.rs` owns the handshake and record layer. Small
   records are sealed in place in the reusable buffer (no per-frame temporary
-  Vec/copy); keep this fast path when touching the record layer. AES-256-GCM
-  is AES-NI accelerated and is negligible at this bitrate.
+  Vec/copy); keep this fast path when touching the record layer. Each record
+  goes out with one `write_vectored` (length prefix + sealed chunk): with
+  `TCP_NODELAY` two separate writes double the packet count. Receivers use
+  `recv_msg_raw`, which keeps the 12-byte header in front of the payload so a
+  video packet is never memmoved; `recv_msg` is only for small control
+  messages. AES-256-GCM is AES-NI accelerated and is negligible at this
+  bitrate.
   records are split into 32 KiB chunks; the length/index/chunk length are
   included in the AEAD associated data. `Secure::close` shuts down a raw clone
   because the reader may hold the recv mutex while blocked in `read_exact`.
