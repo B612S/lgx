@@ -1,4 +1,5 @@
 # Maintainer: B612S
+# Build with packaging/build.sh; bump pkgrel on every rebuild.
 pkgname=lgx-client
 pkgver=0.3.0
 pkgrel=26

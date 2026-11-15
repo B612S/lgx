@@ -1,13 +1,12 @@
-/target
-**/*.rs.bk
-*.ppm
+# Build trees
+/target/
+
+# Packaging outputs: source tarballs and built packages
+packaging/*.tar.gz
 *.pkg.tar.zst
-packaging/*.tar.gz
-pkg/
+*.pkg.tar.zst.sig
+
+# Client/server runtime droppings
+*.ppm
+**/*.rs.bk
 scripts/__pycache__/
-packaging/*.tar.gz
-scripts/__pycache__/
-packaging/*/src/
-packaging/*/pkg/
-packaging/*/*.tar.gz
-packaging/*/*.pkg.tar.zst
