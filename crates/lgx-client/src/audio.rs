@@ -12,7 +12,7 @@
 
 use std::io;
 use std::net::TcpStream;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -35,6 +35,8 @@ struct PlaybackState {
     cons: ringbuf::HeapCons<u8>,
     /// Set while the window is unfocused and `mute_unfocused` is active.
     paused: Arc<AtomicBool>,
+    /// Callbacks that ran out of queued audio and had to emit silence.
+    underruns: Arc<AtomicU64>,
     /// Wait for one quantum before starting, instead of playing half a
     /// buffer followed by silence.
     prebuffer: bool,
@@ -151,6 +153,7 @@ fn pipewire_thread(
                 let n = state.cons.pop_slice(&mut slice[..size]);
                 if n < size {
                     slice[n..size].fill(0);
+                    state.underruns.fetch_add(1, Ordering::Relaxed);
                 }
             }
             let chunk = data.chunk_mut();
@@ -210,14 +213,17 @@ fn spawn_playback(
     pw::channel::Sender<()>,
     std::thread::JoinHandle<()>,
     Arc<AtomicBool>,
+    Arc<AtomicU64>,
     std::sync::mpsc::Receiver<()>,
 )> {
     let ring = HeapRb::<u8>::new(RING_BYTES);
     let (prod, cons) = ring.split();
     let paused = Arc::new(AtomicBool::new(false));
+    let underruns = Arc::new(AtomicU64::new(0));
     let state = PlaybackState {
         cons,
         paused: paused.clone(),
+        underruns: underruns.clone(),
         prebuffer: true,
     };
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<()>(1);
@@ -231,7 +237,7 @@ fn spawn_playback(
                 eprintln!("lgx-client: PipeWire playback: {e}");
             }
         })?;
-    Ok((prod, quit_tx, handle, paused, ready_rx))
+    Ok((prod, quit_tx, handle, paused, underruns, ready_rx))
 }
 
 pub fn run(
@@ -243,7 +249,8 @@ pub fn run(
 ) -> std::io::Result<()> {
     let app_name = format!("lgx - {client_id}");
     let media_name = format!("lgx audio ({client_id})");
-    let (mut audio_tx, quit, handle, paused, ready) = spawn_playback(&app_name, &media_name)?;
+    let (mut audio_tx, quit, handle, paused, underruns, ready) =
+        spawn_playback(&app_name, &media_name)?;
     // Connect the audio socket only after the playback stream is streaming.
     // Otherwise the server can send hundreds of milliseconds of audio while
     // the stream is still linking, and that backlog becomes permanent
@@ -274,10 +281,15 @@ pub fn run(
             let _ = audio_tx.push_slice(&chunk);
             total += chunk.len() as u64;
             if last.elapsed() >= Duration::from_secs(5) {
-                eprintln!(
-                    "lgx-client: audio {:.1} KiB/s",
-                    total as f64 / 1024.0 / last.elapsed().as_secs_f64()
-                );
+                // Underruns are the audible kind of quality problem; surface
+                // them instead of hiding the gaps as silence.
+                let missed = underruns.swap(0, Ordering::Relaxed);
+                if missed > 0 {
+                    eprintln!(
+                        "lgx-client: audio {:.1} KiB/s, {missed} underrun(s)",
+                        total as f64 / 1024.0 / last.elapsed().as_secs_f64()
+                    );
+                }
                 total = 0;
                 last = Instant::now();
             }
