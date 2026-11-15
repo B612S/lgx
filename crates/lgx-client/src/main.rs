@@ -36,6 +36,7 @@ struct Args {
     no_window: bool,
     fullscreen: Option<bool>,
     vsync: Option<bool>,
+    present_hz: Option<String>,
     screenshot: Option<String>,
     bench: Option<f64>,
     size: Option<(u32, u32)>,
@@ -67,6 +68,8 @@ struct Settings {
     height: Option<u32>,
     fullscreen: bool,
     vsync: bool,
+    /// `0`/`off` = present every decoded frame, `auto` = display refresh.
+    present_hz: String,
     audio: bool,
     audio_connect: Option<String>,
     token: String,
@@ -88,6 +91,7 @@ fn parse_args() -> Result<Args, String> {
         no_window: false,
         fullscreen: None,
         vsync: None,
+        present_hz: None,
         screenshot: None,
         bench: None,
         size: None,
@@ -120,6 +124,7 @@ fn parse_args() -> Result<Args, String> {
             "--fullscreen" => a.fullscreen = Some(true),
             "--windowed" => a.fullscreen = Some(false),
             "--vsync" => a.vsync = Some(true),
+            "--present-hz" => a.present_hz = Some(it.next().ok_or("--present-hz")?),
             "--no-vsync" => a.vsync = Some(false),
             "--audio" => a.audio = Some(true),
             "--no-audio" => a.audio = Some(false),
@@ -409,6 +414,11 @@ fn main() {
             .or_else(|| cfg.get_bool("fullscreen"))
             .unwrap_or(false),
         vsync: args.vsync.or_else(|| cfg.get_bool("vsync")).unwrap_or(false),
+        present_hz: args
+            .present_hz
+            .clone()
+            .or_else(|| cfg.get("present_hz").map(str::to_string))
+            .unwrap_or_else(|| "0".to_string()),
         audio: args.audio.or_else(|| cfg.get_bool("audio")).unwrap_or(false),
         audio_connect: args
             .audio_connect
@@ -652,6 +662,17 @@ fn main() {
     if s.fullscreen {
         window.set_fullscreen(true).ok();
     }
+    let present_hz: Option<f32> = match s.present_hz.as_str() {
+        "" | "0" | "off" => None,
+        "auto" => window
+            .display_mode()
+            .map(|m| m.refresh_rate)
+            .filter(|hz| *hz > 1.0),
+        v => v.parse::<f32>().ok().filter(|hz| *hz > 1.0),
+    };
+    if let Some(hz) = present_hz {
+        eprintln!("lgx-client: presenting at most {hz:.0} Hz (present_hz)");
+    }
     let mut renderer = match vk::Renderer::new(&window, s.vsync, (hello.width, hello.height)) {
         Ok(r) => r,
         Err(e) => {
@@ -745,6 +766,8 @@ fn main() {
 
     let mut img_size = (hello.width, hello.height);
     let mut last_frame: Option<dec::Frame> = None;
+    let mut last_present: Option<Instant> = None;
+    let mut last_cpu: Option<(u64, Instant)> = None;
     let mut shown = 0u64;
     let mut screenshot = args.screenshot.take();
     let mut next_stats = Instant::now() + Duration::from_secs(1);
@@ -1038,6 +1061,14 @@ fn main() {
                 fullscreen_hold = None;
             }
         }
+        // `present_hz` caps uploads/presents. The frame is dropped, not
+        // delayed: the mailbox holds a newer one, so this only trades one
+        // interval of latency for less GPU work.
+        if let (Some(hz), Some(last)) = (present_hz, last_present) {
+            if last.elapsed().as_secs_f32() < 1.0 / hz {
+                frame = None;
+            }
+        }
         let hold_draw = fullscreen_hold.is_some();
         if hold_draw {
             frame = None;
@@ -1077,6 +1108,7 @@ fn main() {
             let drawn_ok = renderer.draw(&frame, win_px);
             let draw_ms = draw_started.elapsed().as_secs_f64() * 1000.0;
             if drawn_ok {
+                last_present = Some(Instant::now());
                 shown += 1;
                 draw_ms_sum += draw_ms;
                 draw_ms_max = draw_ms_max.max(draw_ms);
@@ -1121,10 +1153,24 @@ fn main() {
             last_stat_dropped = dropped;
             let avg_draw = if draw_count > 0 { draw_ms_sum / draw_count as f64 } else { 0.0 };
             if std::env::var_os("LGX_DEBUG_FPS").is_some() {
-                eprintln!(
-                    "lgx-client: fps {df}, decoded {d_dec}, overwritten {d_drop}, draw {avg_draw:.2}/{draw_ms_max:.2} ms, {:.1} MiB/s",
-                    bytes as f64 / 1_048_576.0
-                );
+                let cpu = match (last_cpu, cpu_ticks()) {
+                    (Some((before, since)), Some(now)) => {
+                        let ticks = now.saturating_sub(before) as f64;
+                        Some(ticks / clock_ticks_per_second() / since.elapsed().as_secs_f64() * 100.0)
+                    }
+                    _ => None,
+                };
+                last_cpu = cpu_ticks().map(|now| (now, Instant::now()));
+                match cpu {
+                    Some(cpu) => eprintln!(
+                        "lgx-client: fps {df}, decoded {d_dec}, overwritten {d_drop}, draw {avg_draw:.2}/{draw_ms_max:.2} ms, cpu {cpu:.0}%, {:.1} MiB/s",
+                        bytes as f64 / 1_048_576.0
+                    ),
+                    None => eprintln!(
+                        "lgx-client: fps {df}, decoded {d_dec}, overwritten {d_drop}, draw {avg_draw:.2}/{draw_ms_max:.2} ms, {:.1} MiB/s",
+                        bytes as f64 / 1_048_576.0
+                    ),
+                }
             }
             draw_ms_sum = 0.0;
             draw_ms_max = 0.0;
@@ -1226,6 +1272,24 @@ fn toggle_fullscreen(window: &mut sdl3::video::Window) {
     let full = window.fullscreen_state();
     let now_full = full != sdl3::video::FullscreenType::Off;
     window.set_fullscreen(!now_full).ok();
+}
+
+/// Process CPU time in clock ticks (utime + stime from /proc/self/stat).
+fn cpu_ticks() -> Option<u64> {
+    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+    // The comm field may contain spaces and parentheses; everything after the
+    // last ')' is space separated, starting with the state (field 3).
+    let rest = stat.rsplit_once(')')?.1;
+    let mut fields = rest.split_whitespace();
+    fields.next()?; // state
+    let utime: u64 = fields.nth(10)?.parse().ok()?; // field 14
+    let stime: u64 = fields.next()?.parse().ok()?; // field 15
+    Some(utime + stime)
+}
+
+fn clock_ticks_per_second() -> f64 {
+    let tck = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if tck > 0 { tck as f64 } else { 100.0 }
 }
 
 fn split_host_port(addr: &str) -> (String, Option<u16>) {
@@ -1421,6 +1485,20 @@ mod tests {
         assert_eq!(reconnect_delay(2), Duration::from_secs(2));
         assert_eq!(reconnect_delay(5), Duration::from_secs(15));
         assert_eq!(reconnect_delay(99), Duration::from_secs(15));
+    }
+
+    #[test]
+    fn cpu_ticks_track_real_cpu_time() {
+        let before = cpu_ticks().expect("/proc/self/stat must be readable on Linux");
+        let mut acc = 0u64;
+        for i in 0..2_000_000u64 {
+            acc = acc.wrapping_add(i);
+        }
+        std::hint::black_box(acc);
+        let after = cpu_ticks().expect("/proc/self/stat must be readable on Linux");
+        // A misparsed field (starttime, rss, ...) would be far outside this.
+        assert!(before < 3600 * 100, "cpu ticks look misparsed: {before}");
+        assert!(after >= before, "cpu ticks must not go backwards");
     }
 
     #[test]

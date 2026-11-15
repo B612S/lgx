@@ -101,6 +101,10 @@ Commit format: `area: short imperative summary`, for example
   `WindowEvent::CloseRequested` and set `quit`; SDL does not send
   `Event::Quit` for it, and otherwise the process keeps running without a
   window.
+- `[video] present_hz` (or `--present-hz`) caps how often a decoded frame is
+  uploaded and presented: `0` (default) presents every frame, `auto` uses the
+  display refresh. Skipped frames are dropped, not delayed, so the newest one
+  still wins; keep the default for the lowest input latency.
 - After a fullscreen toggle the client skips drawing until SDL reports the
   new window size (1.2 s cap). Vulkan acquire uses a 100 ms timeout and
   recreates the swapchain/semaphores on timeout; a UI watchdog calls
@@ -307,6 +311,7 @@ the Vulkan shader converts full-range BT.709, and the HEVC VUI says
 cargo build --release
 cargo test --workspace
 gcc -O2 -o lgx-vaenc helper/lgx-vaenc.c -lavcodec -lavutil -lva -lva-drm
+scripts/check.sh          # build + tests + both C helpers, run before pushing
 ./packaging/build.sh
 ```
 

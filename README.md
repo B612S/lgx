@@ -127,6 +127,8 @@ height = 1080
 fullscreen = false
 vsync = false
 decoder = auto
+# 0 = present every decoded frame (lowest latency), "auto" = panel refresh.
+present_hz = 0
 
 [audio]
 enabled = true

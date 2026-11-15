@@ -54,7 +54,7 @@ fn canonical(key: &str) -> String {
         return key.to_string();
     }
     let (section, name) = match key {
-        "width" | "height" | "fullscreen" | "vsync" | "decoder" => {
+        "width" | "height" | "fullscreen" | "vsync" | "decoder" | "present_hz" => {
             ("video", key)
         }
         "audio" => ("audio", "enabled"),
@@ -118,6 +118,7 @@ impl Config {
             cfg.set("height", 1080);
             cfg.set("fullscreen", "false");
             cfg.set("vsync", "false");
+            cfg.set("present_hz", "0");
             cfg.set("decoder", "auto");
             cfg.set("cursor_grab", "true");
             cfg.set("audio", "true");
