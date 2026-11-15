@@ -12,6 +12,10 @@ RestartSec=2
 # system out of reach. It must stay able to write ~/.config/lgx, so home is
 # readable but not the unit's sandbox.
 NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=full
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+UMask=0077
 PrivateTmp=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes

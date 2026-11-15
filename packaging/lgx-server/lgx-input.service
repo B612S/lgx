@@ -9,7 +9,8 @@ Restart=always
 # root because creating kernel input devices requires it; everything else is
 # locked down so a bug in the helper cannot touch the rest of the system.
 DeviceAllow=/dev/uinput rw
-CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE
+CapabilityBoundingSet=CAP_CHOWN CAP_FOWNER
+UMask=0077
 AmbientCapabilities=
 NoNewPrivileges=yes
 ProtectSystem=strict
