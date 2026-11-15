@@ -178,7 +178,7 @@ pub fn listen(
     clip_set: Arc<dyn Fn(&str) + Send + Sync>,
     last_remote: Arc<Mutex<String>>,
 ) -> io::Result<()> {
-    const MAX_CLIENTS: usize = 8;
+    const MAX_CLIENTS: usize = 1;
     let active = Arc::new(AtomicUsize::new(0));
     let listener = TcpListener::bind(addr)?;
     eprintln!("lgx-server: listening on {addr} (HEVC)");

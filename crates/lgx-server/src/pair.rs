@@ -10,17 +10,20 @@ use std::io;
 use std::net::TcpListener;
 use std::time::{Duration, Instant};
 
-use lgx_proto::secure;
-
 use lgx_proto::auth;
+use lgx_proto::secure;
 
 use crate::clients;
 
-pub fn run(addr: &str, name: Option<&str>) -> io::Result<()> {
+pub fn run(
+    addr: &str,
+    name: Option<&str>,
+    video_port: u16,
+    audio_port: u16,
+    pair_port: u16,
+) -> io::Result<()> {
     clients::ensure()?;
     let token = auth::generate_token();
-    // A named pairing uses the profile name as the public client ID, so the
-    // client config only needs [name] server/token.
     let (id, name) = match name {
         Some(n) => {
             let n = clients::clean_name(n);
@@ -33,12 +36,14 @@ pub fn run(addr: &str, name: Option<&str>) -> io::Result<()> {
         }
     };
     let code = auth::generate();
-    let listener = TcpListener::bind(addr).map_err(|e| io::Error::other(format!("bind {addr}: {e}")))?;
+    let listener =
+        TcpListener::bind(addr).map_err(|e| io::Error::other(format!("bind {addr}: {e}")))?;
     listener.set_nonblocking(true)?;
     eprintln!("lgx-server: pairing code: {code}");
-    let port = addr.rsplit_once(':').map(|(_, p)| p).unwrap_or("5904");
     eprintln!("lgx-server: on the client run:");
-    eprintln!("  lgx-client --pair <server-ip>:{port} --pair-code {code}");
+    eprintln!(
+        "  lgx-client {name} --pair <server-ip>:{pair_port} --pair-code {code}"
+    );
     eprintln!("lgx-server: waiting up to 3 minutes for one client...");
     let deadline = Instant::now() + Duration::from_secs(180);
     let mut failures = 0u32;
@@ -50,7 +55,7 @@ pub fn run(addr: &str, name: Option<&str>) -> io::Result<()> {
             Ok((stream, peer)) => {
                 let _ = stream.set_nodelay(true);
                 eprintln!("lgx-server: pairing client from {peer}");
-                match pair_client(stream, &code, &id, &token) {
+                match pair_client(stream, &code, &id, &token, video_port, audio_port) {
                     Ok(()) => {
                         clients::add(clients::Entry {
                             id: id.clone(),
@@ -62,7 +67,7 @@ pub fn run(addr: &str, name: Option<&str>) -> io::Result<()> {
                                 .as_secs(),
                         })?;
                         eprintln!(
-                            "lgx-server: paired client {peer}: id={id} name={name}; token delivered"
+                            "lgx-server: paired client {peer}: id={id} name={name}; video={video_port} audio={audio_port} pair={pair_port}"
                         );
                         return Ok(());
                     }
@@ -88,11 +93,13 @@ fn pair_client(
     code: &str,
     id: &str,
     token: &str,
+    video_port: u16,
+    audio_port: u16,
 ) -> io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
     stream.set_write_timeout(Some(Duration::from_secs(30)))?;
     let secure = secure::server_handshake(stream, code)?;
-    secure.send_bytes(format!("{id}\n{token}").as_bytes())?;
+    secure.send_bytes(format!("{id}\n{token}\n{video_port}\n{audio_port}").as_bytes())?;
     let ack = secure.recv_bytes()?;
     if ack != b"ok" {
         secure.close();

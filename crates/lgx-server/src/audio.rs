@@ -186,7 +186,7 @@ pub fn serve(addr: &str) -> io::Result<()> {
 
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
-        if clients.lock().unwrap().len() >= 8 {
+        if clients.lock().unwrap().len() >= 1 {
             eprintln!("lgx-server: audio: too many clients");
             continue;
         }

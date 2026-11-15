@@ -45,6 +45,36 @@ struct Args {
     revoke: Option<String>,
     rotate: Option<String>,
     list: bool,
+    video_port: u16,
+    audio_port: u16,
+    pair_port: u16,
+}
+
+fn interface_ip(name: &str) -> Option<std::net::IpAddr> {
+    let cname = std::ffi::CString::new(name).ok()?;
+    let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
+    if unsafe { libc::getifaddrs(&mut ifap) } != 0 {
+        return None;
+    }
+    let mut out = None;
+    let mut cur = ifap;
+    while !cur.is_null() {
+        let ifa = unsafe { &*cur };
+        let addr = ifa.ifa_addr;
+        if !addr.is_null()
+            && unsafe { (*addr).sa_family as i32 } == libc::AF_INET
+            && unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) } == cname.as_c_str()
+        {
+            let sin = unsafe { &*(addr as *const libc::sockaddr_in) };
+            out = Some(std::net::IpAddr::V4(std::net::Ipv4Addr::from(
+                u32::from_be(sin.sin_addr.s_addr),
+            )));
+            break;
+        }
+        cur = unsafe { (*cur).ifa_next };
+    }
+    unsafe { libc::freeifaddrs(ifap) };
+    out
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -54,11 +84,37 @@ fn parse_args() -> Result<Args, String> {
         None | Some("") | Some("auto") => None,
         Some(v) => Some(v.parse().map_err(|_| "video.fps must be auto or a number")?),
     };
+    let interface = cfg.get("network.interface").unwrap_or("");
+    let video_port = cfg.get_u32("network.video_port").unwrap_or(5902) as u16;
+    let audio_port = cfg.get_u32("network.audio_port").unwrap_or(5903) as u16;
+    let pair_port = cfg.get_u32("network.pair_port").unwrap_or(5904) as u16;
+    let bind = if interface.is_empty() {
+        None
+    } else {
+        Some(
+            interface_ip(interface)
+                .ok_or_else(|| format!("network.interface {interface} has no IPv4 address"))?,
+        )
+    };
+    let bind_host = bind.map(|ip| ip.to_string());
+    let make_addr = |old_keys: &[&str], port: u16, label: &str| -> Result<String, String> {
+        for key in old_keys {
+            if let Some(v) = cfg.get(key) {
+                if !v.is_empty() {
+                    return Ok(v.to_string());
+                }
+            }
+        }
+        bind_host
+            .as_ref()
+            .map(|host| format!("{host}:{port}"))
+            .ok_or_else(|| format!("set network.interface (or an explicit {label} address)"))
+    };
+    let listen = make_addr(&["network.video_listen", "network.listen"], video_port, "video")?;
+    let audio_listen = make_addr(&["network.audio_listen"], audio_port, "audio")?;
+    let pair_listen = make_addr(&["network.pair_listen"], pair_port, "pair")?;
     let mut a = Args {
-        listen: cfg
-            .get("network.listen")
-            .unwrap_or("0.0.0.0:5902")
-            .to_string(),
+        listen,
         fps,
         bitrate: cfg.get_u32("video.bitrate").unwrap_or(40_000_000),
         output: cfg
@@ -67,23 +123,20 @@ fn parse_args() -> Result<Args, String> {
             .map(str::to_string),
         no_input: !cfg.get_bool("input.enabled").unwrap_or(true),
         audio: cfg.get_bool("audio.enabled").unwrap_or(true),
-        audio_listen: cfg
-            .get("network.audio_listen")
-            .unwrap_or("0.0.0.0:5903")
-            .to_string(),
+        audio_listen,
         token: None,
         low_power: cfg.get_bool("video.low_power").unwrap_or(true),
         async_depth: cfg.get_u32("video.async_depth").unwrap_or(2),
         vpp: cfg.get_bool("video.vpp").unwrap_or(true),
         pair: false,
-        pair_listen: cfg
-            .get("network.pair_listen")
-            .unwrap_or("0.0.0.0:5904")
-            .to_string(),
+        pair_listen,
         pair_name: None,
         revoke: None,
         rotate: None,
         list: false,
+        video_port,
+        audio_port,
+        pair_port,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -506,7 +559,7 @@ fn main() {
         return;
     }
     if args.pair {
-        if let Err(e) = pair::run(&args.pair_listen, args.pair_name.as_deref()) {
+        if let Err(e) = pair::run(&args.pair_listen, args.pair_name.as_deref(), args.video_port, args.audio_port, args.pair_port) {
             eprintln!("lgx-server: pairing: {e}");
             std::process::exit(1);
         }

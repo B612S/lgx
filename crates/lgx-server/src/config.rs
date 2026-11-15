@@ -21,7 +21,10 @@ fn canonical(key: &str) -> String {
         return key.to_string();
     }
     let (section, name) = match key {
-        "listen" | "audio_listen" => ("network", key),
+        "listen" | "video_listen" | "audio_listen" | "pair_listen" | "name"
+        | "server" | "video_port" | "audio_port" | "pair_port" | "discovery_port" => {
+            ("network", key)
+        }
         "fps" | "bitrate" | "output" | "low_power" | "async_depth" | "vpp" => {
             ("video", key)
         }
@@ -138,9 +141,11 @@ pub fn load_or_create() -> Config {
         return cfg;
     }
     let mut cfg = Config::default();
-    cfg.set("network.listen", "0.0.0.0:5902");
-    cfg.set("network.audio_listen", "0.0.0.0:5903");
-    cfg.set("network.pair_listen", "0.0.0.0:5904");
+    cfg.set("network.server", "0.0.0.0");
+    cfg.set("network.video_port", 5902u32);
+    cfg.set("network.audio_port", 5903u32);
+    cfg.set("network.pair_port", 5904u32);
+    cfg.set("network.discovery_port", 5900u32);
     cfg.set("video.fps", "auto");
     cfg.set("video.bitrate", 40_000_000u32);
     cfg.set("video.output", "");
