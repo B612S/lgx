@@ -8,6 +8,14 @@ Environment=WAYLAND_DISPLAY=wayland-1
 ExecStart=/usr/bin/lgx-server --audio
 Restart=on-failure
 RestartSec=2
-
-[Install]
-WantedBy=graphical-session.target
+# The server needs Wayland, DRM/VAAPI, PipeWire and TCP; keep the rest of the
+# system out of reach. It must stay able to write ~/.config/lgx, so home is
+# readable but not the unit's sandbox.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes
+LockPersonality=yes
+SystemCallArchitectures=native

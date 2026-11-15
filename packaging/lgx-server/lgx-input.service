@@ -5,6 +5,25 @@ After=systemd-user-sessions.service
 [Service]
 ExecStart=/usr/lib/lgx/lgx-uinput /run/lgx-input.sock
 Restart=always
+# The helper only needs /dev/uinput and its own socket in /run. It runs as
+# root because creating kernel input devices requires it; everything else is
+# locked down so a bug in the helper cannot touch the rest of the system.
+DeviceAllow=/dev/uinput rw
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE
+AmbientCapabilities=
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
 
 [Install]
 WantedBy=multi-user.target
