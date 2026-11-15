@@ -10,6 +10,7 @@
 
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
+use std::io::IoSlice;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -22,6 +23,8 @@ use crate::{payload_len, Msg};
 
 const MAGIC: &[u8; 4] = b"LGX1";
 const CHUNK: usize = 32 * 1024;
+/// Wire header of a [`Msg`]: type, two i32 fields, codec and length.
+pub const MSG_HEADER: usize = 12;
 const MAX_RECORD: usize = 64 * 1024 * 1024;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -220,7 +223,7 @@ impl Secure {
     }
 
     pub fn send_msg(&self, m: Msg, payload: &[u8]) -> io::Result<()> {
-        let total = 12usize
+        let total = MSG_HEADER
             .checked_add(payload.len())
             .ok_or_else(|| io::Error::other("secure record too large"))?;
         if total > MAX_RECORD {
@@ -238,7 +241,6 @@ impl Secure {
             st.buf.extend_from_slice(&m.to_bytes());
             st.buf.extend_from_slice(payload);
             let total = st.buf.len() as u32;
-            st.stream.write_all(&total.to_le_bytes())?;
             let SendState { stream, key, nonce, buf } = &mut *st;
             let mut aad = [0u8; 12];
             aad[..4].copy_from_slice(&total.to_le_bytes());
@@ -253,8 +255,10 @@ impl Secure {
             )
             .map_err(|_| crypto_err())?;
             *nonce = nonce.checked_add(1).ok_or_else(crypto_err)?;
-            stream.write_all(&(buf.len() as u32).to_le_bytes())?;
-            stream.write_all(buf)?;
+            write_parts(
+                stream,
+                &[&total.to_le_bytes(), &(buf.len() as u32).to_le_bytes(), buf],
+            )?;
             Ok(())
         } else {
             let mut plain = Vec::with_capacity(total);
@@ -264,18 +268,29 @@ impl Secure {
         }
     }
 
-    pub fn recv_msg(&self) -> io::Result<(Msg, Vec<u8>)> {
-        let mut plain = self.recv_record()?;
-        if plain.len() < 12 {
+    /// Receives one message and keeps the 12-byte header in front of the
+    /// payload, so a 30 KiB video packet is never memmoved. Use
+    /// [`MSG_HEADER`] to skip the header.
+    pub fn recv_msg_raw(&self) -> io::Result<(Msg, Vec<u8>)> {
+        let plain = self.recv_record()?;
+        if plain.len() < MSG_HEADER {
             return Err(io::Error::other("short secure message"));
         }
-        let mut header = [0u8; 12];
-        header.copy_from_slice(&plain[..12]);
+        let mut header = [0u8; MSG_HEADER];
+        header.copy_from_slice(&plain[..MSG_HEADER]);
         let m = Msg::from_bytes(&header);
-        if payload_len(&m) != plain.len() - 12 {
+        if payload_len(&m) != plain.len() - MSG_HEADER {
             return Err(io::Error::other("secure message length mismatch"));
         }
-        plain.drain(..12);
+        Ok((m, plain))
+    }
+
+    /// Receives one message and shifts the payload to the front. Fine for
+    /// clipboard and control messages; the video path uses
+    /// [`Self::recv_msg_raw`].
+    pub fn recv_msg(&self) -> io::Result<(Msg, Vec<u8>)> {
+        let (m, mut plain) = self.recv_msg_raw()?;
+        plain.drain(..MSG_HEADER);
         Ok((m, plain))
     }
 
@@ -304,7 +319,11 @@ impl Secure {
 
 fn send_plain_locked(st: &mut SendState, plain: &[u8]) -> io::Result<()> {
     let total = plain.len() as u32;
-    st.stream.write_all(&total.to_le_bytes())?;
+    if total == 0 {
+        use std::io::Write;
+        return st.stream.write_all(&total.to_le_bytes());
+    }
+    // The record length and the first chunk share one write.
     let SendState { stream, key, nonce, buf } = &mut *st;
     for (idx, chunk) in plain.chunks(CHUNK).enumerate() {
         let mut aad = [0u8; 12];
@@ -322,8 +341,55 @@ fn send_plain_locked(st: &mut SendState, plain: &[u8]) -> io::Result<()> {
         )
         .map_err(|_| crypto_err())?;
         *nonce = nonce.checked_add(1).ok_or_else(crypto_err)?;
-        stream.write_all(&(buf.len() as u32).to_le_bytes())?;
-        stream.write_all(buf)?;
+        if idx == 0 {
+            write_parts(
+                stream,
+                &[&total.to_le_bytes(), &(buf.len() as u32).to_le_bytes(), buf],
+            )?;
+        } else {
+            write_parts(stream, &[&(buf.len() as u32).to_le_bytes(), buf])?;
+        }
+    }
+    Ok(())
+}
+
+/// Writes the record length, the chunk length and the sealed chunk with one
+/// syscall. With `TCP_NODELAY` two separate writes become two TCP segments per
+/// message, which doubles the packet count of the input and video paths.
+fn write_parts(stream: &mut TcpStream, parts: &[&[u8]]) -> io::Result<()> {
+    use std::io::Write;
+    let mut idx = 0;
+    let mut off = 0;
+    while idx < parts.len() {
+        if off >= parts[idx].len() {
+            idx += 1;
+            off = 0;
+            continue;
+        }
+        let mut bufs = [IoSlice::new(&[]); 4];
+        let mut n = 0;
+        for (k, part) in parts[idx..].iter().enumerate().take(bufs.len()) {
+            let start = if k == 0 { off } else { 0 };
+            bufs[n] = IoSlice::new(&part[start..]);
+            n += 1;
+        }
+        let written = stream.write_vectored(&bufs[..n])?;
+        if written == 0 {
+            return Err(io::Error::from(io::ErrorKind::WriteZero));
+        }
+        // Rare partial write: advance across the parts.
+        let mut left = written;
+        while left > 0 && idx < parts.len() {
+            let room = parts[idx].len() - off;
+            if left < room {
+                off += left;
+                left = 0;
+            } else {
+                left -= room;
+                idx += 1;
+                off = 0;
+            }
+        }
     }
     Ok(())
 }
@@ -428,6 +494,7 @@ pub fn server_handshake(mut stream: TcpStream, token: &str) -> io::Result<Secure
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::msg;
     use std::net::TcpListener;
 
     #[test]
@@ -448,6 +515,28 @@ mod tests {
         let (m, p) = secure.recv_msg().unwrap();
         assert_eq!(m.typ, 3);
         assert_eq!(p, b"world");
+        server.join().unwrap();
+    }
+
+    /// The video path reads the header and payload from one buffer, so the
+    /// framing must stay identical to what `send_msg` wrote.
+    #[test]
+    fn raw_receive_keeps_the_header_in_front() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let secure = server_handshake(stream, "raw-token").unwrap();
+            let (m, buf) = secure.recv_msg_raw().unwrap();
+            assert_eq!(m.typ, msg::VIDEO);
+            assert_eq!(&buf[..MSG_HEADER], &m.to_bytes());
+            assert_eq!(&buf[MSG_HEADER..], b"payload");
+            secure.send_bytes(b"done").unwrap();
+        });
+        let stream = TcpStream::connect(addr).unwrap();
+        let secure = client_handshake(stream, "raw-token").unwrap();
+        secure.send_msg(Msg::new(msg::VIDEO, 0, 7, 0), b"payload").unwrap();
+        assert_eq!(secure.recv_bytes().unwrap(), b"done");
         server.join().unwrap();
     }
 
