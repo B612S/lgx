@@ -181,6 +181,12 @@ fn serve(rx: Receiver<Cmd>, path: &str, seat_name: Option<String>) {
     // reconnecting instead of losing input until the server restarts.
     let mut connected_once = false;
     let mut waiting_logged = false;
+    // The helper needs ~300 ms after start before its socket exists (it
+    // creates the uinput devices first), and a package upgrade restarts both
+    // units. Without this grace period the server would give up on uinput and
+    // silently fall back to Wayland virtual devices, which have no gamepads.
+    let grace = std::time::Duration::from_secs(3);
+    let started = std::time::Instant::now();
     loop {
         match std::os::unix::net::UnixStream::connect(path) {
             Ok(sock) => {
@@ -197,6 +203,14 @@ fn serve(rx: Receiver<Cmd>, path: &str, seat_name: Option<String>) {
                 eprintln!("lgx-server: input: helper connection lost, reconnecting");
             }
             Err(e) => {
+                if !connected_once && started.elapsed() < grace {
+                    if !waiting_logged {
+                        eprintln!("lgx-server: input: waiting for the uinput helper ({e})");
+                        waiting_logged = true;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    continue;
+                }
                 if !connected_once {
                     eprintln!("lgx-server: input: uinput helper not found, using Wayland virtual devices");
                     if let Err(e) = run(&rx, seat_name.clone()) {
@@ -354,6 +368,39 @@ mod tests {
         for packet in &seen {
             assert_eq!(packet, &[b'K', 30, 0, 1]);
         }
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+mod fallback_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// The helper needs a moment before its socket exists; the input thread
+    /// must wait for it instead of falling back to Wayland devices.
+    #[test]
+    fn waits_for_a_late_helper_socket() {
+        let dir = std::env::temp_dir().join(format!("lgx-late-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sock");
+        let _ = std::fs::remove_file(&path);
+        let server_path = path.to_str().unwrap().to_string();
+        let listener_path = path.clone();
+        let late = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(400));
+            let listener = std::os::unix::net::UnixListener::bind(&listener_path).unwrap();
+            let (mut conn, _) = listener.accept().unwrap();
+            use std::io::Read;
+            let mut buf = [0u8; 4];
+            conn.read_exact(&mut buf).unwrap();
+            buf
+        });
+        let (tx, rx) = std::sync::mpsc::channel::<Cmd>();
+        std::thread::spawn(move || serve(rx, &server_path, None));
+        std::thread::sleep(Duration::from_millis(500));
+        tx.send(Cmd::Key { code: 30, state: 1, time: 0 }).unwrap();
+        assert_eq!(late.join().unwrap(), [b'K', 30, 0, 1]);
         let _ = std::fs::remove_file(&path);
     }
 }
