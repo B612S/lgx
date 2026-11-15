@@ -819,15 +819,7 @@ fn main() {
             quit = true;
         }
 
-        let mut queue = events.into_iter().peekable();
-        while let Some(ev) = queue.next() {
-            // A high-rate mouse queues many motions per frame; only the last
-            // one before a non-motion event is visible in the video anyway.
-            if matches!(ev, Event::MouseMotion { .. })
-                && matches!(queue.peek(), Some(Event::MouseMotion { .. }))
-            {
-                continue;
-            }
+        for ev in events {
             match ev {
                 Event::Quit { .. } => quit = true,
                 // The window decoration's close button arrives as a window

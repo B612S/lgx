@@ -139,10 +139,9 @@ Commit format: `area: short imperative summary`, for example
   LAN discovery, list-paired/unpair command or multi-client fan-out.
 - SDL3 gamepads are opened through `GamepadSubsystem`; duplicate
   `ControllerDeviceAdded` events are filtered by device path.
-- Mouse motion is coalesced per SDL event batch: only the newest motion before
-  a non-motion event is sent, so a 1000 Hz mouse does not produce 1000 secure
-  records per second. Button, wheel and key events are never coalesced, which
-  keeps click positions exact.
+- Every SDL mouse motion event is forwarded immediately; do not coalesce
+  motion per frame or per event batch. Coalescing cut the record count but
+  measurably changed the pointer feel, which matters more than the syscalls.
 
 ## Client decoding
 
