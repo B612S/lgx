@@ -180,6 +180,10 @@ the Vulkan shader converts full-range BT.709, and the HEVC VUI says
 - The old helper must be updated before the server sends `G`: an unknown
   command would desynchronise its input protocol. Install the server package
   and restart `lgx-input`.
+- The helper unlinks and re-binds `/run/lgx-input.sock` when it restarts, so
+  the server's input thread must keep reconnecting to it. A one-shot connect
+  silently disables all guest input until the server restarts, which is what
+  a package upgrade used to do.
 - Client scancodes must be masked with `& 0x1ff`.
 - `MODS` is sent before every `KEY`; the virtual keyboard needs explicit
   modifiers.

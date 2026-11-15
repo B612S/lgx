@@ -73,7 +73,7 @@ pub enum Cmd {
 /// Kernel-level input devices created by the `lgx-uinput` helper. They work for
 /// every application and every compositor shortcut, like Sunshine's uinput
 /// backend, and do not depend on Wayland protocol details.
-fn run_uinput(rx: Receiver<Cmd>, mut sock: std::os::unix::net::UnixStream) -> std::io::Result<()> {
+fn run_uinput(rx: &Receiver<Cmd>, mut sock: std::os::unix::net::UnixStream) -> std::io::Result<()> {
     use std::io::Write;
     while let Ok(cmd) = rx.recv() {
         let ok = match cmd {
@@ -138,26 +138,46 @@ pub fn spawn(seat_name: Option<String>) -> Sender<Cmd> {
     std::thread::Builder::new()
         .name("lgx-input".into())
         .spawn(move || {
-            match std::os::unix::net::UnixStream::connect("/run/lgx-input.sock") {
-                Ok(sock) => {
-                    eprintln!("lgx-server: input: kernel uinput devices");
-                    if let Err(e) = run_uinput(rx, sock) {
-                        eprintln!("lgx-server: input: {e}");
+            // The helper unlinks and re-creates its socket when the package is
+            // upgraded or the unit restarts, which closes our connection. Keep
+            // reconnecting instead of losing input until the server restarts.
+            let mut connected_once = false;
+            let mut waiting_logged = false;
+            loop {
+                match std::os::unix::net::UnixStream::connect("/run/lgx-input.sock") {
+                    Ok(sock) => {
+                        if !connected_once {
+                            eprintln!("lgx-server: input: kernel uinput devices");
+                        }
+                        connected_once = true;
+                        waiting_logged = false;
+                        if let Err(e) = run_uinput(&rx, sock) {
+                            eprintln!("lgx-server: input: {e}");
+                        }
+                        eprintln!("lgx-server: input: helper connection lost, reconnecting");
+                    }
+                    Err(e) => {
+                        if !connected_once {
+                            eprintln!("lgx-server: input: uinput helper not found, using Wayland virtual devices");
+                            if let Err(e) = run(&rx, seat_name.clone()) {
+                                eprintln!("lgx-server: input: {e}");
+                            }
+                            return;
+                        }
+                        if !waiting_logged {
+                            eprintln!("lgx-server: input: waiting for the uinput helper ({e})");
+                            waiting_logged = true;
+                        }
                     }
                 }
-                Err(_) => {
-                    eprintln!("lgx-server: input: uinput helper not found, using Wayland virtual devices");
-                    if let Err(e) = run(rx, seat_name) {
-                        eprintln!("lgx-server: input: {e}");
-                    }
-                }
+                std::thread::sleep(std::time::Duration::from_millis(250));
             }
         })
         .expect("input thread");
     tx
 }
 
-fn run(rx: Receiver<Cmd>, _seat_name: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+fn run(rx: &Receiver<Cmd>, _seat_name: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
     let conn = Connection::connect_to_env()?;
     let (globals, queue) = registry_queue_init::<InputState>(&conn)?;
     let qh: QueueHandle<InputState> = queue.handle();
