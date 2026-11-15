@@ -31,3 +31,42 @@ pub fn evdev_from_scancode(sc: i32) -> Option<u16> {
         Some(code)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Spot checks against the kernel HID->evdev table; these are the keys a
+    /// remote session uses constantly, so a shifted table is very visible.
+    #[test]
+    fn common_keys_map_to_the_kernel_table() {
+        assert_eq!(evdev_from_scancode(4), Some(30)); // a
+        assert_eq!(evdev_from_scancode(29), Some(44)); // z
+        assert_eq!(evdev_from_scancode(40), Some(28)); // enter
+        assert_eq!(evdev_from_scancode(42), Some(14)); // backspace
+        assert_eq!(evdev_from_scancode(44), Some(57)); // space
+        assert_eq!(evdev_from_scancode(225), Some(42)); // left shift
+        assert_eq!(evdev_from_scancode(224), Some(29)); // left ctrl
+        assert_eq!(evdev_from_scancode(226), Some(56)); // left alt
+        assert_eq!(evdev_from_scancode(227), Some(125)); // left meta
+        assert_eq!(evdev_from_scancode(41), Some(1)); // escape
+    }
+
+    #[test]
+    fn reserved_and_out_of_range_scancodes_are_dropped() {
+        assert_eq!(evdev_from_scancode(0), None);
+        assert_eq!(evdev_from_scancode(256), None);
+        assert_eq!(evdev_from_scancode(-1), None);
+        assert_eq!(evdev_from_scancode(1), None); // no key
+        assert_eq!(evdev_from_scancode(130), None); // 0xF0 placeholder
+    }
+
+    #[test]
+    fn every_supported_scancode_is_a_known_evdev_code() {
+        for sc in 1..256i32 {
+            if let Some(code) = evdev_from_scancode(sc) {
+                assert!(code < 256, "scancode {sc} maps to {code}");
+            }
+        }
+    }
+}

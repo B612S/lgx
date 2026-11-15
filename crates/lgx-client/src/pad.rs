@@ -163,3 +163,62 @@ pub fn open_all(subsystem: &GamepadSubsystem) -> Vec<Pad> {
 pub fn open_one(subsystem: &GamepadSubsystem, id: u32, slot: u8) -> Option<Pad> {
     make(subsystem, id, slot)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Bit order is shared with `helper/lgx-uinput.c` (`gamepad_buttons[]`);
+    /// reordering either side silently swaps buttons inside the guest.
+    #[test]
+    fn button_bits_match_the_helper_table() {
+        let expected = [
+            (Button::South, 0),
+            (Button::East, 1),
+            (Button::North, 2),
+            (Button::West, 3),
+            (Button::Back, 4),
+            (Button::Guide, 5),
+            (Button::Start, 6),
+            (Button::LeftStick, 7),
+            (Button::RightStick, 8),
+            (Button::LeftShoulder, 9),
+            (Button::RightShoulder, 10),
+            (Button::DPadUp, 11),
+            (Button::DPadDown, 12),
+            (Button::DPadLeft, 13),
+            (Button::DPadRight, 14),
+            (Button::Misc1, 15),
+            (Button::Misc2, 16),
+            (Button::Misc3, 17),
+            (Button::Misc4, 18),
+            (Button::Misc5, 19),
+            (Button::RightPaddle1, 20),
+            (Button::LeftPaddle1, 21),
+            (Button::RightPaddle2, 22),
+            (Button::LeftPaddle2, 23),
+            (Button::Touchpad, 24),
+        ];
+        for (button, bit) in expected {
+            assert_eq!(button_bit(button), bit, "{button:?}");
+        }
+    }
+
+    #[test]
+    fn axes_follow_the_wire_order() {
+        for (axis, idx) in [
+            (Axis::LeftX, 0),
+            (Axis::LeftY, 1),
+            (Axis::RightX, 2),
+            (Axis::RightY, 3),
+            (Axis::TriggerLeft, 4),
+            (Axis::TriggerRight, 5),
+        ] {
+            let mut state = State::default();
+            state.set_axis(axis, 1234);
+            let mut expected = [0i16; 6];
+            expected[idx] = 1234;
+            assert_eq!(state.axes, expected, "{axis:?}");
+        }
+    }
+}
