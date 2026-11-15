@@ -1,0 +1,24 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      # The container has neither node (needed by the JS actions) nor the
+      # toolchain, and the repository is not checked out yet.
+      - name: Toolchain
+        run: |
+          pacman -Syu --noconfirm --needed \
+            nodejs git rust gcc pkgconf clang \
+            ffmpeg sdl3 vulkan-headers vulkan-icd-loader mesa \
+            libxkbcommon pipewire libva libpulse wl-clipboard \
+            qt6-base freetype2
+      - uses: actions/checkout@v4
+      - name: Build and test
+        run: ./scripts/check.sh
