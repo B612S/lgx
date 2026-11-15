@@ -73,9 +73,35 @@ pub enum Cmd {
 /// Kernel-level input devices created by the `lgx-uinput` helper. They work for
 /// every application and every compositor shortcut, like Sunshine's uinput
 /// backend, and do not depend on Wayland protocol details.
-fn run_uinput(rx: &Receiver<Cmd>, mut sock: std::os::unix::net::UnixStream) -> std::io::Result<()> {
+/// Why the input loop returned.
+enum Stop {
+    /// The helper went away (restart or package upgrade): reconnect.
+    Peer,
+    /// The server is shutting down and dropped the command channel.
+    Shutdown,
+}
+
+fn run_uinput(
+    rx: &Receiver<Cmd>,
+    mut sock: std::os::unix::net::UnixStream,
+) -> std::io::Result<Stop> {
     use std::io::Write;
-    while let Ok(cmd) = rx.recv() {
+    use std::os::fd::AsRawFd;
+    use std::sync::mpsc::RecvTimeoutError;
+    let fd = sock.as_raw_fd();
+    loop {
+        let cmd = match rx.recv_timeout(std::time::Duration::from_millis(250)) {
+            Ok(cmd) => cmd,
+            Err(RecvTimeoutError::Timeout) => {
+                // Nothing to write, so check the socket itself: the helper
+                // unlinks and re-binds its path when it restarts.
+                if peer_gone(fd) {
+                    return Ok(Stop::Peer);
+                }
+                continue;
+            }
+            Err(RecvTimeoutError::Disconnected) => return Ok(Stop::Shutdown),
+        };
         let ok = match cmd {
             Cmd::Key { code, state, .. } => {
                 let mut b = [b'K', 0, 0, state as u8];
@@ -127,54 +153,65 @@ fn run_uinput(rx: &Receiver<Cmd>, mut sock: std::os::unix::net::UnixStream) -> s
             Cmd::Mods { .. } | Cmd::Keymap(_) => Ok(()),
         };
         if ok.is_err() {
-            return Ok(());
+            return Ok(Stop::Peer);
         }
     }
-    Ok(())
 }
+
+fn peer_gone(fd: std::os::fd::RawFd) -> bool {
+    let mut p = libc::pollfd { fd, events: 0, revents: 0 };
+    let n = unsafe { libc::poll(&mut p, 1, 0) };
+    n > 0 && (p.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)) != 0
+}
+
+const SOCKET: &str = "/run/lgx-input.sock";
 
 pub fn spawn(seat_name: Option<String>) -> Sender<Cmd> {
     let (tx, rx) = std::sync::mpsc::channel::<Cmd>();
     std::thread::Builder::new()
         .name("lgx-input".into())
-        .spawn(move || {
-            // The helper unlinks and re-creates its socket when the package is
-            // upgraded or the unit restarts, which closes our connection. Keep
-            // reconnecting instead of losing input until the server restarts.
-            let mut connected_once = false;
-            let mut waiting_logged = false;
-            loop {
-                match std::os::unix::net::UnixStream::connect("/run/lgx-input.sock") {
-                    Ok(sock) => {
-                        if !connected_once {
-                            eprintln!("lgx-server: input: kernel uinput devices");
-                        }
-                        connected_once = true;
-                        waiting_logged = false;
-                        if let Err(e) = run_uinput(&rx, sock) {
-                            eprintln!("lgx-server: input: {e}");
-                        }
-                        eprintln!("lgx-server: input: helper connection lost, reconnecting");
-                    }
-                    Err(e) => {
-                        if !connected_once {
-                            eprintln!("lgx-server: input: uinput helper not found, using Wayland virtual devices");
-                            if let Err(e) = run(&rx, seat_name.clone()) {
-                                eprintln!("lgx-server: input: {e}");
-                            }
-                            return;
-                        }
-                        if !waiting_logged {
-                            eprintln!("lgx-server: input: waiting for the uinput helper ({e})");
-                            waiting_logged = true;
-                        }
-                    }
-                }
-                std::thread::sleep(std::time::Duration::from_millis(250));
-            }
-        })
+        .spawn(move || serve(rx, SOCKET, seat_name))
         .expect("input thread");
     tx
+}
+
+fn serve(rx: Receiver<Cmd>, path: &str, seat_name: Option<String>) {
+    // The helper unlinks and re-creates its socket when the package is
+    // upgraded or the unit restarts, which closes our connection. Keep
+    // reconnecting instead of losing input until the server restarts.
+    let mut connected_once = false;
+    let mut waiting_logged = false;
+    loop {
+        match std::os::unix::net::UnixStream::connect(path) {
+            Ok(sock) => {
+                if !connected_once {
+                    eprintln!("lgx-server: input: kernel uinput devices");
+                }
+                connected_once = true;
+                waiting_logged = false;
+                match run_uinput(&rx, sock) {
+                    Ok(Stop::Shutdown) => return,
+                    Ok(Stop::Peer) => {}
+                    Err(e) => eprintln!("lgx-server: input: {e}"),
+                }
+                eprintln!("lgx-server: input: helper connection lost, reconnecting");
+            }
+            Err(e) => {
+                if !connected_once {
+                    eprintln!("lgx-server: input: uinput helper not found, using Wayland virtual devices");
+                    if let Err(e) = run(&rx, seat_name.clone()) {
+                        eprintln!("lgx-server: input: {e}");
+                    }
+                    return;
+                }
+                if !waiting_logged {
+                    eprintln!("lgx-server: input: waiting for the uinput helper ({e})");
+                    waiting_logged = true;
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
 }
 
 fn run(rx: &Receiver<Cmd>, _seat_name: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
@@ -264,4 +301,59 @@ fn tempfile_in_shm(bytes: &[u8]) -> std::io::Result<std::fs::File> {
         .open(path)?;
     f.write_all(bytes)?;
     Ok(f)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+    use std::os::unix::net::UnixListener;
+    use std::time::Duration;
+
+    /// The helper unlinks and re-binds its socket on every restart; the input
+    /// thread must follow it instead of dying with the old connection.
+    #[test]
+    fn reconnects_when_the_helper_socket_drops() {
+        let dir = std::env::temp_dir().join(format!("lgx-input-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sock");
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+
+        let helper = std::thread::spawn(move || {
+            // One packet per accepted connection, then hang up like a helper
+            // that was restarted; two packets means we saw both connections.
+            let mut seen = Vec::new();
+            let mut accepts = 0;
+            while seen.len() < 2 {
+                let (mut conn, _) = listener.accept().unwrap();
+                accepts += 1;
+                let mut buf = [0u8; 4];
+                if conn.read_exact(&mut buf).is_ok() {
+                    seen.push(buf);
+                }
+            }
+            (accepts, seen)
+        });
+
+        let (tx, rx) = std::sync::mpsc::channel::<Cmd>();
+        let serve_path = path.to_str().unwrap().to_string();
+        std::thread::spawn(move || serve(rx, &serve_path, None));
+
+        // Keep sending: the event racing the hang-up may be dropped, the next
+        // one must reach the reconnected stream.
+        let mut sent = 0;
+        while sent < 20 && !helper.is_finished() {
+            let _ = tx.send(Cmd::Key { code: 30, state: 1, time: 0 });
+            sent += 1;
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        let (accepts, seen) = helper.join().unwrap();
+        assert!(accepts >= 2, "input thread never reconnected");
+        for packet in &seen {
+            assert_eq!(packet, &[b'K', 30, 0, 1]);
+        }
+        let _ = std::fs::remove_file(&path);
+    }
 }
