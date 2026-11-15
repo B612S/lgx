@@ -4,6 +4,12 @@
 //! context, converted with a fragment shader into two render targets (R8 for Y,
 //! RG8 for UV) and read back as a packed NV12 frame that ffmpeg/VAAPI accepts.
 
+// Unsafe FFI wrappers: every `unsafe fn` here forwards to the driver and its
+// contract is described at the call site, so the per-function `# Safety`
+// section and the argument-count heuristic are skipped deliberately.
+#![allow(clippy::missing_safety_doc, clippy::too_many_arguments)]
+
+
 use std::ffi::{c_char, c_void, CString};
 
 const EGL_PLATFORM_GBM_KHR: u32 = 0x31D7;
@@ -93,8 +99,8 @@ impl GlConv {
     pub unsafe fn pbo_new(&self, size: usize) -> Option<PboRead> {
         let mut pbos = [0u32; 2];
         glGenBuffers(2, pbos.as_mut_ptr());
-        for i in 0..2 {
-            glBindBuffer(0x88EB, pbos[i]);
+        for pbo in pbos {
+            glBindBuffer(0x88EB, pbo);
             glBufferData(0x88EB, size as isize, std::ptr::null(), 0x88E8); // STREAM_READ
         }
         let mut fbo = 0u32;

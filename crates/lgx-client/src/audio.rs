@@ -205,17 +205,17 @@ fn pipewire_thread(
     Ok(())
 }
 
-fn spawn_playback(
-    app_name: &str,
-    media_name: &str,
-) -> io::Result<(
+/// Producer side of the playback ring plus the handles the network loop needs.
+type Playback = (
     ringbuf::HeapProd<u8>,
     pw::channel::Sender<()>,
     std::thread::JoinHandle<()>,
     Arc<AtomicBool>,
     Arc<AtomicU64>,
     std::sync::mpsc::Receiver<()>,
-)> {
+);
+
+fn spawn_playback(app_name: &str, media_name: &str) -> io::Result<Playback> {
     let ring = HeapRb::<u8>::new(RING_BYTES);
     let (prod, cons) = ring.split();
     let paused = Arc::new(AtomicBool::new(false));

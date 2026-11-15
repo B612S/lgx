@@ -170,7 +170,6 @@ impl Hub {
 
 /// Streams a file clipboard to one client, locking the socket per message so
 /// video packets interleave instead of freezing for the whole transfer.
-
 pub fn listen(
     addr: &str,
     hub: Arc<Hub>,
@@ -306,11 +305,7 @@ fn handle(
             }
         })?;
 
-    loop {
-        let (m, payload) = match secure.recv_msg() {
-            Ok(v) => v,
-            Err(_) => break,
-        };
+    while let Ok((m, payload)) = secure.recv_msg() {
         match m.typ {
             msg::KEYMAP => {
                 let _ = input.send(Cmd::Keymap(payload));

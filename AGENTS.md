@@ -327,7 +327,9 @@ root. `make-source.sh` writes the only source tarball,
 trees belong in `target/pkgbuild` (git-ignored); never commit or keep
 `packaging/*/src`, `packaging/*/pkg` or per-package copies of the tarball.
 Bump `pkgrel` in a PKGBUILD for every rebuild; the build script fails when the
-result would be older than the installed package.
+result would be older than the installed package. `build.sh` also writes a
+temporary PKGBUILD copy with the real `sha256sums` (the tracked one keeps
+`SKIP`), so makepkg verifies the source archive instead of trusting it.
 
 Manual check on the VM:
 

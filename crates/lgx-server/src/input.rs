@@ -268,7 +268,7 @@ fn run(rx: &Receiver<Cmd>, _seat_name: Option<String>) -> Result<(), Box<dyn std
                 vkb.key(time, code, state);
             }
             Cmd::Btn { code, state, time } => {
-                vptr.button(time, code, wl_pointer::ButtonState::try_from(state as u32).unwrap_or(wl_pointer::ButtonState::Pressed));
+                vptr.button(time, code, wl_pointer::ButtonState::try_from(state).unwrap_or(wl_pointer::ButtonState::Pressed));
                 if vptr_version >= 2 {
                     vptr.frame();
                 }

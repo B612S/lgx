@@ -200,6 +200,7 @@ fn text_width(font: &SystemFont, text: &str) -> f32 {
     text.chars().map(|ch| glyph(font, ch, false).0 as f32).sum()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn blend(pixels: &mut [u8], stride: u32, x: i32, y: i32, r: u8, g: u8, b: u8, a: f32) {
     if x < 0 || y < 0 {
         return;

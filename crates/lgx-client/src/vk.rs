@@ -185,7 +185,7 @@ impl Renderer {
             }
             let discrete = props.device_type == vk::PhysicalDeviceType::DISCRETE_GPU;
             let score = if discrete { 2 } else { 1 };
-            if chosen.as_ref().map_or(true, |(_, s, _)| score > *s) {
+            if chosen.as_ref().is_none_or(|(_, s, _)| score > *s) {
                 chosen = Some((pd, score, family));
             }
         }

@@ -1334,7 +1334,7 @@ fn save_frame(path: &str, frame: &dec::Frame) {
         let uv = unsafe {
             std::slice::from_raw_parts(n.uv, n.uv_stride as usize * (h as usize / 2))
         };
-        match write_ppm_nv12(&path, w, h, y, n.y_stride as usize, uv, n.uv_stride as usize) {
+        match write_ppm_nv12(path, w, h, y, n.y_stride as usize, uv, n.uv_stride as usize) {
             Ok(()) => eprintln!("lgx-client: saved {path} ({w}x{h})"),
             Err(e) => eprintln!("lgx-client: screenshot: {e}"),
         }

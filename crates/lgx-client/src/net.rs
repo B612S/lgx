@@ -122,11 +122,7 @@ fn reader(
     video: std::sync::mpsc::Sender<Chunk>,
     clipboard: ClipPolicy,
 ) {
-    loop {
-        let (m, payload) = match secure.recv_msg_raw() {
-            Ok(v) => v,
-            Err(_) => break,
-        };
+    while let Ok((m, payload)) = secure.recv_msg_raw() {
         let body = &payload[secure::MSG_HEADER..];
         match m.typ {
             msg::VIDEO => {

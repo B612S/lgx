@@ -53,7 +53,7 @@ fn next_uniform(rng: &mut u64) -> f32 {
 fn f32_to_s16_dithered(input: &[u8], out: &mut Vec<u8>, rng: &mut u64) {
     out.clear();
     out.reserve(input.len() / 2);
-    for sample in input.chunks_exact(4) {
+    for sample in input.as_chunks::<4>().0 {
         let v = f32::from_le_bytes([sample[0], sample[1], sample[2], sample[3]]);
         let d = next_uniform(rng) - next_uniform(rng);
         // Scale by 2^15 so -1.0 reaches -32768 exactly; +1.0 saturates.
@@ -275,7 +275,7 @@ pub fn serve(addr: &str) -> io::Result<()> {
 
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
-        if clients.lock().unwrap().len() >= 1 {
+        if !clients.lock().unwrap().is_empty() {
             eprintln!("lgx-server: audio: too many clients");
             continue;
         }

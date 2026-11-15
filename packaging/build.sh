@@ -7,6 +7,8 @@
 # to target/pkgbuild/, and the finished packages land in the project root.
 set -eu
 root=$(cd "$(dirname "$0")/.." && pwd)
+# Generated PKGBUILDs with real checksums are temporary.
+trap 'rm -f "$root"/packaging/*/PKGBUILD.sha256' EXIT
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' "$root/Cargo.toml" | head -1)
 
 if [ "$#" -eq 0 ]; then
@@ -33,10 +35,13 @@ for pkg in "$@"; do
     esac
   fi
   echo "==> $pkg $built"
+  # Verify the freshly archived source instead of trusting SKIP.
+  sum=$(sha256sum "$root/packaging/lgx-$version.tar.gz" | cut -d' ' -f1)
+  sed "s|^sha256sums=.*|sha256sums=('$sum')|" "$dir/PKGBUILD" > "$dir/PKGBUILD.sha256"
   (
     cd "$dir"
     BUILDDIR="$root/target/pkgbuild" SRCDEST="$root/packaging" PKGDEST="$root" \
-      makepkg -f --noconfirm
+      makepkg -p PKGBUILD.sha256 -f --noconfirm
   )
   # Keep only the package just built; older versions in the root are stale.
   for old in "$root/$pkg-"*.pkg.tar.zst; do

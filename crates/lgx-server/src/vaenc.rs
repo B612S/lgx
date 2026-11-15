@@ -1,6 +1,12 @@
 //! Client side of the `lgx-vaenc` helper: it owns the VAAPI surfaces and the
 //! HEVC encoder, we render into its dma-bufs with GL (zero copy).
 
+// Unsafe FFI wrappers: every `unsafe fn` here forwards to the driver and its
+// contract is described at the call site, so the per-function `# Safety`
+// section and the argument-count heuristic are skipped deliberately.
+#![allow(clippy::missing_safety_doc, clippy::too_many_arguments)]
+
+
 use std::io::{self, Read, Write};
 use std::os::fd::RawFd;
 use std::os::unix::net::UnixStream;
@@ -208,7 +214,7 @@ impl VaEnc {
 
     /// Imports an external NV12 dma-buf as the encoder surface.
     pub fn import_surface(&mut self, fd: RawFd, meta: [u32; 4]) -> io::Result<bool> {
-        self.stream.write_all(&[b'I'])?;
+        self.stream.write_all(b"I")?;
         let mut payload = [0u8; 16];
         for (i, v) in meta.iter().enumerate() {
             payload[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
@@ -247,7 +253,7 @@ impl VaEnc {
         modifier: u64,
         fd: RawFd,
     ) -> io::Result<Vec<Vec<u8>>> {
-        self.stream.write_all(&[b'R'])?;
+        self.stream.write_all(b"R")?;
         let meta: [u32; 8] = [
             width,
             height,
@@ -294,7 +300,7 @@ impl VaEnc {
     /// Uploads one CPU NV12 frame into the helper's VAAPI surface and encodes
     /// it. The helper returns the same packet list format as `encode`.
     pub fn send_cpu(&mut self, data: &[u8]) -> io::Result<Vec<Vec<u8>>> {
-        self.stream.write_all(&[b'F'])?;
+        self.stream.write_all(b"F")?;
         self.stream.write_all(&0u32.to_le_bytes())?;
         self.stream.write_all(&(data.len() as u32).to_le_bytes())?;
         self.stream.write_all(data)?;
@@ -314,13 +320,13 @@ impl VaEnc {
     /// just joined can start decoding immediately instead of waiting for the
     /// next keyframe interval.
     pub fn force_keyframe(&mut self) -> io::Result<()> {
-        self.stream.write_all(&[b'K'])
+        self.stream.write_all(b"K")
     }
 
     /// Encodes the surface rendered by the caller. The helper may return
     /// several access units for one frame; each stays a separate packet.
     pub fn encode(&mut self, idx: u32) -> io::Result<Vec<Vec<u8>>> {
-        self.stream.write_all(&[b'E'])?;
+        self.stream.write_all(b"E")?;
         self.stream.write_all(&idx.to_le_bytes())?;
         let count = u32::from_le_bytes(rx(&mut self.stream, 4)?.try_into().unwrap()) as usize;
         if count > 16 {
@@ -337,6 +343,6 @@ impl VaEnc {
 
 impl Drop for VaEnc {
     fn drop(&mut self) {
-        let _ = self.stream.write_all(&[b'Q']);
+        let _ = self.stream.write_all(b"Q");
     }
 }
