@@ -54,13 +54,14 @@ fn canonical(key: &str) -> String {
         return key.to_string();
     }
     let (section, name) = match key {
-        "width" | "height" | "fullscreen" | "vsync" | "decoder" | "cursor" => {
+        "width" | "height" | "fullscreen" | "vsync" | "decoder" => {
             ("video", key)
         }
         "audio" => ("audio", "enabled"),
         "mute_unfocused" => ("audio", "mute_unfocused"),
         "audio_connect" => ("audio", "connect"),
         "gamepads" => ("input", "gamepads"),
+        "cursor_grab" => ("input", "cursor_grab"),
         "clipboard" => ("input", "clipboard"),
         "clipboard_rich" => ("input", "clipboard_rich"),
         "clipboard_max_bytes" => ("input", "clipboard_max_bytes"),
@@ -118,7 +119,7 @@ impl Config {
             cfg.set("fullscreen", "false");
             cfg.set("vsync", "false");
             cfg.set("decoder", "auto");
-            cfg.set("cursor", "remote");
+            cfg.set("cursor_grab", "true");
             cfg.set("audio", "true");
         }
         for (key, value) in [

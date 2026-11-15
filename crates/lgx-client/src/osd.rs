@@ -23,12 +23,26 @@ const FALLBACK_FONTS: &[&str] = &[
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
 ];
 
+pub const AUDIO_ON: usize = 0;
+pub const AUDIO_OFF: usize = 1;
+pub const POINTER_CAPTURED: usize = 2;
+pub const POINTER_RELEASED: usize = 3;
+pub const FULLSCREEN_ON: usize = 4;
+pub const FULLSCREEN_OFF: usize = 5;
+pub const CARDS: [&str; 6] = [
+    "Background audio: On",
+    "Background audio: Off",
+    "Pointer captured",
+    "Pointer released",
+    "Fullscreen: On",
+    "Fullscreen: Off",
+];
+
 pub struct Atlas {
     pub width: u32,
     pub height: u32,
-    pub card_width_on: u32,
-    pub card_width_off: u32,
-    pub card_height: u32,
+    /// (offset, width) of each card in the atlas.
+    pub cards: Vec<(u32, u32)>,
     pub rgba: Vec<u8>,
 }
 
@@ -309,23 +323,21 @@ fn card_width(font: &SystemFont, text: &str) -> u32 {
 pub fn atlas(scale: f32) -> Option<Atlas> {
     let (font, family, point) = system_font(scale)?;
     eprintln!("lgx-client: OSD font {family}, {point} pt ({} px)", font.pixels);
-    let on = "Background audio: On";
-    let off = "Background audio: Off";
-    // Each state gets the width its own text needs. Sharing the widest width
-    // (or a fixed minimum) left a visible empty strip on the shorter card.
-    let on_w = card_width(&font, on);
-    let off_w = card_width(&font, off);
+    let widths: Vec<u32> = CARDS.iter().map(|t| card_width(&font, t)).collect();
     let card_h = CARD_H;
-    let width = on_w + off_w;
+    let width: u32 = widths.iter().sum();
     let mut rgba = vec![0u8; (width * card_h * 4) as usize];
-    draw_card(&mut rgba, width, 0, on_w, on, &font);
-    draw_card(&mut rgba, width, on_w, off_w, off, &font);
+    let mut cards = Vec::with_capacity(CARDS.len());
+    let mut offset = 0;
+    for (text, w) in CARDS.iter().zip(widths.iter()) {
+        draw_card(&mut rgba, width, offset, *w, text, &font);
+        cards.push((offset, *w));
+        offset += *w;
+    }
     Some(Atlas {
         width,
         height: card_h,
-        card_width_on: on_w,
-        card_width_off: off_w,
-        card_height: card_h,
+        cards,
         rgba,
     })
 }
@@ -336,18 +348,10 @@ mod tests {
 
     #[test]
     fn atlas_uses_a_system_font() {
-        let (font, _, _) = system_font(1.0).expect("a system sans font");
-        assert!(text_width(&font, "Background audio: On") > 0.0);
         let atlas = atlas(1.0).expect("OSD atlas");
-        assert_eq!(
-            atlas.card_width_on as f32,
-            text_width(&font, "Background audio: On").ceil() + (PAD_X * 2) as f32
-        );
-        assert_eq!(
-            atlas.card_width_off as f32,
-            text_width(&font, "Background audio: Off").ceil() + (PAD_X * 2) as f32
-        );
-        assert_eq!(atlas.width, atlas.card_width_on + atlas.card_width_off);
+        assert_eq!(atlas.cards.len(), CARDS.len());
+        assert_eq!(atlas.width, atlas.cards.iter().map(|c| c.1).sum());
         assert_eq!(atlas.rgba.len(), (atlas.width * atlas.height * 4) as usize);
+        assert!(atlas.cards.iter().all(|c| c.1 > 0));
     }
 }

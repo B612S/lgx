@@ -44,7 +44,7 @@ struct Args {
     audio: Option<bool>,
     audio_connect: Option<String>,
     decoder: Option<String>,
-    cursor: Option<bool>,
+    cursor_grab: Option<bool>,
     gamepads: Option<bool>,
     connections: bool,
     list_profiles: bool,
@@ -61,6 +61,8 @@ struct Args {
 struct Settings {
     name: String,
     server: String,
+    video_port: u16,
+    audio_port: u16,
     width: Option<u32>,
     height: Option<u32>,
     fullscreen: bool,
@@ -70,7 +72,7 @@ struct Settings {
     token: String,
     client_id: String,
     decoder: String,
-    cursor_remote: bool,
+    cursor_grab: bool,
     gamepads: bool,
     clipboard: bool,
     clipboard_rich: bool,
@@ -94,7 +96,7 @@ fn parse_args() -> Result<Args, String> {
         audio: None,
         audio_connect: None,
         decoder: None,
-        cursor: None,
+        cursor_grab: None,
         gamepads: None,
         connections: true,
         list_profiles: false,
@@ -145,13 +147,8 @@ fn parse_args() -> Result<Args, String> {
             "--decoder" => a.decoder = Some(it.next().ok_or("--decoder")?),
             "--bench" => a.bench = Some(it.next().ok_or("--bench")?.parse().map_err(|_| "--bench")?),
             "--frames" => a.frames = Some(it.next().ok_or("--frames")?.parse().map_err(|_| "--frames")?),
-            "--cursor" => {
-                a.cursor = Some(match it.next().ok_or("--cursor")?.as_str() {
-                    "local" => false,
-                    "remote" => true,
-                    other => return Err(format!("--cursor must be local or remote, not {other}")),
-                })
-            }
+            "--cursor-grab" => a.cursor_grab = Some(true),
+            "--no-cursor-grab" => a.cursor_grab = Some(false),
             "--size" => {
                 let v = it.next().ok_or("--size")?;
                 let (w, h) = v.split_once('x').ok_or("--size WxH")?;
@@ -162,7 +159,7 @@ fn parse_args() -> Result<Args, String> {
                     "lgx-client [NAME] [--connect HOST:PORT] [--token T] [--size WxH]\n\
                      \x20          NAME selects the [NAME] section in client.conf\n\
                      \x20          [--decoder auto|cuda|vaapi|software]\n\
-                     \x20          [--cursor local|remote] [--fullscreen|--windowed]\n\
+                     \x20          [--cursor-grab|--no-cursor-grab] [--fullscreen|--windowed]\n\
                      \x20          [--vsync] [--audio] [--audio-connect ADDR]\n\
                      \x20          [--gamepads|--no-gamepads] [--no-reconnect]\n\
                      \x20          [--list] [--check]\n\
@@ -170,7 +167,7 @@ fn parse_args() -> Result<Args, String> {
                      \x20          [--mute-unfocused|--no-mute-unfocused]\n\
                      \x20          [--no-window] [--bench SECONDS] [--frames N]\n\
                      \x20          [--screenshot FILE]\n\
-                     \x20          [--pair HOST:PORT --pair-code CODE] [--client-id ID]"
+                     \x20          [--pair HOST:PAIRPORT --pair-code CODE] [--client-id ID]"
                 );
                 std::process::exit(0);
             }
@@ -280,6 +277,50 @@ fn main() {
         }
     };
 
+    if let Some(addr) = args.pair.clone() {
+        let code = match args.pair_code.as_deref() {
+            Some(c) => c,
+            None => {
+                eprintln!("lgx-client: --pair requires --pair-code");
+                std::process::exit(2);
+            }
+        };
+        let (host, pair_port) = split_host_port(&addr);
+        let pair_port = pair_port.unwrap_or(5904);
+        let pair_addr = join_host_port(&host, pair_port);
+        match pair::run(&pair_addr, code) {
+            Ok((id, token, video, audio)) => {
+                if id != args.name {
+                    eprintln!(
+                        "lgx-client: server paired id {id}, but profile is {}",
+                        args.name
+                    );
+                    std::process::exit(1);
+                }
+                let mut cfg = config::Config::load_or_create();
+                cfg.set_instance(&args.name, "server", &host);
+                cfg.set_instance(&args.name, "video_port", video);
+                cfg.set_instance(&args.name, "audio_port", audio);
+                cfg.set_instance(&args.name, "pair_port", pair_port);
+                cfg.set_instance(&args.name, "token", &token);
+                if let Err(e) = cfg.save() {
+                    eprintln!("lgx-client: cannot save [{}]: {e}", args.name);
+                    std::process::exit(1);
+                }
+                eprintln!(
+                    "lgx-client: paired as {id}; saved [{}] server={host} video={video} audio={audio} in {}",
+                    args.name,
+                    config::path().display()
+                );
+            }
+            Err(e) => {
+                eprintln!("lgx-client: pairing with {pair_addr} failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
     if args.list_profiles {
         let cfg = config::Config::load_or_create();
         let profiles = cfg.instances();
@@ -320,44 +361,6 @@ fn main() {
         return;
     }
 
-    if let Some(addr) = args.pair.clone() {
-        let code = match args.pair_code.as_deref() {
-            Some(c) => c,
-            None => {
-                eprintln!("lgx-client: --pair requires --pair-code");
-                std::process::exit(2);
-            }
-        };
-        match pair::run(&addr, code) {
-            Ok((id, token)) => {
-                if id != args.name {
-                    eprintln!(
-                        "lgx-client: server paired id {id}, but profile is {}; use --pair-name {}",
-                        args.name, args.name
-                    );
-                    std::process::exit(1);
-                }
-                let mut cfg = config::Config::load_or_create();
-                cfg.set_instance(&args.name, "token", &token);
-                cfg.set_instance(&args.name, "server", pair::normal_server(&addr));
-                if let Err(e) = cfg.save() {
-                    eprintln!("lgx-client: cannot save profile {}: {e}", args.name);
-                    std::process::exit(1);
-                }
-                eprintln!(
-                    "lgx-client: paired as {id}; saved [{}] in {}",
-                    args.name,
-                    config::path().display()
-                );
-            }
-            Err(e) => {
-                eprintln!("lgx-client: pairing with {addr} failed: {e}");
-                std::process::exit(1);
-            }
-        }
-        return;
-    }
-
     let cfg = config::Config::load_or_create();
     let token = args
         .token
@@ -385,6 +388,14 @@ fn main() {
                 }
             }
         },
+        video_port: cfg
+            .instance_get(&args.name, "video_port")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5902),
+        audio_port: cfg
+            .instance_get(&args.name, "audio_port")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5903),
         width: args
             .size
             .map(|(w, _)| w)
@@ -414,9 +425,9 @@ fn main() {
             .clone()
             .or_else(|| cfg.get("decoder").map(str::to_string))
             .unwrap_or_else(|| "auto".to_string()),
-        cursor_remote: args
-            .cursor
-            .or_else(|| cfg.get("cursor").map(|v| v != "local"))
+        cursor_grab: args
+            .cursor_grab
+            .or_else(|| cfg.get_bool("cursor_grab"))
             .unwrap_or(true),
         gamepads: args
             .gamepads
@@ -445,7 +456,16 @@ fn main() {
         );
         std::process::exit(2);
     }
-    let this_host = display_host(&s.server).to_string();
+    let (host, explicit_video_port) = split_host_port(&s.server);
+    let video_port = explicit_video_port.unwrap_or(s.video_port);
+    let audio_port = s.audio_port;
+    let server = join_host_port(&host, video_port);
+    let audio_addr = s
+        .audio_connect
+        .clone()
+        .unwrap_or_else(|| join_host_port(&host, audio_port));
+
+    let this_host = host.clone();
     let _instance = match instance::acquire(&this_host) {
         Ok(Some(guard)) => Some(guard),
         Ok(None) => {
@@ -457,7 +477,7 @@ fn main() {
             None
         }
     };
-    let (server, token) = (s.server.clone(), s.token.clone());
+    let token = s.token.clone();
     let (mut keyboard, keymap) = match Keyboard::new() {
         Some(v) => (Some(v.0), v.1),
         None => {
@@ -515,7 +535,7 @@ fn main() {
     // Remember the attempt count in case this session drops quickly.
     std::env::set_var(RECONNECT_ATTEMPT_ENV, connect_attempt.to_string());
     let _ = conn.send(
-        Msg::new(msg::CURSOR, s.cursor_remote as u16, 0, 0),
+        Msg::new(msg::CURSOR, 1, 0, 0),
         &[],
     );
     eprintln!("lgx-client: server HEVC {}x{}", hello.width, hello.height);
@@ -569,13 +589,7 @@ fn main() {
     let audio_focus = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     let mute_unfocused = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(s.mute_unfocused));
     if s.audio {
-        let addr = s
-            .audio_connect
-            .clone()
-            .unwrap_or_else(|| match server.rsplit_once(':') {
-                Some((host, _)) => format!("{host}:5903"),
-                None => format!("{server}:5903"),
-            });
+        let addr = audio_addr;
         let token = token.clone();
         let client_id = s.client_id.clone();
         let focus = audio_focus.clone();
@@ -682,7 +696,15 @@ fn main() {
         pad::send(&conn, p, true);
     }
     let mut pump = sdl.event_pump().expect("event pump");
-    sdl.mouse().show_cursor(!s.cursor_remote);
+    sdl.mouse().set_relative_mouse_mode(&window, false);
+    let mut grab_active = s.cursor_grab;
+    if grab_active && !window.set_mouse_grab(true) {
+        eprintln!("lgx-client: pointer confinement is not available; cursor stays absolute");
+    }
+    // Remote-cursor style: exactly one visible cursor. While the window is
+    // focused the guest cursor is composited into the video and the host
+    // cursor is hidden; grab only controls pointer confinement.
+    sdl.mouse().show_cursor(false);
     let heartbeat = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     {
         let hb = heartbeat.clone();
@@ -710,7 +732,7 @@ fn main() {
     }
 
     let wm = unsafe { wayland_window(&window) };
-    let mut inhibitor: Option<inhibit::Guard> = match wm {
+    let _inhibitor: Option<inhibit::Guard> = match wm {
         Some((display, surface)) => match unsafe { inhibit::install(display, surface) } {
             Ok(g) => Some(g),
             Err(e) => {
@@ -738,10 +760,12 @@ fn main() {
     let mut redraw = true;
     let mut swallow_f_keyup = false;
     let mut swallow_m_keyup = false;
+    let mut swallow_g_keyup = false;
     let mut osd_until: Option<Instant> = None;
-    let mut osd_enabled = false;
+    let mut osd_card = osd::AUDIO_ON;
+    let mut fullscreen = s.fullscreen;
     if let Ok(state) = std::env::var("LGX_OSD_DEMO") {
-        osd_enabled = state != "off";
+        osd_card = if state == "off" { osd::AUDIO_OFF } else { osd::AUDIO_ON };
         osd_until = Some(Instant::now() + Duration::from_secs(10));
     }
     let mut fullscreen_hold: Option<(Instant, (u32, u32))> = None;
@@ -783,9 +807,19 @@ fn main() {
                 }
                 Event::Window { win_event: sdl3::event::WindowEvent::FocusLost, .. } => {
                     audio_focus.store(false, std::sync::atomic::Ordering::Relaxed);
+                    window.set_mouse_grab(false);
+                    sdl.mouse().show_cursor(true);
+                    // Unfocused: show the host cursor and exclude the guest
+                    // cursor from the video, so exactly one is visible.
+                    let _ = conn.send(Msg::new(msg::CURSOR, 0, 0, 0), &[]);
                 }
                 Event::Window { win_event: sdl3::event::WindowEvent::FocusGained, .. } => {
                     audio_focus.store(true, std::sync::atomic::Ordering::Relaxed);
+                    window.set_mouse_grab(grab_active);
+                    sdl.mouse().show_cursor(false);
+                    // Focused: guest cursor only; grab state does not change
+                    // which cursor is drawn.
+                    let _ = conn.send(Msg::new(msg::CURSOR, 1, 0, 0), &[]);
                 }
                 Event::Window { .. } => redraw = true,
                 Event::ControllerDeviceAdded { which, .. } => {
@@ -847,6 +881,13 @@ fn main() {
                 {
                     fullscreen_hold = Some((Instant::now(), renderer.size()));
                     toggle_fullscreen(&mut window);
+                    fullscreen = !fullscreen;
+                    osd_card = if fullscreen {
+                        osd::FULLSCREEN_ON
+                    } else {
+                        osd::FULLSCREEN_OFF
+                    };
+                    osd_until = Some(Instant::now() + Duration::from_millis(1600));
                     redraw = true;
                     // The modifiers were already forwarded before we could
                     // see the F; release them. F itself is never sent.
@@ -881,38 +922,49 @@ fn main() {
                         "lgx-client: background audio {} (Ctrl+Shift+Alt+M)",
                         if now_mute { "disabled" } else { "enabled" }
                     );
-                    osd_enabled = !now_mute;
+                    osd_card = if now_mute { osd::AUDIO_OFF } else { osd::AUDIO_ON };
                     osd_until = Some(Instant::now() + Duration::from_millis(1600));
                     redraw = true;
                 }
                 Event::KeyDown {
                     keycode: Some(sdl3::keyboard::Keycode::G),
                     keymod,
+                    repeat,
                     ..
-                } if keymod.intersects(sdl3::keyboard::Mod::LCTRLMOD | sdl3::keyboard::Mod::RCTRLMOD)
-                    && keymod.intersects(sdl3::keyboard::Mod::LALTMOD | sdl3::keyboard::Mod::RALTMOD) =>
+                } if !repeat
+                    && keymod.intersects(sdl3::keyboard::Mod::LCTRLMOD | sdl3::keyboard::Mod::RCTRLMOD)
+                    && keymod.intersects(sdl3::keyboard::Mod::LALTMOD | sdl3::keyboard::Mod::RALTMOD)
+                    && keymod.intersects(
+                        sdl3::keyboard::Mod::LSHIFTMOD | sdl3::keyboard::Mod::RSHIFTMOD,
+                    ) =>
                 {
-                    match inhibitor.take() {
-                        Some(g) => {
-                            g.release();
-                            eprintln!("lgx-client: shortcuts released");
-                        }
-                        None => {
-                            if let Some((display, surface)) = wm {
-                                if let Ok(g) = unsafe { inhibit::install(display, surface) } {
-                                    inhibitor = Some(g);
-                                    eprintln!("lgx-client: shortcuts inhibited");
-                                }
-                            }
-                        }
+                    grab_active = !grab_active;
+                    let ok = window.set_mouse_grab(grab_active);
+                    for code in [29u16, 42, 56, 97, 100, 54] {
+                        send_key(&conn, keyboard.as_mut(), code, false);
                     }
+                    swallow_g_keyup = true;
+                    eprintln!(
+                        "lgx-client: pointer {} (Ctrl+Alt+Shift+G){}",
+                        if grab_active { "captured" } else { "released" },
+                        if ok { "" } else { " [confinement unsupported]" }
+                    );
+                    osd_card = if grab_active {
+                        osd::POINTER_CAPTURED
+                    } else {
+                        osd::POINTER_RELEASED
+                    };
+                    osd_until = Some(Instant::now() + Duration::from_millis(1600));
                 }
                 Event::KeyDown {
                     keycode: Some(sdl3::keyboard::Keycode::Q),
                     keymod,
                     ..
                 } if keymod.intersects(sdl3::keyboard::Mod::LCTRLMOD | sdl3::keyboard::Mod::RCTRLMOD)
-                    && keymod.intersects(sdl3::keyboard::Mod::LALTMOD | sdl3::keyboard::Mod::RALTMOD) =>
+                    && keymod.intersects(sdl3::keyboard::Mod::LALTMOD | sdl3::keyboard::Mod::RALTMOD)
+                    && keymod.intersects(
+                        sdl3::keyboard::Mod::LSHIFTMOD | sdl3::keyboard::Mod::RSHIFTMOD,
+                    ) =>
                 {
                     quit = true;
                 }
@@ -955,6 +1007,11 @@ fn main() {
                 {
                     swallow_m_keyup = false;
                 }
+                Event::KeyUp { keycode: Some(sdl3::keyboard::Keycode::G), .. }
+                    if swallow_g_keyup =>
+                {
+                    swallow_g_keyup = false;
+                }
                 Event::KeyUp { scancode: Some(sc), .. } => {
                     if let Some(code) = hid::evdev_from_scancode((sc as i32) & 0x1ff) {
                         send_key(&conn, keyboard.as_mut(), code, false);
@@ -990,7 +1047,7 @@ fn main() {
                     // luma appears immediately and fades out over 150 ms.
                     let left = until.saturating_duration_since(now).as_secs_f32();
                     let alpha = (left / 0.15).clamp(0.0, 1.0);
-                    Some((osd_enabled, alpha))
+                    Some((osd_card, alpha))
                 }
             }
             None => None,
@@ -1163,6 +1220,32 @@ fn toggle_fullscreen(window: &mut sdl3::video::Window) {
     window.set_fullscreen(!now_full).ok();
 }
 
+fn split_host_port(addr: &str) -> (String, Option<u16>) {
+    if let Some(rest) = addr.strip_prefix('[') {
+        if let Some((host, port)) = rest.split_once("]:") {
+            if let Ok(port) = port.parse::<u16>() {
+                return (host.to_string(), Some(port));
+            }
+        }
+    } else if let Some((host, port)) = addr.rsplit_once(':') {
+        if !host.contains(':') {
+            if let Ok(port) = port.parse::<u16>() {
+                return (host.to_string(), Some(port));
+            }
+        }
+    }
+    (addr.to_string(), None)
+}
+
+fn join_host_port(host: &str, port: u16) -> String {
+    if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+#[cfg(test)]
 fn display_host(addr: &str) -> &str {
     if let Some(rest) = addr.strip_prefix('[') {
         if let Some(end) = rest.find(']') {

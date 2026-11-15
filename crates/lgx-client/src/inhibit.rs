@@ -88,9 +88,9 @@ pub struct Guard {
     inhibitor: Mutex<Option<inh::ZwpKeyboardShortcutsInhibitorV1>>,
 }
 
-impl Guard {
+impl Drop for Guard {
     /// Destroys the inhibitor, giving compositor shortcuts back.
-    pub fn release(self) {
+    fn drop(&mut self) {
         if let Some(i) = self.inhibitor.lock().unwrap().take() {
             i.destroy();
         }

@@ -88,9 +88,10 @@ pub struct Renderer {
     osd_tex: Texture,
     osd_stage: Staging,
     osd_ready: bool,
-    /// On-card width, off-card width, card height (pixels of the atlas).
-    osd_cards: (u32, u32, u32),
-    osd_draw: Option<(bool, f32)>,
+    /// (offset, width) of every card in the OSD atlas, and atlas height.
+    osd_cards: Vec<(u32, u32)>,
+    osd_height: u32,
+    osd_draw: Option<(usize, f32)>,
     osd_desc_layout: vk::DescriptorSetLayout,
     osd_desc_pool: vk::DescriptorPool,
     osd_desc_set: vk::DescriptorSet,
@@ -270,17 +271,13 @@ impl Renderer {
         // breaking video.
         let scale = window.display_scale().clamp(0.5, 4.0);
         let (osd_w, osd_h, osd_cards, osd_rgba) = match crate::osd::atlas(scale) {
-            Some(atlas) => (
-                atlas.width,
-                atlas.height,
-                (atlas.card_width_on, atlas.card_width_off, atlas.card_height),
-                atlas.rgba,
-            ),
+            Some(atlas) => (atlas.width, atlas.height, atlas.cards, atlas.rgba),
             None => {
                 eprintln!("lgx-client: OSD font not found; OSD overlay disabled");
-                (2, 1, (1, 1, 1), vec![0u8; 8])
+                (2, 1, vec![(0, 1), (1, 1)], vec![0u8; 8])
             }
         };
+        let osd_height = osd_h;
         let (osd_tex, osd_stage) =
             create_rgba_texture(&device, &instance, pd, osd_w, osd_h, &osd_rgba)?;
         let osd_desc_layout = create_osd_desc_layout(&device)?;
@@ -425,6 +422,7 @@ impl Renderer {
             osd_stage,
             osd_ready: false,
             osd_cards,
+            osd_height,
             osd_draw: None,
             osd_desc_layout,
             osd_desc_pool,
@@ -453,7 +451,7 @@ impl Renderer {
         (self.extent.width, self.extent.height)
     }
 
-    pub fn set_osd(&mut self, osd: Option<(bool, f32)>) {
+    pub fn set_osd(&mut self, osd: Option<(usize, f32)>) {
         self.osd_draw = osd;
     }
 
@@ -616,25 +614,22 @@ impl Renderer {
         Ok(())
     }
 
-    unsafe fn draw_osd(&self, cmd: vk::CommandBuffer, enabled: bool, alpha: f32) {
+    unsafe fn draw_osd(&self, cmd: vk::CommandBuffer, card: usize, alpha: f32) {
         if alpha <= 0.0 {
             return;
         }
+        let Some(&(offset, card_width)) = self.osd_cards.get(card) else {
+            return;
+        };
         let sw = self.extent.width as f32;
         let sh = self.extent.height as f32;
-        let (on_w, off_w, card_h) = (
-            self.osd_cards.0 as f32,
-            self.osd_cards.1 as f32,
-            self.osd_cards.2 as f32,
+        let card_h = self.osd_height as f32;
+        let total_w = (self.osd_cards.iter().map(|c| c.1).sum::<u32>()).max(1) as f32;
+        let (card_w, u0, u1) = (
+            card_width as f32,
+            offset as f32 / total_w,
+            (offset + card_width) as f32 / total_w,
         );
-        let total_w = (on_w + off_w).max(1.0);
-        // Each card has its own width in the atlas; use exactly that slice
-        // instead of always sampling half of a shared width.
-        let (card_w, u0, u1) = if enabled {
-            (on_w, 0.0, on_w / total_w)
-        } else {
-            (off_w, on_w / total_w, 1.0)
-        };
         let x0 = ((sw - card_w) / 2.0).round();
         let y0 = 40.0;
         let y1 = y0 + card_h;
@@ -880,8 +875,8 @@ impl Renderer {
             &[],
         );
         self.device.cmd_draw(cmd, 3, 1, 0, 0);
-        if let Some((enabled, alpha)) = self.osd_draw {
-            self.draw_osd(cmd, enabled, alpha);
+        if let Some((card, alpha)) = self.osd_draw {
+            self.draw_osd(cmd, card, alpha);
         }
         self.device.cmd_end_render_pass(cmd);
         self.device
