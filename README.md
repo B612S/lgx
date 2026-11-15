@@ -86,7 +86,7 @@ Start the client on the host with a profile name:
 lgx-client archlinux
 # --decoder auto|cuda|vaapi|software
 # --size 1920x1080
-# --cursor local|remote
+# --cursor-grab|--no-cursor-grab
 # --no-window --frames 300 --screenshot shot.ppm
 ```
 
@@ -111,7 +111,6 @@ height = 1080
 fullscreen = false
 vsync = false
 decoder = auto
-cursor = remote
 
 [audio]
 enabled = true
@@ -119,19 +118,24 @@ mute_unfocused = true
 
 [input]
 gamepads = true
+cursor_grab = true
 clipboard = true
 clipboard_rich = true
 clipboard_max_bytes = 1048576
 
 [archlinux]
-server = 192.168.122.25:5902
+server = 192.168.122.25
+video_port = 5902
+audio_port = 5903
+pair_port = 5904
 token = <token>
 ```
 
 `lgx-client archlinux` selects the `[archlinux]` section; the section name is
 also the public client ID. `[video]`, `[audio]` and `[input]` are shared;
-each profile has only `server` and `token`. The file contains tokens and is
-`0600`.
+each profile has `server`, `video_port`, `audio_port`, `pair_port` and
+`token`. The file contains tokens and is `0600`. The ports are explicit;
+there is no discovery.
 
 - `mute_unfocused = true` discards received audio and emits silence while the
   client window is unfocused; the native PipeWire stream stays active.
@@ -139,16 +143,23 @@ each profile has only `server` and `token`. The file contains tokens and is
 - `[input] gamepads = false` (or `--no-gamepads`) skips gamepad forwarding.
 - `clipboard = false` disables sync; `clipboard_rich = false` sends only plain
   text; `clipboard_max_bytes` limits both directions (`0` = unlimited).
-- `[audio] connect` is an optional audio-port override; normally omit it and
-  derive `host:5903` from `server`.
+- `[input] cursor_grab = true` confines the pointer to the window (SDL mouse
+  grab) and keeps the original absolute motion. It does not change which
+  cursor is drawn: while the window is focused the host cursor is hidden and
+  the guest cursor is shown in the video; losing focus shows the host cursor
+  and hides the guest one. `Ctrl+Alt+Shift+G` only releases/recaptures the
+  confinement.
+- `[audio] connect` is an optional audio-address override; normally omit it
+  and use `server:audio_port`.
 
 Server `~/.config/lgx/server.conf`:
 
 ```ini
 [network]
-listen = 0.0.0.0:5902
-audio_listen = 0.0.0.0:5903
-pair_listen = 0.0.0.0:5904
+interface = enp10s0
+video_port = 5902
+audio_port = 5903
+pair_port = 5904
 
 [video]
 fps = auto
@@ -165,6 +176,8 @@ enabled = true
 enabled = true
 ```
 
+`interface` is the guest interface to bind (find it with `ip -br addr`). All
+listeners bind only that interface's IPv4 address; nothing binds 0.0.0.0.
 Command-line flags override the file for the current run. Missing files are
 created with defaults.
 
@@ -176,22 +189,29 @@ stream on the host. Both are 48 kHz s16le stereo. A muted host sink is the
 only external thing that can silence it; `[audio] mute_unfocused` intentionally
 discards audio while the client window is unfocused.
 
-## Pairing and revocation
+## Pairing and clients
 
 ```bash
 lgx-server --pair --pair-name archlinux
+# server prints a one-time code and the client command
 lgx-client archlinux --pair 192.168.122.25:5904 --pair-code CODE
 lgx-client archlinux
 ```
 
-`--pair` binds the pair port (`0.0.0.0:5904` by default), prints a one-time
-code, accepts one client for three minutes, and exits. The client writes
-`[archlinux]` with `server` and the new token. Without `--pair-name` the
-server generates a random ID, which cannot be launched as a named profile.
+The server prints the code; the client enters it. The code protects the
+X25519/AES-GCM channel used only for pairing; the long-term token and the
+current video/audio ports arrive inside that channel and are written to
+`[archlinux]`. Pairing accepts one client for three minutes and five failed
+attempts.
+
+The server is single-client by design: while one client is connected, another
+video or audio connection is rejected. The client can hold profiles for
+several servers and run one instance per server (the per-host instance lock
+allows different hosts side by side).
 
 ```bash
 lgx-server --list
-lgx-server --revoke archlinux      # ID or name
+lgx-server --revoke archlinux      # remove the paired client
 lgx-server --rotate archlinux      # new token; update client.conf
 ```
 
@@ -201,23 +221,31 @@ under `~/.config/lgx/master.key` (32 random bytes, `0600`). Back up
 The running server reloads the registry every second and closes a revoked
 client's stream immediately.
 
-All traffic — video, input, clipboard and audio — is inside AES-256-GCM
-records. The token is the PSK and is never transmitted in plaintext.
+All video, input, clipboard and audio data is inside AES-256-GCM records; the
+token is the PSK and is never transmitted in plaintext.
 
 ## Hotkeys and clipboard
 
 | key | action |
 |---|---|
-| Ctrl+Shift+Alt+F | toggle fullscreen (never forwarded) |
+| Ctrl+Shift+Alt+F | toggle fullscreen (never forwarded, OSD) |
 | Ctrl+Shift+Alt+M | toggle background audio for this run (OSD) |
-| Ctrl+Alt+Q | quit |
-| Ctrl+Alt+G | release/grab compositor shortcuts |
+| Ctrl+Alt+Shift+G | release/recapture the pointer (OSD) |
+| Ctrl+Alt+Shift+Q | quit |
+
+`[input] cursor_grab = true` (the default) confines the pointer to the window
+with SDL mouse grab while keeping the same absolute motion as before (no
+relative/raw deltas). The client always draws exactly one cursor: while focused
+it hides the host cursor and includes the guest cursor in the video; losing
+focus shows the host cursor and excludes the guest one. `Ctrl+Alt+Shift+G`
+toggles only the pointer confinement; `cursor_grab = false` starts unconfined.
 
 Rich text (`text/html` plus a plain fallback) is synchronized automatically in
 both directions with normal Ctrl+C/Ctrl+V. Files and directories are not
 synchronized; there are no clipboard hotkeys and no paste injection.
 `Ctrl+Shift+Alt+M` is runtime-only and resets to `[audio] mute_unfocused` on
-restart. F9/F10/F11/F12 are ordinary guest keys.
+restart. Audio, pointer capture and fullscreen toggles each show the top-center
+OSD card for 1.6 s. F9/F10/F11/F12 are ordinary guest keys.
 
 ## Gamepads
 

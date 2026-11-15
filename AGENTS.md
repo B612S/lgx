@@ -78,14 +78,23 @@ Commit format: `area: short imperative summary`, for example
   not link Qt.
   `--list`/`--check NAME` inspect profiles without printing tokens. The `<name>` is the profile section selected on the command line.
   `LGX_DEBUG_FPS` still prints per-second diagnostics to stderr.
-- Client hotkeys are `Ctrl+Shift+Alt+F` (fullscreen) and
+- Client hotkeys are `Ctrl+Alt+Shift+G` (release/recapture the pointer), `Ctrl+Shift+Alt+F` (fullscreen),
   `Ctrl+Shift+Alt+M` (runtime-only toggle of background audio, not persisted;
   startup value comes from `[audio] mute_unfocused`; the OSD is a luma-style
   top-center text card (40 px, radius 8, 85% theme background, 20% border)
-  rendered inside the Vulkan swapchain, not a separate window; its font is
+  rendered inside the Vulkan swapchain, not a separate window; audio, pointer
+  and fullscreen toggles all select an OSD card; its font is
   resolved from KDE `kdeglobals` via `fc-match`, then `sans-serif`; point
   size/DPI come from kdegobals/Xft/SDL scale and it is rasterized by FreeType
-  with the fontconfig hintstyle). The
+  with the fontconfig hintstyle) and `Ctrl+Alt+Shift+Q` (quit). There is no
+  manual compositor-shortcut release hotkey. `[input] cursor_grab = true`
+  confines the pointer to the window with SDL mouse grab and keeps the
+  original absolute motion. It must not change cursor visibility: while
+  focused the host cursor is hidden and the guest cursor is composited into
+  the video; focus loss shows the host cursor and excludes the guest cursor.
+  `Ctrl+Alt+Shift+G` toggles only the confinement, and `cursor_grab = false`
+  starts unconfined. Do not use SDL relative mode for this: it changed the
+  pointer feel. The
   keydown/keyup is swallowed and modifier key-ups clear the guest state.
   F9/F10/F11/F12 are ordinary keys and must reach the guest. The window
   decoration's close button must be handled as
@@ -98,24 +107,32 @@ Commit format: `area: short imperative summary`, for example
   `_exit(2)` if the main loop has not advanced for 3 s instead of leaving a
   frozen window.
 - Client profiles: `~/.config/lgx/client.conf` has shared `video`/`audio`/
-  `input` sections plus `[archlinux]`, `[client2]` sections with only `server`
-  and `token`. `[input] gamepads = false` (or `--no-gamepads`) skips the SDL
-  gamepad subsystem and sends no `GAMEPAD` packets; keyboard/mouse are
-  unaffected. `clipboard = false` disables sync, `clipboard_rich = false`
-  forces plain text, and `clipboard_max_bytes` limits both directions (0 =
-  unlimited). Launch with `lgx-client archlinux`; the section name is the public
-  client ID. There is no `[network]`, no `[default]`, no `client_id` field and
-  no config migration. The file is mode 0600. `[audio] connect` is an
-  optional audio-port override; omit it and derive `host:5903` from `server`.
-  Server settings are `~/.config/lgx/server.conf` (`network`, `video`,
-  `audio`, `input`). CLI flags override. `[audio] mute_unfocused = true`
-  discards received audio and outputs silence while the window is unfocused
-  (the native PipeWire playback stream stays active); the secure audio stream
-  is still drained, so the server does not back up.
-- Pairing with a name: `lgx-server --pair --pair-name archlinux` and
-  `lgx-client archlinux --pair HOST:PAIRPORT --pair-code CODE` write
-  `[archlinux]`; token and client id must never go to a global token file
-  again.
+  `input` sections plus `[archlinux]`, `[client2]` sections with `server`,
+  `video_port`, `audio_port`, `pair_port` and `token`. There is no discovery;
+  the client connects exactly to those ports. `[input] gamepads = false` (or
+  `--no-gamepads`) skips the SDL gamepad subsystem and sends no `GAMEPAD`
+  packets; keyboard/mouse are unaffected. `clipboard = false` disables sync,
+  `clipboard_rich = false` forces plain text, and `clipboard_max_bytes` limits
+  both directions (0 = unlimited). `[input] cursor_grab = true` confines the
+  pointer to the window; `Ctrl+Alt+Shift+G` toggles the confinement; cursor
+  visibility stays remote-style (guest cursor while focused, host cursor when
+  unfocused). Launch with
+  `lgx-client archlinux`; the section name is the public client ID. There is no
+  `[network]`, no `[default]`, no `client_id` field and no config migration.
+  The file is mode 0600. `[audio] connect` is an optional audio-address
+  override. Server settings are `~/.config/lgx/server.conf` (`network`,
+  `video`, `audio`, `input`); `network.interface`, `video_port`, `audio_port`
+  and `pair_port` determine the bound interface and ports. CLI flags override.
+  `[audio] mute_unfocused = true` discards received audio and outputs silence
+  while the window is unfocused (the native PipeWire playback stream stays
+  active); the secure audio stream is still drained.
+- Pairing is server-initiated and explicit: `lgx-server --pair
+  --pair-name archlinux` prints a one-time code; the client runs
+  `lgx-client archlinux --pair HOST:PAIRPORT --pair-code CODE`. The code
+  protects the X25519/AES-GCM exchange; the token and the server's current
+  video/audio ports arrive encrypted and are written to the profile. Pairing
+  accepts one client for three minutes and five failed attempts. There is no
+  LAN discovery, list-paired/unpair command or multi-client fan-out.
 - SDL3 gamepads are opened through `GamepadSubsystem`; duplicate
   `ControllerDeviceAdded` events are filtered by device path.
 
@@ -211,33 +228,33 @@ the Vulkan shader converts full-range BT.709, and the HEVC VUI says
   discards received chunks and the process callback drains the ring buffer
   and emits silence; no external process is stopped or left behind.
 
-## Pairing and revocation
+## Pairing and clients
 
-- `lgx-server --pair` is a local admin action. It binds the pair port
-  (`--pair-listen`, default `0.0.0.0:5904`), prints a 32-hex one-time code,
-  accepts exactly one client for three minutes and exits after five failed
-  attempts. It must not become a remote, always-on endpoint.
+- `lgx-server --pair --pair-name NAME` binds the configured pair port on the
+  configured interface, prints a one-time code, accepts one client for three
+  minutes, and exits after five failed attempts. It is a local admin action
+  and must not become an always-on endpoint.
+- The client enters that code with `lgx-client NAME --pair HOST:PAIRPORT
+  --pair-code CODE`; the pairing channel is protected by the code as PSK. The
+  long-term token and the server's current video/audio ports are sent only
+  inside that channel and written to `[NAME]`.
+- The server is single-client: at most one video and one audio connection at
+  a time; a second one is rejected. The client may keep profiles for several
+  servers and run one instance per server host.
 - Per-client registry: `~/.config/lgx/clients`, mode 0600, tab-separated
   `id<TAB>name<TAB>enc:nonce:token-ciphertext<TAB>created`. Tokens are
   AES-256-GCM sealed under `~/.config/lgx/master.key` (32 random bytes, 0600),
   so the registry alone is useless. New tokens are 256-bit; legacy 128-bit
-  tokens are re-encrypted on startup. `clients::ensure` migrates a legacy
-  single-line `token` file into the `default` entry. The registry and master
-  key are the source of truth; do not add a global token path back.
+  tokens are re-encrypted on startup. The registry and master key are the
+  source of truth; do not add a global token path back.
 - Back up `master.key` with the registry. Losing it makes encrypted tokens
   undecryptable and requires re-pairing every client; never log or commit it.
-- Pairing generates a new token and sends `id\ntoken` over the
-  code-authenticated secure channel, waits for `ok`, and only then adds the
-  entry. With `--pair-name NAME` the ID is NAME, so it matches the client
-  section; without it the ID is random. A failed pairing must not create an
-  entry.
+- Pairing generates a new token and sends it over the code-authenticated
+  secure channel, waits for `ok`, and only then adds the entry. A failed
+  pairing must not create an entry.
 - The client sends its ID in a plaintext frame before `LGX1`. The ID is public;
   the server looks up the token in the registry for the handshake. Never send
   the token before the handshake.
-- `lgx-client NAME --pair HOST:PORT --pair-code CODE` receives credentials,
-  verifies that the server ID equals NAME, and writes `[NAME]` in
-  `client.conf` (mode 0600). There is no global client token file and no
-  config migration.
 - `lgx-server --rotate ID|NAME` replaces the token and prints it; the running
   server watches token fingerprints and closes the old session within a
   second. Update the matching `[NAME] token` in `client.conf`.
