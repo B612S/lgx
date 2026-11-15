@@ -93,7 +93,8 @@ lgx-server --listen 0.0.0.0:5902 --bitrate 40000000
 # --no-audio          disable the raw s16le 48 kHz stereo stream
 ```
 
-The shipped server service runs `lgx-server --listen 0.0.0.0:5902 --audio`.
+The shipped server service runs `lgx-server --audio` and takes the interface
+and ports from `~/.config/lgx/server.conf`.
 
 Start the client on the host with a profile name:
 
