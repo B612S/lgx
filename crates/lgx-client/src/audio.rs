@@ -284,12 +284,10 @@ pub fn run(
                 // Underruns are the audible kind of quality problem; surface
                 // them instead of hiding the gaps as silence.
                 let missed = underruns.swap(0, Ordering::Relaxed);
-                if missed > 0 {
-                    eprintln!(
-                        "lgx-client: audio {:.1} KiB/s, {missed} underrun(s)",
-                        total as f64 / 1024.0 / last.elapsed().as_secs_f64()
-                    );
-                }
+                eprintln!(
+                    "lgx-client: audio {:.1} KiB/s, {missed} underrun(s)",
+                    total as f64 / 1024.0 / last.elapsed().as_secs_f64()
+                );
                 total = 0;
                 last = Instant::now();
             }

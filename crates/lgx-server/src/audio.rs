@@ -68,7 +68,11 @@ struct Client {
     secure: Arc<Secure>,
 }
 
-fn capture_thread(capture: Capture, ready: SyncSender<Result<(), String>>) {
+fn capture_thread(
+    capture: Capture,
+    ready: SyncSender<Result<(), String>>,
+    quit: pw::channel::Receiver<()>,
+) {
     let result = (|| -> Result<(), String> {
         pw::init();
         let mainloop = pw::main_loop::MainLoopRc::new(None).map_err(|e| format!("main loop: {e}"))?;
@@ -163,6 +167,10 @@ fn capture_thread(capture: Capture, ready: SyncSender<Result<(), String>>) {
             .map_err(|e| format!("connect: {e}"))?;
 
         let _ = ready.send(Ok(()));
+        let _quit = quit.attach(mainloop.loop_(), {
+            let mainloop = mainloop.clone();
+            move |_| mainloop.quit()
+        });
         mainloop.run();
         Ok(())
     })();
@@ -172,34 +180,46 @@ fn capture_thread(capture: Capture, ready: SyncSender<Result<(), String>>) {
     }
 }
 
-pub fn serve(addr: &str) -> io::Result<()> {
+/// A running PipeWire capture stream plus its fan-out thread. Created when the
+/// first client authenticates and dropped with the last one, so an idle server
+/// keeps no capture stream (and no extra node in the guest mixer).
+struct CaptureHandle {
+    quit: pw::channel::Sender<()>,
+    join: std::thread::JoinHandle<()>,
+    fanout: std::thread::JoinHandle<()>,
+}
+
+fn start_capture(clients: &Arc<Mutex<Vec<Client>>>) -> Result<CaptureHandle, String> {
     let (pcm_tx, pcm_rx) = mpsc::sync_channel::<Vec<u8>>(4);
     let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), String>>(1);
     let dropped = Arc::new(AtomicU64::new(0));
+    let (quit_tx, quit_rx) = pw::channel::channel::<()>();
     let capture = Capture {
         pcm: pcm_tx,
         rng: 0x9E37_79B9_7F4A_7C15,
         dropped: dropped.clone(),
     };
-    std::thread::Builder::new()
+    let join = std::thread::Builder::new()
         .name("lgx-pw-capture".into())
-        .spawn(move || capture_thread(capture, ready_tx))
-        .map_err(|e| io::Error::other(format!("PipeWire capture thread: {e}")))?;
+        .spawn(move || capture_thread(capture, ready_tx, quit_rx))
+        .map_err(|e| format!("PipeWire capture thread: {e}"))?;
     match ready_rx.recv() {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => return Err(io::Error::other(format!("PipeWire capture: {e}"))),
-        Err(_) => return Err(io::Error::other("PipeWire capture thread exited")),
+        Ok(Err(e)) => return Err(format!("PipeWire capture: {e}")),
+        Err(_) => return Err("PipeWire capture thread exited".into()),
     }
-    eprintln!(
-        "lgx-server: audio capture from the default sink monitor (PipeWire, float32 -> s16le dithered)"
-    );
 
-    let clients: Arc<Mutex<Vec<Client>>> = Arc::new(Mutex::new(Vec::new()));
     let listeners = clients.clone();
-    std::thread::Builder::new()
+    let fanout_dropped = dropped.clone();
+    let fanout = std::thread::Builder::new()
         .name("lgx-audio-fanout".into())
         .spawn(move || {
             while let Ok(chunk) = pcm_rx.recv() {
+                let lost = fanout_dropped.swap(0, Ordering::Relaxed);
+                if lost > 0 {
+                    // Audible as a short gap; loud enough to notice in tests.
+                    eprintln!("lgx-server: audio: dropped {lost} chunk(s), client behind");
+                }
                 let mut list = listeners.lock().unwrap();
                 list.retain(|c| match c.tx.try_send(chunk.clone()) {
                     Ok(()) | Err(TrySendError::Full(_)) => true,
@@ -207,7 +227,25 @@ pub fn serve(addr: &str) -> io::Result<()> {
                 });
             }
         })
-        .ok();
+        .map_err(|e| format!("audio fanout thread: {e}"))?;
+
+    eprintln!(
+        "lgx-server: audio capture started (PipeWire monitor, float32 -> s16le dithered)"
+    );
+    Ok(CaptureHandle { quit: quit_tx, join, fanout })
+}
+
+fn stop_capture(handle: CaptureHandle) {
+    let _ = handle.quit.send(());
+    let _ = handle.join.join();
+    // The fan-out ends when the capture thread drops its sender.
+    let _ = handle.fanout.join();
+    eprintln!("lgx-server: audio capture stopped (no clients)");
+}
+
+pub fn serve(addr: &str) -> io::Result<()> {
+    let clients: Arc<Mutex<Vec<Client>>> = Arc::new(Mutex::new(Vec::new()));
+    let capture: Arc<Mutex<Option<CaptureHandle>>> = Arc::new(Mutex::new(None));
 
     let listener = TcpListener::bind(addr)?;
     eprintln!("lgx-server: audio on {addr}");
@@ -219,11 +257,6 @@ pub fn serve(addr: &str) -> io::Result<()> {
             .name("lgx-audio-revoke".into())
             .spawn(move || loop {
                 std::thread::sleep(Duration::from_secs(1));
-                let lost = dropped.swap(0, Ordering::Relaxed);
-                if lost > 0 {
-                    // Audible as a short gap; loud enough to notice in tests.
-                    eprintln!("lgx-server: audio: dropped {lost} chunk(s), client behind");
-                }
                 let Ok(list) = crate::clients::load() else { continue };
                 let valid: HashSet<String> = list.into_iter().map(|e| e.id).collect();
                 let mut clients = clients.lock().unwrap();
@@ -247,10 +280,11 @@ pub fn serve(addr: &str) -> io::Result<()> {
             continue;
         }
         let clients = clients.clone();
+        let capture = capture.clone();
         std::thread::Builder::new()
             .name("lgx-audio-client".into())
             .spawn(move || {
-                if let Err(e) = handle(stream, clients) {
+                if let Err(e) = handle(stream, clients, capture) {
                     eprintln!("lgx-server: audio client: {e}");
                 }
             })
@@ -259,7 +293,11 @@ pub fn serve(addr: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn handle(mut stream: TcpStream, clients: Arc<Mutex<Vec<Client>>>) -> io::Result<()> {
+fn handle(
+    mut stream: TcpStream,
+    clients: Arc<Mutex<Vec<Client>>>,
+    capture: Arc<Mutex<Option<CaptureHandle>>>,
+) -> io::Result<()> {
     let client_id = secure::server_read_id(&mut stream)?;
     let token = match clients::token_for(&client_id)? {
         Some(t) => t,
@@ -278,17 +316,54 @@ fn handle(mut stream: TcpStream, clients: Arc<Mutex<Vec<Client>>>) -> io::Result
     }
 
     let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(4);
-    clients.lock().unwrap().push(Client {
-        id: client_id,
-        tx,
-        secure: secure.clone(),
-    });
+    {
+        // Start capturing only now: an idle server must not hold a PipeWire
+        // stream (and the guest must not keep its sink awake for nobody).
+        let started = {
+            let mut slot = capture.lock().unwrap();
+            if slot.is_none() {
+                match start_capture(&clients) {
+                    Ok(handle) => {
+                        *slot = Some(handle);
+                        true
+                    }
+                    Err(e) => {
+                        eprintln!("lgx-server: audio: capture unavailable: {e}");
+                        false
+                    }
+                }
+            } else {
+                true
+            }
+        };
+        if !started {
+            secure.close();
+            return Ok(());
+        }
+        clients.lock().unwrap().push(Client {
+            id: client_id,
+            tx,
+            secure: secure.clone(),
+        });
+    }
     while let Ok(chunk) = rx.recv() {
         if secure.send_bytes(&chunk).is_err() {
             break;
         }
     }
     secure.close();
+    // Unregister, then stop capturing if this was the last listener.
+    let empty = {
+        let mut list = clients.lock().unwrap();
+        list.retain(|c| !Arc::ptr_eq(&c.secure, &secure));
+        list.is_empty()
+    };
+    if empty {
+        let handle = capture.lock().unwrap().take();
+        if let Some(handle) = handle {
+            stop_capture(handle);
+        }
+    }
     Ok(())
 }
 
