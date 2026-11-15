@@ -65,6 +65,21 @@ your GPU's Vulkan driver.
 The server looks for the encoder helper at `/usr/lib/lgx/lgx-vaenc`. From a
 source tree, set `LGX_VAENC=$PWD/lgx-vaenc`.
 
+## Packaging
+
+```bash
+./packaging/build.sh                # both packages
+./packaging/build.sh lgx-client     # a single package
+```
+
+`build.sh` archives the committed tree as `packaging/lgx-<version>.tar.gz`
+(it refuses to package a dirty working tree), builds the PKGBUILDs under
+`packaging/`, and leaves the finished `*.pkg.tar.zst` files in the project
+root. makepkg's `src`/`pkg` work trees go to `target/pkgbuild`, so `packaging/`
+only ever holds PKGBUILDs, unit files and the desktop entry. Bump `pkgrel` in
+the PKGBUILD before a rebuild meant to replace an installed package; the
+script stops instead of producing a version older than the one pacman has.
+
 ## Usage
 
 Start the server inside the guest's graphical session:

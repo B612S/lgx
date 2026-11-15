@@ -294,7 +294,17 @@ the Vulkan shader converts full-range BT.709, and the HEVC VUI says
 cargo build --release
 cargo test --workspace
 gcc -O2 -o lgx-vaenc helper/lgx-vaenc.c -lavcodec -lavutil -lva -lva-drm
+./packaging/build.sh
 ```
+
+Packaging layout: `packaging/build.sh` builds `lgx-client` and `lgx-server`
+from the committed tree and puts the `*.pkg.tar.zst` files in the repository
+root. `make-source.sh` writes the only source tarball,
+`packaging/lgx-<version>.tar.gz`, and refuses a dirty tree. makepkg's work
+trees belong in `target/pkgbuild` (git-ignored); never commit or keep
+`packaging/*/src`, `packaging/*/pkg` or per-package copies of the tarball.
+Bump `pkgrel` in a PKGBUILD for every rebuild; the build script fails when the
+result would be older than the installed package.
 
 Manual check on the VM:
 
