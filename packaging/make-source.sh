@@ -11,4 +11,9 @@ if ! git diff --quiet || ! git diff --cached --quiet; then
   exit 1
 fi
 git archive --prefix="lgx-$ver/" -o "packaging/lgx-$ver.tar.gz" HEAD
+# Only the tarball for the current version is kept.
+for old in packaging/lgx-*.tar.gz; do
+  [ -e "$old" ] || continue
+  [ "$old" = "packaging/lgx-$ver.tar.gz" ] || rm -f "$old"
+done
 echo "packaging/lgx-$ver.tar.gz"
