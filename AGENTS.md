@@ -217,8 +217,12 @@ the Vulkan shader converts full-range BT.709, and the HEVC VUI says
   `Audio/Capture` stream with `stream.capture.sink = true` and `AUTOCONNECT`
   so it captures the default sink monitor, not the default source
   (microphone); the client opens an `Audio/Playback` stream with
-  `AUTOCONNECT`. Both request 48 kHz s16le stereo via an `AudioInfoRaw` format
-  pod. The client's stream carries `application.name = lgx - <profile>`,
+  `AUTOCONNECT`. The server captures **float32** (the graph's native format,
+  so PipeWire converts nothing) and converts to s16le 48 kHz stereo itself
+  with TPDF dither (`audio::f32_to_s16_dithered`, scale 2^15, then clamp) —
+  that is the only quantization step, so do not hand the conversion back to
+  PipeWire. The client requests s16le and counts playback underruns; both use
+  an `AudioInfoRaw` format pod. The client's stream carries `application.name = lgx - <profile>`,
   `media.name = lgx audio (<profile>)`, `application.process.binary =
   lgx-client` and `application.icon_name = lgx`; host mixers show the profile
   like the window title. Also set `node.name` and `node.description` to

@@ -31,7 +31,8 @@ override.
   queue of stale frames.
 - Input through kernel `uinput`, absolute pointer, up to four hot-plugged
   gamepads, and rich-text clipboard.
-- Native PipeWire audio: 48 kHz stereo from the guest's default sink monitor
+- Native PipeWire audio: float32 capture from the guest's default sink monitor,
+  dithered once to 48 kHz s16le stereo on the wire
   to the host's default sink. No `pacat`, `parec` or PulseAudio layer.
 - Per-client tokens, AES-256-GCM transport, and revocation at runtime.
 - Window title `lgx — <profile>`; FPS/bandwidth diagnostics behind
@@ -202,8 +203,13 @@ created with defaults.
 ## Audio
 
 Audio is captured from the default sink monitor by a native PipeWire capture
-stream (`stream.capture.sink = true`) and played by a native PipeWire playback
-stream on the host. Both are 48 kHz s16le stereo. A muted host sink is the
+stream (`stream.capture.sink = true`) in float32, the graph's native format, so
+PipeWire does no conversion on capture. The server performs the single
+float32 to s16le step itself with TPDF dither, which turns quantization into
+noise instead of low-level distortion; the wire format stays 48 kHz s16le
+stereo and the host plays it through a native PipeWire playback stream. The
+client counts playback underruns and prints them in its five-second audio
+statistics, so dropouts show up instead of silently becoming gaps. A muted host sink is the
 only external thing that can silence it; `[audio] mute_unfocused` intentionally
 discards audio while the client window is unfocused.
 
