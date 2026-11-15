@@ -5,7 +5,7 @@ PartOf=graphical-session.target
 
 [Service]
 Environment=WAYLAND_DISPLAY=wayland-1
-ExecStart=/usr/bin/lgx-server --listen 0.0.0.0:5902 --audio
+ExecStart=/usr/bin/lgx-server --audio
 Restart=on-failure
 RestartSec=2
 
