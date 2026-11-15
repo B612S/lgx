@@ -56,6 +56,9 @@ struct Staging {
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
     ptr: *mut u8,
+    /// Row length in texels (bytes for R8, 2-byte pairs for R8G8) the buffer
+    /// was sized for, so padded decoder rows can be copied in one memcpy.
+    pitch: u32,
 }
 
 pub struct Renderer {
@@ -474,7 +477,13 @@ impl Renderer {
                     return false;
                 }
             }
-            self.upload(frame.width, frame.height, nv.y, nv.y_stride, nv.uv, nv.uv_stride);
+            if nv.y_stride != self.stage_y.pitch || nv.uv_stride / 2 != self.stage_uv.pitch {
+                if let Err(e) = self.resize_staging(frame.width, frame.height, nv.y_stride, nv.uv_stride) {
+                    eprintln!("lgx-client: Vulkan staging: {e}");
+                    return false;
+                }
+            }
+            self.upload(frame.height, nv.y, nv.uv);
             match self.present(win) {
                 Ok(()) => true,
                 Err(e) => {
@@ -485,48 +494,46 @@ impl Renderer {
         }
     }
 
-    unsafe fn upload(
+    unsafe fn upload(&mut self, h: u32, y: *const u8, uv: *const u8) {
+        // Rows keep the decoder's stride and the copy into the image uses
+        // `buffer_row_length`, so each plane is one contiguous memcpy even
+        // when the decoder pads it.
+        let y_bytes = (self.stage_y.pitch as usize) * (h as usize);
+        std::ptr::copy_nonoverlapping(y, self.stage_y.ptr, y_bytes);
+        let uv_bytes = (self.stage_uv.pitch as usize) * 2 * (h as usize / 2);
+        std::ptr::copy_nonoverlapping(uv, self.stage_uv.ptr, uv_bytes);
+    }
+
+    /// Sizes the staging buffers for the decoder's current row pitch.
+    unsafe fn resize_staging(
         &mut self,
         w: u32,
         h: u32,
-        y: *const u8,
         y_stride: u32,
-        uv: *const u8,
         uv_stride: u32,
-    ) {
-        // The decoder usually pads rows to an aligned stride. When there is
-        // no padding the plane is contiguous and one large memcpy is much
-        // cheaper than one call per row.
-        if y_stride as usize == w as usize {
-            std::ptr::copy_nonoverlapping(
-                y,
-                self.stage_y.ptr,
-                (w as usize) * (h as usize),
-            );
-        } else {
-            for row in 0..h as usize {
-                std::ptr::copy_nonoverlapping(
-                    y.add(row * y_stride as usize),
-                    self.stage_y.ptr.add(row * w as usize),
-                    w as usize,
-                );
-            }
-        }
-        if uv_stride as usize == w as usize {
-            std::ptr::copy_nonoverlapping(
-                uv,
-                self.stage_uv.ptr,
-                (w as usize) * (h as usize / 2),
-            );
-        } else {
-            for row in 0..(h / 2) as usize {
-                std::ptr::copy_nonoverlapping(
-                    uv.add(row * uv_stride as usize),
-                    self.stage_uv.ptr.add(row * w as usize),
-                    w as usize,
-                );
-            }
-        }
+    ) -> Result<(), String> {
+        // Only called when the pitch changed, which happens once per format.
+        self.device.device_wait_idle().map_err(|e| format!("wait idle: {e:?}"))?;
+        destroy_staging(&self.device, &mut self.stage_y);
+        destroy_staging(&self.device, &mut self.stage_uv);
+        self.stage_y = create_staging(
+            &self.device,
+            &self.instance,
+            self.physical,
+            y_stride,
+            h,
+            1,
+        )?;
+        let uv_texels = (uv_stride / 2).max(w / 2);
+        self.stage_uv = create_staging(
+            &self.device,
+            &self.instance,
+            self.physical,
+            uv_texels,
+            h / 2,
+            2,
+        )?;
+        Ok(())
     }
 
     unsafe fn resize_textures(&mut self, w: u32, h: u32) -> Result<(), String> {
@@ -767,7 +774,7 @@ impl Renderer {
         );
         let y_region = [vk::BufferImageCopy::default()
             .buffer_offset(0)
-            .buffer_row_length(0)
+            .buffer_row_length(self.stage_y.pitch)
             .buffer_image_height(0)
             .image_subresource(
                 vk::ImageSubresourceLayers::default()
@@ -786,7 +793,7 @@ impl Renderer {
         );
         let uv_region = [vk::BufferImageCopy::default()
             .buffer_offset(0)
-            .buffer_row_length(0)
+            .buffer_row_length(self.stage_uv.pitch)
             .buffer_image_height(0)
             .image_subresource(
                 vk::ImageSubresourceLayers::default()
@@ -1337,7 +1344,7 @@ fn create_rgba_texture(
         std::ptr::copy_nonoverlapping(rgba.as_ptr(), ptr, (w as usize) * (h as usize) * 4);
         Ok((
             Texture { image, view, memory, width: w.max(1), height: h.max(1) },
-            Staging { buffer, memory: bmem, ptr },
+            Staging { buffer, memory: bmem, ptr, pitch: 0 },
         ))
     }
 }
@@ -1511,44 +1518,55 @@ fn create_texture(
                 None,
             )
             .map_err(|e| format!("image view: {e:?}"))?;
-        let stage_size = if luma {
-            (w as u64) * (h as u64)
-        } else {
-            (w as u64) * (h as u64) / 2
-        };
-        let buffer = device
-            .create_buffer(
-                &vk::BufferCreateInfo::default()
-                    .size(stage_size)
-                    .usage(vk::BufferUsageFlags::TRANSFER_SRC)
-                    .sharing_mode(vk::SharingMode::EXCLUSIVE),
-                None,
-            )
-            .map_err(|e| format!("staging buffer: {e:?}"))?;
-        let breq = device.get_buffer_memory_requirements(buffer);
-        let btype = find_memory(
-            instance,
-            pd,
-            breq.memory_type_bits,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        )?;
-        let bmem = device
-            .allocate_memory(
-                &vk::MemoryAllocateInfo::default()
-                    .allocation_size(breq.size)
-                    .memory_type_index(btype),
-                None,
-            )
-            .map_err(|e| format!("staging memory: {e:?}"))?;
-        device.bind_buffer_memory(buffer, bmem, 0).map_err(|e| format!("bind staging: {e:?}"))?;
-        let ptr = device
-            .map_memory(bmem, 0, breq.size, vk::MemoryMapFlags::empty())
-            .map_err(|e| format!("map staging: {e:?}"))? as *mut u8;
-        Ok((
-            Texture { image, view, memory, width: tw.max(1), height: th.max(1) },
-            Staging { buffer, memory: bmem, ptr },
-        ))
+        let text = Texture { image, view, memory, width: tw.max(1), height: th.max(1) };
+        // Start with tightly packed rows; a padded decoder stride resizes the
+        // staging buffer on the first frame.
+        let texel_bytes = if luma { 1 } else { 2 };
+        let staging = create_staging(device, instance, pd, tw, th, texel_bytes)?;
+        Ok((text, staging))
     }
+}
+
+/// Creates a host-visible staging buffer for `rows` rows of `pitch` texels
+/// (`texel_bytes` bytes each) and maps it.
+unsafe fn create_staging(
+    device: &ash::Device,
+    instance: &ash::Instance,
+    pd: vk::PhysicalDevice,
+    pitch: u32,
+    rows: u32,
+    texel_bytes: u32,
+) -> Result<Staging, String> {
+    let size = (pitch as u64) * (rows as u64) * (texel_bytes as u64);
+    let buffer = device
+        .create_buffer(
+            &vk::BufferCreateInfo::default()
+                .size(size)
+                .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE),
+            None,
+        )
+        .map_err(|e| format!("staging buffer: {e:?}"))?;
+    let breq = device.get_buffer_memory_requirements(buffer);
+    let btype = find_memory(
+        instance,
+        pd,
+        breq.memory_type_bits,
+        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+    )?;
+    let bmem = device
+        .allocate_memory(
+            &vk::MemoryAllocateInfo::default()
+                .allocation_size(breq.size)
+                .memory_type_index(btype),
+            None,
+        )
+        .map_err(|e| format!("staging memory: {e:?}"))?;
+    device.bind_buffer_memory(buffer, bmem, 0).map_err(|e| format!("bind staging: {e:?}"))?;
+    let ptr = device
+        .map_memory(bmem, 0, breq.size, vk::MemoryMapFlags::empty())
+        .map_err(|e| format!("map staging: {e:?}"))? as *mut u8;
+    Ok(Staging { buffer, memory: bmem, ptr, pitch })
 }
 
 fn find_memory(
@@ -1642,5 +1660,10 @@ unsafe fn destroy_staging(device: &ash::Device, s: &mut Staging) {
     }
     device.destroy_buffer(s.buffer, None);
     device.free_memory(s.memory, None);
-    *s = Staging { buffer: vk::Buffer::null(), memory: vk::DeviceMemory::null(), ptr: std::ptr::null_mut() };
+    *s = Staging {
+        buffer: vk::Buffer::null(),
+        memory: vk::DeviceMemory::null(),
+        ptr: std::ptr::null_mut(),
+        pitch: 0,
+    };
 }

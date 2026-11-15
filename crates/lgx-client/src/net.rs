@@ -123,22 +123,28 @@ fn reader(
     clipboard: ClipPolicy,
 ) {
     loop {
-        let (m, payload) = match secure.recv_msg() {
+        let (m, payload) = match secure.recv_msg_raw() {
             Ok(v) => v,
             Err(_) => break,
         };
+        let body = &payload[secure::MSG_HEADER..];
         match m.typ {
             msg::VIDEO => {
-                conn.bytes.fetch_add(payload.len() as u64, Ordering::Relaxed);
-                if video.send(Chunk { data: payload, at: std::time::Instant::now() }).is_err() {
+                conn.bytes.fetch_add(body.len() as u64, Ordering::Relaxed);
+                let chunk = Chunk {
+                    data: payload,
+                    off: secure::MSG_HEADER,
+                    at: std::time::Instant::now(),
+                };
+                if video.send(chunk).is_err() {
                     break;
                 }
             }
             msg::CLIP_DATA_HTML => {
-                if !clipboard.allows(payload.len()) {
+                if !clipboard.allows(body.len()) {
                     continue;
                 }
-                if let Some((html, text)) = lgx_proto::decode_rich(&payload) {
+                if let Some((html, text)) = lgx_proto::decode_rich(body) {
                     if clipboard.rich {
                         *last_remote.lock().unwrap() =
                             crate::clip::signature(&crate::clip::Clip::Rich {
@@ -157,10 +163,10 @@ fn reader(
                 }
             }
             msg::CLIP_DATA => {
-                if !clipboard.allows(payload.len()) {
+                if !clipboard.allows(body.len()) {
                     continue;
                 }
-                let text = String::from_utf8_lossy(&payload).to_string();
+                let text = String::from_utf8_lossy(body).to_string();
                 *last_remote.lock().unwrap() = text.clone();
                 if let Err(e) = crate::clip::set_text(&text) {
                     eprintln!("lgx-client: wl-copy: {e}");

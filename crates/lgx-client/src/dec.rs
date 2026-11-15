@@ -92,7 +92,10 @@ extern "C" {
 
 /// One encoded chunk received from the server.
 pub struct Chunk {
+    /// Secure-message bytes including the 12-byte header; the access unit
+    /// starts at `off` so receiving a packet costs no copy.
     pub data: Vec<u8>,
+    pub off: usize,
     pub at: Instant,
 }
 
@@ -392,7 +395,7 @@ pub fn spawn(
             while let Ok(chunk) = rx.recv() {
                 // A packet can be refused until pending frames are pulled.
                 loop {
-                    match dec.push(&chunk.data, pts) {
+                    match dec.push(&chunk.data[chunk.off..], pts) {
                         Ok(true) => break,
                         Ok(false) => {
                             if let Err(e) = drain(&mut dec, &sink, chunk.at, &wake) {
