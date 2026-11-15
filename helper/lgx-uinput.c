@@ -237,7 +237,11 @@ int main(int argc, char **argv) {
                 int down = rest[2];
                 int r = emit(cmd == 'K' ? kbd : mouse, EV_KEY, code, down);
                 int r2 = sync_event(cmd == 'K' ? kbd : mouse);
-                fprintf(stderr, "uinput: key code=%u down=%d write=%d sync=%d errno=%d\n", code, down, r, r2, errno);
+                // One journal line per keystroke is far too chatty for a
+                // remote desktop; keep it behind a debug switch.
+                if (r < 0 || r2 < 0) {
+                    fprintf(stderr, "uinput: key code=%u down=%d write=%d sync=%d errno=%d\n", code, down, r, r2, errno);
+                }
             } else if (cmd == 'M') {
                 int32_t d[2];
                 if (read_all(c, d, sizeof(d)) < 0) break;
