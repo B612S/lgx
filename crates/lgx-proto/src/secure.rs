@@ -176,22 +176,24 @@ impl Secure {
             .recv
             .lock()
             .map_err(|_| io::Error::other("secure recv lock"))?;
-        let mut len = [0u8; 4];
-        st.stream.read_exact(&mut len)?;
-        let total = u32::from_le_bytes(len) as usize;
+        // Record length and the first chunk length arrive together, so a
+        // single-chunk record (video, input, audio) costs two reads instead
+        // of three.
+        let mut head = [0u8; 8];
+        st.stream.read_exact(&mut head)?;
+        let total = u32::from_le_bytes([head[0], head[1], head[2], head[3]]) as usize;
         if total > MAX_RECORD {
             return Err(io::Error::other("secure record too large"));
         }
         if total == 0 {
             return Ok(Vec::new());
         }
+        let mut next_len = [head[4], head[5], head[6], head[7]];
         let mut out = Vec::with_capacity(total);
         let RecvState { stream, key, nonce, buf } = &mut *st;
         let mut idx = 0u32;
         while out.len() < total {
-            let mut clen = [0u8; 4];
-            stream.read_exact(&mut clen)?;
-            let ct_len = u32::from_le_bytes(clen) as usize;
+            let ct_len = u32::from_le_bytes(next_len) as usize;
             if ct_len <= 16 || ct_len > CHUNK + 16 {
                 return Err(io::Error::other("bad secure chunk"));
             }
@@ -218,6 +220,11 @@ impl Secure {
             out.extend_from_slice(pt);
             *nonce = nonce.checked_add(1).ok_or_else(crypto_err)?;
             idx += 1;
+            if out.len() < total {
+                // Only multi-chunk records (clipboard, large payloads) read
+                // the following chunk lengths separately.
+                stream.read_exact(&mut next_len)?;
+            }
         }
         Ok(out)
     }

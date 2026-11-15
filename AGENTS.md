@@ -316,6 +316,7 @@ cargo build --release
 cargo test --workspace
 gcc -O2 -o lgx-vaenc helper/lgx-vaenc.c -lavcodec -lavutil -lva -lva-drm
 scripts/check.sh          # build + tests + both C helpers, run before pushing
+# CI runs the same script in an archlinux:latest container
 ./packaging/build.sh
 ```
 
