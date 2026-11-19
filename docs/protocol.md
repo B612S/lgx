@@ -36,6 +36,17 @@ the header and its length is in `a`.
 | 13 | CURSOR | `code` = 1 overlay the guest pointer, 0 draw locally | — |
 | 14 | PING | — | — |
 | 18 | GAMEPAD | `a` = 24 | one gamepad snapshot |
+| 23 | IDR | — | client asks for an immediate keyframe |
+| 24 | CURSOR_IMAGE | `a` = length | u32 LE width, height, i32 LE hotspot_x/y, then RGBA8 pixels |
+| 25 | CURSOR_SHAPE | — | client asks for cursor shapes |
+
+`CURSOR_IMAGE` is used by servers that ask the client to draw the pointer
+locally (`CURSOR_LOCAL`). The payload is top-down, straight-alpha RGBA: the
+client installs it as its local cursor, so a resize/move/wait cursor is visible
+without compositing the pointer into the video. A client opts in with
+`CURSOR_SHAPE`; the server replies with the current shape and then sends a new
+`CURSOR_IMAGE` whenever it changes. This keeps older clients compatible: they
+never request the message, so they never see an unknown payload type.
 
 ## Handshake
 

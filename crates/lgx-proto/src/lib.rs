@@ -43,6 +43,13 @@ pub mod msg {
     /// Client asks for an immediate keyframe after it had to drop packets, so
     /// the HEVC reference chain heals without waiting for the next GOP.
     pub const IDR: u8 = 23;
+    /// Cursor shape for a locally drawn pointer. Payload: u32 LE width,
+    /// u32 LE height, i32 LE hotspot_x, i32 LE hotspot_y, then RGBA pixels
+    /// (top-down, straight alpha).
+    pub const CURSOR_IMAGE: u8 = 24;
+    /// Client asks the server to send cursor shapes. Clients that do not send
+    /// this never receive CURSOR_IMAGE, so older clients keep working.
+    pub const CURSOR_SHAPE: u8 = 25;
     pub const GAMEPAD_LEN: usize = 24;
 }
 
@@ -106,7 +113,8 @@ pub fn payload_len(m: &Msg) -> usize {
         | msg::CLIP_DATA_HTML
         | msg::FILE_BEGIN
         | msg::FILE_DATA
-        | msg::GAMEPAD => m.a.max(0) as usize,
+        | msg::GAMEPAD
+        | msg::CURSOR_IMAGE => m.a.max(0) as usize,
         _ => 0,
     }
 }
