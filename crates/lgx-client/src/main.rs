@@ -648,6 +648,10 @@ fn main() {
 
     let sdl = sdl3::init().expect("SDL");
     let video = sdl.video().expect("SDL video");
+    // Let the click that focuses the window reach the guest. Otherwise the
+    // compositor swallows the first click after focus loss, which looks like
+    // a dead remote mouse until the window is recreated.
+    sdl3::hint::set(sdl3::hint::names::MOUSE_FOCUS_CLICKTHROUGH, "1");
     if let Err(e) = video.vulkan_load_library_default() {
         eprintln!("lgx-client: cannot load Vulkan: {e}");
         std::process::exit(1);
@@ -1023,7 +1027,17 @@ fn main() {
                         let _ = conn.send(Msg::new(msg::MOTION, 0, nx, ny), &[]);
                     }
                 }
-                Event::MouseButtonDown { mouse_btn, .. } => {
+                Event::MouseButtonDown { mouse_btn, x, y, .. } => {
+                    // The server presses at the last motion it saw. Re-send
+                    // the position so a click after a resize, a fullscreen
+                    // toggle or a skipped motion lands where the pointer is.
+                    if dst.w > 0 && dst.h > 0 {
+                        let nx = (((x - dst.x as f32) / dst.w as f32) * 65535.0)
+                            .clamp(0.0, 65535.0) as i32;
+                        let ny = (((y - dst.y as f32) / dst.h as f32) * 65535.0)
+                            .clamp(0.0, 65535.0) as i32;
+                        let _ = conn.send(Msg::new(msg::MOTION, 0, nx, ny), &[]);
+                    }
                     if let Some(code) = btn_code(mouse_btn) {
                         let _ = conn.send(Msg::new(msg::BTN, code, 1, 0), &[]);
                     }
