@@ -21,10 +21,28 @@ pub const HID_TO_EVDEV: [u16; 256] = [
 ];
 
 pub fn evdev_from_scancode(sc: i32) -> Option<u16> {
-    if !(1..256).contains(&sc) {
-        return None;
-    }
-    let code = HID_TO_EVDEV[sc as usize];
+    // SDL scancodes 262..=272 are the consumer/media page, above the 8-bit
+    // HID keyboard page covered by HID_TO_EVDEV. They are passed through
+    // unchanged by the caller's `& 0x1ff` mask.
+    let code = match sc {
+        262 => 207, // play
+        263 => 164, // pause (play/pause on the wire)
+        264 => 167, // record
+        265 => 208, // fast forward
+        266 => 168, // rewind
+        267 => 163, // next track
+        268 => 165, // previous track
+        269 => 166, // stop
+        270 => 161, // eject
+        271 => 164, // play/pause
+        272 => 226, // media select
+        _ => {
+            if !(1..256).contains(&sc) {
+                return None;
+            }
+            HID_TO_EVDEV[sc as usize]
+        }
+    };
     if code == 0 || code == 240 {
         None
     } else {
@@ -53,6 +71,11 @@ mod tests {
         assert_eq!(evdev_from_scancode(58), Some(59)); // F1
         assert_eq!(evdev_from_scancode(68), Some(87)); // F11
         assert_eq!(evdev_from_scancode(69), Some(88)); // F12
+        assert_eq!(evdev_from_scancode(127), Some(113)); // mute
+        assert_eq!(evdev_from_scancode(128), Some(115)); // volume up
+        assert_eq!(evdev_from_scancode(129), Some(114)); // volume down
+        assert_eq!(evdev_from_scancode(267), Some(163)); // next track
+        assert_eq!(evdev_from_scancode(271), Some(164)); // play/pause
     }
 
     #[test]
