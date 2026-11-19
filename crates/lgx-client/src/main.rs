@@ -404,27 +404,33 @@ fn main() {
         width: args
             .size
             .map(|(w, _)| w)
-            .or_else(|| cfg.get_u32("width")),
+            .or_else(|| cfg.get_u32_for(&args.name, "width")),
         height: args
             .size
             .map(|(_, h)| h)
-            .or_else(|| cfg.get_u32("height")),
+            .or_else(|| cfg.get_u32_for(&args.name, "height")),
         fullscreen: args
             .fullscreen
-            .or_else(|| cfg.get_bool("fullscreen"))
+            .or_else(|| cfg.get_bool_for(&args.name, "fullscreen"))
             .unwrap_or(false),
-        vsync: args.vsync.or_else(|| cfg.get_bool("vsync")).unwrap_or(false),
+        vsync: args
+            .vsync
+            .or_else(|| cfg.get_bool_for(&args.name, "vsync"))
+            .unwrap_or(false),
         present_hz: args
             .present_hz
             .clone()
-            .or_else(|| cfg.get("present_hz").map(str::to_string))
+            .or_else(|| cfg.get_for(&args.name, "present_hz").map(str::to_string))
             .unwrap_or_else(|| "0".to_string()),
-        audio: args.audio.or_else(|| cfg.get_bool("audio")).unwrap_or(false),
+        audio: args
+            .audio
+            .or_else(|| cfg.get_bool_for(&args.name, "audio"))
+            .unwrap_or(false),
         audio_connect: args
             .audio_connect
             .clone()
             .or_else(|| {
-                cfg.get("audio_connect")
+                cfg.get_for(&args.name, "audio_connect")
                     .filter(|v| !v.is_empty())
                     .map(str::to_string)
             }),
@@ -433,28 +439,34 @@ fn main() {
         decoder: args
             .decoder
             .clone()
-            .or_else(|| cfg.get("decoder").map(str::to_string))
+            .or_else(|| cfg.get_for(&args.name, "decoder").map(str::to_string))
             .unwrap_or_else(|| "auto".to_string()),
         cursor_grab: args
             .cursor_grab
-            .or_else(|| cfg.get_bool("cursor_grab"))
+            .or_else(|| cfg.get_bool_for(&args.name, "cursor_grab"))
             .unwrap_or(true),
         gamepads: args
             .gamepads
-            .or_else(|| cfg.get_bool("gamepads"))
+            .or_else(|| cfg.get_bool_for(&args.name, "gamepads"))
             .unwrap_or(true),
-        clipboard: args.clipboard.or_else(|| cfg.get_bool("clipboard")).unwrap_or(true),
+        clipboard: args
+            .clipboard
+            .or_else(|| cfg.get_bool_for(&args.name, "clipboard"))
+            .unwrap_or(true),
         clipboard_rich: args
             .clipboard_rich
-            .or_else(|| cfg.get_bool("clipboard_rich"))
+            .or_else(|| cfg.get_bool_for(&args.name, "clipboard_rich"))
             .unwrap_or(true),
         clipboard_max_bytes: args
             .clipboard_max
-            .or_else(|| cfg.get_u32("clipboard_max_bytes").map(|v| v as usize))
+            .or_else(|| {
+                cfg.get_u32_for(&args.name, "clipboard_max_bytes")
+                    .map(|v| v as usize)
+            })
             .unwrap_or(1024 * 1024),
         mute_unfocused: args
             .mute_unfocused
-            .or_else(|| cfg.get_bool("mute_unfocused"))
+            .or_else(|| cfg.get_bool_for(&args.name, "mute_unfocused"))
             .unwrap_or(true),
         reconnect: args.connections,
     };

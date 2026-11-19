@@ -148,13 +148,21 @@ video_port = 5902
 audio_port = 5903
 pair_port = 5904
 token = <token>
+# Optional overrides of the shared sections, only for this profile.
+vsync = true
+mute_unfocused = false
+clipboard = false
 ```
 
 `lgx-client archlinux` selects the `[archlinux]` section; the section name is
 also the public client ID. `[video]`, `[audio]` and `[input]` are shared;
 each profile has `server`, `video_port`, `audio_port`, `pair_port` and
-`token`. The file contains tokens and is `0600`. The ports are explicit;
-there is no discovery.
+`token`, and may override any shared setting. An override in the profile
+section wins over the global section, and command-line flags still win over
+both. A profile can use the bare key (`vsync`), the section-qualified key
+(`video.vsync`), or the field name used inside the global section (`enabled`
+for `[audio] enabled`). The file contains tokens and is `0600`. The ports are
+explicit; there is no discovery.
 
 - `mute_unfocused = true` discards received audio and emits silence while the
   client window is unfocused; the native PipeWire stream stays active.

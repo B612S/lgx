@@ -112,7 +112,10 @@ Commit format: `area: short imperative summary`, for example
   frozen window.
 - Client profiles: `~/.config/lgx/client.conf` has shared `video`/`audio`/
   `input` sections plus `[archlinux]`, `[client2]` sections with `server`,
-  `video_port`, `audio_port`, `pair_port` and `token`. There is no discovery;
+  `video_port`, `audio_port`, `pair_port` and `token`. A profile may override
+  any shared setting (bare key such as `vsync`, qualified `video.vsync`, or
+  the global field name such as `enabled`); CLI flags still win over the
+  profile and the profile wins over the global section. There is no discovery;
   the client connects exactly to those ports. `[input] gamepads = false` (or
   `--no-gamepads`) skips the SDL gamepad subsystem and sends no `GAMEPAD`
   packets; keyboard/mouse are unaffected. `clipboard = false` disables sync,
