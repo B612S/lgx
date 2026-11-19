@@ -24,6 +24,7 @@
 #include <stdarg.h>
 #include <sys/types.h>
 #include <time.h>
+#include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -222,6 +223,30 @@ static void post_key(unsigned short evdev, int down) {
 // otherwise macOS moves the pointer but leaves the grabbed window behind.
 static int dragging = 0;   // 0 none, 1 left, 2 right, 3 other
 
+// The system cursor can lag behind a burst of warps, so button events use the
+// last position the client sent. The click then lands where the user sees the
+// pointer even when a warp is throttled.
+static int g_have_motion = 0;
+static CGPoint g_motion_point = {0, 0};
+
+// Synthetic mouse events carry their own click count: macOS does not derive
+// double/triple clicks for injected events, and always sending 1 makes every
+// press a single click. Track each button separately.
+typedef struct {
+    double last_down;
+    double down_posted;
+    CGPoint point;
+    int count;
+} ClickState;
+
+static ClickState g_clicks[3];
+
+static double now_sec(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
 static void post_button(unsigned short evdev, int down) {
     CGMouseButton button;
     CGEventType type;
@@ -231,9 +256,33 @@ static void post_button(unsigned short evdev, int down) {
         case 0x112: button = kCGMouseButtonCenter; type = down ? kCGEventOtherMouseDown : kCGEventOtherMouseUp; break;
         default: return;
     }
-    CGEventRef cur = CGEventCreate(NULL);
-    CGPoint loc = cur ? CGEventGetLocation(cur) : CGPointZero;
-    if (cur) CFRelease(cur);
+    CGPoint loc;
+    if (g_have_motion) {
+        loc = g_motion_point;
+    } else {
+        CGEventRef cur = CGEventCreate(NULL);
+        loc = cur ? CGEventGetLocation(cur) : CGPointZero;
+        if (cur) CFRelease(cur);
+    }
+
+    int idx = (int)button;
+    if (idx < 0 || idx > 2) idx = 0;
+    ClickState *cs = &g_clicks[idx];
+    double now = now_sec();
+    if (down) {
+        double dx = loc.x - cs->point.x;
+        double dy = loc.y - cs->point.y;
+        if (cs->last_down > 0 && now - cs->last_down <= 0.5
+            && dx * dx + dy * dy <= 16.0) {
+            cs->count = cs->count < 3 ? cs->count + 1 : 1;
+        } else {
+            cs->count = 1;
+        }
+        cs->last_down = now;
+        cs->point = loc;
+    }
+    int click_state = cs->count > 0 ? cs->count : 1;
+
     CGEventSourceRef src = CGEventSourceCreate(kCGEventSourceStateHIDSystemState);
     CGEventRef ev = CGEventCreateMouseEvent(src, type, loc, button);
     if (ev) {
@@ -241,15 +290,34 @@ static void post_button(unsigned short evdev, int down) {
         // and click state are explicit; without them some apps treat them as
         // secondary/ignored.
         CGEventSetIntegerValueField(ev, kCGMouseEventButtonNumber, (int64_t)button);
-        CGEventSetIntegerValueField(ev, kCGMouseEventClickState, 1);
+        CGEventSetIntegerValueField(ev, kCGMouseEventClickState, click_state);
         // A stuck modifier (typically Control) turns a left click into a right
         // click on macOS; synthetic mouse events must not inherit stale flags.
         CGEventSetFlags(ev, 0);
     }
-    logf_("  -> post type=%d button=%d ev=%p down=%d flags=0x%llx", (int)type, (int)button,
-          (void *)ev, down, (unsigned long long)CGEventSourceFlagsState(kCGEventSourceStateHIDSystemState));
+    logf_("  -> post type=%d button=%d ev=%p down=%d click=%d loc=%.1f,%.1f flags=0x%llx",
+          (int)type, (int)button, (void *)ev, down, click_state, loc.x, loc.y,
+          (unsigned long long)CGEventSourceFlagsState(kCGEventSourceStateHIDSystemState));
     if (ev) {
+        if (down) {
+            // Put the system cursor on the click point; the button event
+            // itself is explicit, so a throttled warp cannot move the click.
+            CGWarpMouseCursorPosition(loc);
+            CGAssociateMouseAndMouseCursorPosition(true);
+        } else if (cs->down_posted > 0) {
+            // The window server can drop a mouseUp posted back-to-back with
+            // its mouseDown; keep the pair at least 30 ms apart.
+            double dt = now_sec() - cs->down_posted;
+            if (dt < 0.03) {
+                usleep((useconds_t)((0.03 - dt) * 1000000.0));
+            }
+        }
         CGEventPost(kCGHIDEventTap, ev);
+        if (down) {
+            cs->down_posted = now_sec();
+        } else {
+            cs->down_posted = 0;
+        }
         CFRelease(ev);
     }
     if (src) CFRelease(src);
@@ -265,6 +333,8 @@ static void post_motion(int nx, int ny) {
     CGPoint pt;
     pt.x = screen.origin.x + (CGFloat)nx / 65535.0 * screen.size.width;
     pt.y = screen.origin.y + (CGFloat)ny / 65535.0 * screen.size.height;
+    g_motion_point = pt;
+    g_have_motion = 1;
     CGWarpMouseCursorPosition(pt);
     CGAssociateMouseAndMouseCursorPosition(true);
     CGEventType moveType = kCGEventMouseMoved;

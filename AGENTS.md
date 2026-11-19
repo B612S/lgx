@@ -233,6 +233,12 @@ the Vulkan shader converts full-range BT.709, and the HEVC VUI says
   codes; mute/volume already come from the HID table. SDL3 exposes no
   brightness scancode, so the helper's brightness mapping waits for a client
   that can produce evdev 224/225.
+- macOS synthetic clicks use the last motion point, not the current system
+  cursor (a cursor warp can lag), carry a computed
+  `kCGMouseEventClickState` for double/triple clicks, and keep at least 30 ms
+  between down and up. The client also resends its pointer position before a
+  press and sets `SDL_MOUSE_FOCUS_CLICKTHROUGH`, so a click that focuses the
+  window still reaches the guest.
 - **Rich text only, event-driven.** Both sides use
   `wl-clipboard_rs::watch::Watcher`; no 300 ms polling and no `wl-paste`
   subprocess. The server skips the watcher's initial event so an old guest
