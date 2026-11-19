@@ -44,10 +44,26 @@ func take(_ count: Int) -> Data? {
     return Data(out)
 }
 
-func readU32(_ data: Data, _ offset: Int) -> UInt32? {
+// The frame (u32 length + kind) is big-endian, matching the Rust server's
+// write_clip; the rich payload's inner html length is little-endian, matching
+// lgx_proto::encode_rich/decode_rich.
+func readBe32(_ data: Data, _ offset: Int) -> UInt32? {
     guard data.count >= offset + 4 else { return nil }
     let b = [UInt8](data[offset..<offset + 4])
     return (UInt32(b[0]) << 24) | (UInt32(b[1]) << 16) | (UInt32(b[2]) << 8) | UInt32(b[3])
+}
+
+func readLe32(_ data: Data, _ offset: Int) -> UInt32? {
+    guard data.count >= offset + 4 else { return nil }
+    let b = [UInt8](data[offset..<offset + 4])
+    return UInt32(b[0]) | (UInt32(b[1]) << 8) | (UInt32(b[2]) << 16) | (UInt32(b[3]) << 24)
+}
+
+func appendLe32(_ out: inout Data, _ value: UInt32) {
+    out.append(UInt8(truncatingIfNeeded: value))
+    out.append(UInt8(truncatingIfNeeded: value >> 8))
+    out.append(UInt8(truncatingIfNeeded: value >> 16))
+    out.append(UInt8(truncatingIfNeeded: value >> 24))
 }
 
 func writeRecord(_ kind: UInt8, _ payload: Data) {
@@ -65,19 +81,25 @@ func writeRecord(_ kind: UInt8, _ payload: Data) {
 func apply(_ kind: UInt8, _ payload: Data) {
     lock.lock()
     defer { lock.unlock() }
-    pasteboard.clearContents()
+    // Validate before touching the pasteboard: a malformed record used to clear
+    // the clipboard and leave it empty, which made every Paste do nothing.
     if kind == kindHtml {
-        guard let htmlLength = readU32(payload, 0), 4 + Int(htmlLength) <= payload.count else {
+        guard let htmlLength = readLe32(payload, 0), 4 + Int(htmlLength) <= payload.count else {
+            log("ignoring a malformed rich clipboard record")
             return
         }
         let html = payload.subdata(in: 4..<(4 + Int(htmlLength)))
         let text = payload.subdata(in: (4 + Int(htmlLength))..<payload.count)
+        pasteboard.clearContents()
         pasteboard.setData(html, forType: .html)
         if let string = String(data: text, encoding: .utf8), !string.isEmpty {
             pasteboard.setString(string, forType: .string)
         }
-    } else if let string = String(data: payload, encoding: .utf8) {
+    } else if let string = String(data: payload, encoding: .utf8), !string.isEmpty {
+        pasteboard.clearContents()
         pasteboard.setString(string, forType: .string)
+    } else {
+        return
     }
     lastChange = pasteboard.changeCount
 }
@@ -93,11 +115,7 @@ func publish() {
     if let html = pasteboard.data(forType: .html), !html.isEmpty {
         let plain = pasteboard.string(forType: .string) ?? ""
         var payload = Data(capacity: 4 + html.count + plain.utf8.count)
-        let length = UInt32(html.count)
-        payload.append(UInt8(truncatingIfNeeded: length >> 24))
-        payload.append(UInt8(truncatingIfNeeded: length >> 16))
-        payload.append(UInt8(truncatingIfNeeded: length >> 8))
-        payload.append(UInt8(truncatingIfNeeded: length))
+        appendLe32(&payload, UInt32(html.count))
         payload.append(html)
         payload.append(plain.data(using: .utf8) ?? Data())
         writeRecord(kindHtml, payload)
@@ -118,7 +136,7 @@ log("watching the pasteboard")
 // Commands from the server, one framed record after another.
 while true {
     guard let lengthData = take(4), let kindData = take(1) else { break }
-    guard let length = readU32(lengthData, 0) else { break }
+    guard let length = readBe32(lengthData, 0) else { break }
     guard let payload = take(Int(length)) else { break }
     guard let kind = kindData.first else { break }
     apply(kind, payload)
