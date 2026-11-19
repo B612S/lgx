@@ -32,6 +32,10 @@ clang -O2 -o "$ROOT/target/macos-helper/lgx-cginput" \
   "$ROOT/helper/lgx-media.m" \
   -framework ApplicationServices -framework CoreGraphics -framework AppKit \
   -framework CoreVideo
+# Cursor shape: the client draws the pointer locally, so it needs the guest's
+# NSCursor image to show resize/wait/etc. instead of a permanent arrow.
+clang -O2 -o "$ROOT/target/macos-helper/lgx-macos-cursor" \
+  "$ROOT/helper/lgx-macos-cursor.m" -framework AppKit
 swiftc -O -o "$ROOT/target/macos-helper/lgx-launcher" "$ROOT/helper/lgx-launcher.swift" \
   -framework AppKit -framework ApplicationServices -framework ScreenCaptureKit
 # Audio capture is Swift: CATapDescription is an Objective-C class, so the C
@@ -51,6 +55,7 @@ cp "$ROOT/target/release/lgx-server-macos" "$APP/Contents/MacOS/lgx-server-bin"
 cp "$ROOT/target/macos-helper/lgx-launcher" "$APP/Contents/MacOS/lgx-launcher"
 cp "$ROOT/target/macos-helper/lgx-vtenc"     "$APP/Contents/MacOS/"
 cp "$ROOT/target/macos-helper/lgx-cginput"   "$APP/Contents/MacOS/"
+cp "$ROOT/target/macos-helper/lgx-macos-cursor" "$APP/Contents/MacOS/"
 cp "$ROOT/target/macos-helper/lgx-macos-audio" "$APP/Contents/MacOS/"
 cp "$ROOT/target/macos-helper/lgx-pb"        "$APP/Contents/MacOS/"
 [ -f "$ROOT/assets/lgx.icns" ] && cp "$ROOT/assets/lgx.icns" "$APP/Contents/Resources/lgx.icns"

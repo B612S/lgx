@@ -421,6 +421,69 @@ fn spawn_pb(path: &str) -> Option<Child> {
     }
 }
 
+/// Forwards cursor-shape frames from the helper to the client. The helper
+/// writes `u32 BE length` followed by the CURSOR_IMAGE payload.
+fn spawn_cursor(
+    path: &str,
+    secure: Arc<Secure>,
+    alive: Arc<AtomicBool>,
+    enabled: Arc<AtomicBool>,
+    last: Arc<Mutex<Option<Vec<u8>>>>,
+) -> Option<Child> {
+    let mut cmd = Command::new(path);
+    match cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+    {
+        Ok(mut child) => {
+            if let Some(stdout) = child.stdout.take() {
+                thread::Builder::new()
+                    .name("lgx-cursor".into())
+                    .spawn(move || {
+                        let mut reader = BufReader::new(stdout);
+                        loop {
+                            if !alive.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            let mut len = [0u8; 4];
+                            if reader.read_exact(&mut len).is_err() {
+                                break;
+                            }
+                            let n = u32::from_be_bytes(len) as usize;
+                            if !(16..=256 * 1024).contains(&n) {
+                                break;
+                            }
+                            let mut payload = vec![0u8; n];
+                            if reader.read_exact(&mut payload).is_err() {
+                                break;
+                            }
+                            *last.lock().unwrap() = Some(payload.clone());
+                            if enabled.load(Ordering::Relaxed)
+                                && secure
+                                    .send_msg(
+                                        Msg::new(msg::CURSOR_IMAGE, 0, n as i32, 0),
+                                        &payload,
+                                    )
+                                    .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    })
+                    .ok();
+            }
+            info!("cursor helper started ({path})");
+            Some(child)
+        }
+        Err(e) => {
+            warn!("cannot start cursor helper {path}: {e}");
+            None
+        }
+    }
+}
+
 fn spawn_input(path: &str, wheel_invert: bool) -> Option<Child> {
     let mut cmd = Command::new(path);
     if wheel_invert {
@@ -582,6 +645,17 @@ fn serve(args: &Args, secure: Arc<Secure>) -> std::io::Result<()> {
     // client must never keep the single-client server busy.
     let alive = Arc::new(AtomicBool::new(true));
     let need_idr = Arc::new(AtomicBool::new(false));
+    let cursor_enabled = Arc::new(AtomicBool::new(false));
+    let cursor_last: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
+    let cursor_child = sibling("lgx-macos-cursor").and_then(|path| {
+        spawn_cursor(
+            &path,
+            Arc::clone(&secure),
+            Arc::clone(&alive),
+            Arc::clone(&cursor_enabled),
+            Arc::clone(&cursor_last),
+        )
+    });
 
     // Reader thread: client -> input helper.
     // Clipboard changes made on the Mac are pushed to the client.
@@ -628,11 +702,21 @@ fn serve(args: &Args, secure: Arc<Secure>) -> std::io::Result<()> {
     });
     let input_handle: Option<JoinHandle<()>> = input_stdin.map(|mut cmd| {
         let pb = Arc::clone(&pb_stdin);
+        let cursor_enabled = Arc::clone(&cursor_enabled);
+        let cursor_last = Arc::clone(&cursor_last);
         thread::spawn(move || {
             // A read timeout lets the thread notice a dead peer instead of
             // blocking in recv_msg forever.
             let _ = sec_reader.set_read_timeout(Some(Duration::from_millis(500)));
-            let _ = write_controls(&sec_reader, &mut cmd, &reader_alive, &pb, &reader_idr);
+            let _ = write_controls(
+                &sec_reader,
+                &mut cmd,
+                &reader_alive,
+                &pb,
+                &reader_idr,
+                &cursor_enabled,
+                &cursor_last,
+            );
         })
     });
 
@@ -641,10 +725,20 @@ fn serve(args: &Args, secure: Arc<Secure>) -> std::io::Result<()> {
         let a = Arc::clone(&alive);
         let pb = Arc::clone(&pb_stdin);
         let idr = Arc::clone(&need_idr);
+        let cursor_enabled = Arc::clone(&cursor_enabled);
+        let cursor_last = Arc::clone(&cursor_last);
         thread::spawn(move || match std::os::unix::net::UnixStream::connect(&path) {
             Ok(mut stream) => {
                 info!("input via launcher socket {path}");
-                let _ = write_controls(&sec, &mut stream, &a, &pb, &idr);
+                let _ = write_controls(
+                    &sec,
+                    &mut stream,
+                    &a,
+                    &pb,
+                    &idr,
+                    &cursor_enabled,
+                    &cursor_last,
+                );
             }
             Err(e) => warn!("input socket {path}: {e}"),
         });
@@ -788,6 +882,10 @@ fn serve(args: &Args, secure: Arc<Secure>) -> std::io::Result<()> {
         let _ = child.kill();
         let _ = child.wait();
     }
+    if let Some(mut child) = cursor_child {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
     if let Some(h) = input_handle {
         let _ = h.join();
     }
@@ -808,6 +906,8 @@ fn write_controls(
     alive: &Arc<AtomicBool>,
     pb: &Mutex<Option<std::process::ChildStdin>>,
     need_idr: &Arc<AtomicBool>,
+    cursor_enabled: &Arc<AtomicBool>,
+    cursor_last: &Arc<Mutex<Option<Vec<u8>>>>,
 ) -> std::io::Result<()> {
     let mut seen: u64 = 0;
     loop {
@@ -847,6 +947,17 @@ fn write_controls(
             msg::CLIP_SET_HTML => {
                 if let Some(stdin) = pb.lock().unwrap().as_mut() {
                     let _ = write_clip(stdin, 2, &payload);
+                }
+                continue;
+            }
+            msg::CURSOR_SHAPE => {
+                cursor_enabled.store(true, Ordering::Relaxed);
+                let last = cursor_last.lock().unwrap().clone();
+                if let Some(payload) = last {
+                    let _ = secure.send_msg(
+                        Msg::new(msg::CURSOR_IMAGE, 0, payload.len() as i32, 0),
+                        &payload,
+                    );
                 }
                 continue;
             }

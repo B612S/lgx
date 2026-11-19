@@ -24,6 +24,7 @@ helper/lgx-uinput.c  root helper that creates the uinput devices
 helper/lgx-cginput.c macOS CGEvent input injection
 helper/lgx-frontmost.m frontmost-application PID for function keys
 helper/lgx-media.m   NX_SYSDEFINED media keys for the macOS helper
+helper/lgx-macos-cursor.m  NSCursor shape helper for the local pointer
 scripts/             fake-server.py
 ```
 
@@ -239,6 +240,12 @@ the Vulkan shader converts full-range BT.709, and the HEVC VUI says
   between down and up. The client also resends its pointer position before a
   press and sets `SDL_MOUSE_FOCUS_CLICKTHROUGH`, so a click that focuses the
   window still reaches the guest.
+- macOS cursor shape: `helper/lgx-macos-cursor.m` polls
+  `NSCursor.currentSystemCursor` (Objective-C; the Swift binding is obsolete),
+  crops the alpha bounds and the server forwards `CURSOR_IMAGE` (1x RGBA plus
+  hotspot). The client installs it as an SDL color cursor, so resize/move/wait
+  shapes show while the pointer itself is still drawn locally. Never composite
+  the cursor into the video: it trails the pointer.
 - macOS smooth scrolling is driven by `CVDisplayLink`: one pixel scroll event
   per display frame with `kCGScrollWheelEventScrollPhase`
   began/changed/ended. A background `nanosleep` is coalesced by macOS to
