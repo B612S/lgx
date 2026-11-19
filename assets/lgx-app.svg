@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <title>LGX Server</title>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FBFCFD"/>
+      <stop offset="1" stop-color="#E8ECF2"/>
+    </linearGradient>
+  </defs>
+
+  <!-- frost squircle: full-bleed 1024 canvas, macOS 26 masks it itself -->
+  <rect width="1024" height="1024" rx="232" fill="url(#bg)"/>
+  <rect x="10" y="10" width="1004" height="1004" rx="224" fill="none" stroke="#D3D9E2" stroke-width="6"/>
+
+  <!-- the original project glyph, unchanged -->
+  <g transform="translate(512 512) scale(3.0) translate(-128 -128)">
+    <rect x="20" y="40" width="216" height="148" rx="20" fill="#5294e2"/>
+    <rect x="36" y="56" width="184" height="116" rx="10" fill="#2b4a7d"/>
+    <path d="M148 68 L104 138 h30 l-10 28 44 -60 h-30 z" fill="#f7c948"/>
+    <rect x="112" y="188" width="32" height="18" rx="4" fill="#3f7ac0"/>
+    <rect x="80" y="206" width="96" height="14" rx="7" fill="#5294e2"/>
+  </g>
+</svg>

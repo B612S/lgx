@@ -1,0 +1,14 @@
+[package]
+name = "lgx-server-macos"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "lgx server for macOS: ScreenCaptureKit + VideoToolbox instead of wlr-screencopy + VAAPI"
+
+[[bin]]
+name = "lgx-server-macos"
+path = "src/main.rs"
+
+[dependencies]
+lgx-proto = { path = "../lgx-proto" }
+libc = "0.2"

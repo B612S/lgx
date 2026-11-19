@@ -1,0 +1,864 @@
+//! lgx-server-macos: HEVC streaming of a macOS desktop over the lgx protocol.
+//!
+//! Differences from the Linux server, all forced by the platform:
+//!
+//! * Capture + encode live in `lgx-vtenc` (ScreenCaptureKit -> VideoToolbox),
+//!   spawned as a child. It emits `u32 length + Annex-B access unit` on
+//!   stdout, which is exactly what `lgx-vaenc` feeds the Linux server.
+//! * ScreenCaptureKit is change-driven: a frame is produced only when the
+//!   desktop changes, so the stream is event-driven rather than a fixed frame
+//!   rate. The client presents every decoded frame (`present_hz = 0`), which
+//!   keeps the last image on screen between changes.
+//! * Input goes through `lgx-cginput` (CGEvent) instead of kernel `uinput`,
+//!   because macOS has no uinput and input injection needs the Accessibility
+//!   TCC grant.
+//! * Audio comes from `lgx-macos-audio` (Core Audio process tap) instead of
+//!   PipeWire. The tap is read only while an audio client is connected and
+//!   mutes local playback for that time, so the guest hears the Mac and the
+//!   Mac itself stays quiet. The first tap also needs the "System Audio
+//!   Recording" TCC grant.
+//! * The clipboard (wl-clipboard) is not implemented yet.
+//! * The process must run inside the logged-in GUI session (LaunchAgent):
+//!   Screen Recording and System Audio Recording are denied to anything
+//!   spawned from `sshd`.
+//!
+//! Settings live in `~/.config/lgx/macos.conf` (see `config.rs`); the command
+//! line overrides the file, the file overrides the built-in defaults.
+//!
+//! Usage:
+//!   lgx-server-macos [--listen ADDR] [--fps N] [--bitrate BPS] [--display N]
+//!                    [--wheel-invert|--no-wheel-invert] [--no-adaptive]
+//!                    [--no-audio] [--audio-listen ADDR]
+//!                    [--helper PATH] [--input-helper PATH] [--audio-helper PATH]
+//!   lgx-server-macos --rotate        # new token, rewritten into the config
+//!   lgx-server-macos --pair --pair-name NAME [--pair-port 5904]
+
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
+use std::net::TcpListener;
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use std::thread::{self, JoinHandle};
+
+use lgx_proto::auth;
+use lgx_proto::msg;
+use lgx_proto::secure::{server_handshake, server_read_id, Secure};
+use lgx_proto::{codec, Msg};
+
+use config::Config;
+
+/// Frames buffered between the capture helper and the socket writer. Two or
+/// three frames absorb a short scheduling hiccup without letting a slow link
+/// build up a multi-second backlog.
+const QUEUE_FRAMES: usize = 3;
+
+mod audio;
+mod config;
+
+/// Local wall-clock time for log lines; launchd's log has no timestamps.
+fn now_hms() -> String {
+    unsafe {
+        let t = libc::time(std::ptr::null_mut());
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&t, &mut tm).is_null() {
+            return "--:--:--".into();
+        }
+        format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
+    }
+}
+
+macro_rules! info {
+    ($($arg:tt)*) => {
+        println!("{} {}", now_hms(), format!($($arg)*))
+    };
+}
+
+macro_rules! warn {
+    ($($arg:tt)*) => {
+        eprintln!("{} {}", now_hms(), format!($($arg)*))
+    };
+}
+
+/// Helpers live next to the server executable inside `LGX Server.app`, so the
+/// app is self-contained: drag it into /Applications and it works from there.
+fn sibling(name: &str) -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    let path = dir.join(name);
+    path.exists().then(|| path.to_string_lossy().into_owned())
+}
+
+struct Args {
+    listen: String,
+    token: String,
+    /// `None` lets `lgx-vtenc` follow the display's refresh rate; the helper
+    /// reports the rate it picked on its first stderr line.
+    fps: Option<u32>,
+    bitrate: u32,
+    display: Option<usize>,
+    helper: String,
+    input_helper: String,
+    input_socket: Option<String>,
+    audio: bool,
+    audio_listen: Option<String>,
+    audio_helper: String,
+    pb_helper: String,
+    /// Flip the wheel direction passed to `lgx-cginput`.
+    wheel_invert: bool,
+    /// Lower the bitrate when frames are dropped and raise it again when the
+    /// link recovers.
+    adaptive: bool,
+    pair: bool,
+    pair_name: String,
+    pair_port: u16,
+    rotate: bool,
+}
+
+/// The client's profile points its audio connection at port 5903 on the same
+/// host it streams video from.
+fn default_audio_listen(video_listen: &str) -> String {
+    match video_listen.rsplit_once(':') {
+        Some((host, _)) if !host.is_empty() => format!("{host}:5903"),
+        _ => "0.0.0.0:5903".into(),
+    }
+}
+
+pub fn host_of(addr: &str) -> String {
+    match addr.rsplit_once(':') {
+        Some((host, _)) if !host.is_empty() => host.to_string(),
+        _ => "0.0.0.0".into(),
+    }
+}
+
+pub fn port_of(addr: &str) -> u16 {
+    addr.rsplit_once(':').and_then(|(_, p)| p.parse().ok()).unwrap_or(5902)
+}
+
+fn launch_agent_path() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    let path = std::path::PathBuf::from(home)
+        .join("Library/LaunchAgents/dev.b612s.lgx.server.plist");
+    path.exists().then_some(path)
+}
+
+fn parse_args() -> Args {
+    let cfg = Config::load();
+    let mut a = Args {
+        listen: cfg.listen.clone().unwrap_or_else(|| "0.0.0.0:5902".into()),
+        token: cfg.token.clone().unwrap_or_default(),
+        fps: cfg.fps,
+        bitrate: cfg.bitrate.unwrap_or(20_000_000),
+        display: cfg.display,
+        helper: std::env::var("LGX_HELPER")
+            .ok()
+            .or_else(|| sibling("lgx-vtenc"))
+            .unwrap_or_else(|| "lgx-vtenc".into()),
+        input_helper: std::env::var("LGX_INPUT_HELPER")
+            .ok()
+            .or_else(|| sibling("lgx-cginput"))
+            .unwrap_or_else(|| "lgx-cginput".into()),
+        input_socket: std::env::var("LGX_INPUT_SOCKET").ok(),
+        audio: cfg_audio_enabled(),
+        audio_listen: std::env::var("LGX_AUDIO_LISTEN").ok(),
+        audio_helper: std::env::var("LGX_AUDIO_HELPER")
+            .ok()
+            .or_else(|| sibling("lgx-macos-audio"))
+            .unwrap_or_else(|| "lgx-macos-audio".into()),
+        pb_helper: std::env::var("LGX_PB_HELPER")
+            .ok()
+            .or_else(|| sibling("lgx-pb"))
+            .unwrap_or_else(|| "lgx-pb".into()),
+        wheel_invert: cfg.wheel_invert.unwrap_or(false),
+        adaptive: cfg.adaptive.unwrap_or(true),
+        pair: false,
+        pair_name: "macbook".into(),
+        pair_port: cfg.pair_port.unwrap_or(5904),
+        rotate: false,
+    };
+    // Environment first (manual runs, tests), then the command line.
+    if let Ok(v) = std::env::var("LGX_LISTEN") {
+        a.listen = v;
+    }
+    if let Ok(v) = std::env::var("LGX_TOKEN") {
+        a.token = v;
+    }
+    if let Ok(v) = std::env::var("LGX_FPS") {
+        a.fps = v.parse().ok();
+    }
+    if let Ok(v) = std::env::var("LGX_BITRATE") {
+        if let Ok(v) = v.parse() {
+            a.bitrate = v;
+        }
+    }
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let mut i = 0;
+    while i < argv.len() {
+        let next = |i: &mut usize| -> String {
+            *i += 1;
+            argv.get(*i).cloned().unwrap_or_default()
+        };
+        match argv[i].as_str() {
+            "--listen" => a.listen = next(&mut i),
+            "--token" => a.token = next(&mut i),
+            "--fps" => a.fps = Some(next(&mut i).parse().unwrap_or(60)),
+            "--bitrate" => a.bitrate = next(&mut i).parse().unwrap_or(20_000_000),
+            "--display" => a.display = next(&mut i).parse().ok(),
+            "--helper" => a.helper = next(&mut i),
+            "--input-helper" => a.input_helper = next(&mut i),
+            "--input-socket" => a.input_socket = Some(next(&mut i)),
+            "--no-audio" => a.audio = false,
+            "--audio" => a.audio = true,
+            "--audio-listen" => a.audio_listen = Some(next(&mut i)),
+            "--audio-helper" => a.audio_helper = next(&mut i),
+            "--pb-helper" => a.pb_helper = next(&mut i),
+            "--wheel-invert" => a.wheel_invert = true,
+            "--no-wheel-invert" => a.wheel_invert = false,
+            "--no-adaptive" => a.adaptive = false,
+            "--adaptive" => a.adaptive = true,
+            "--pair" => a.pair = true,
+            "--pair-name" => a.pair_name = next(&mut i),
+            "--pair-port" => a.pair_port = next(&mut i).parse().unwrap_or(5904),
+            "--rotate" => a.rotate = true,
+            other => warn!("unknown argument {other}"),
+        }
+        i += 1;
+    }
+    a
+}
+
+fn cfg_audio_enabled() -> bool {
+    std::env::var("LGX_NO_AUDIO").is_err()
+}
+
+/// Generate a fresh token, store it in the config and mirror it into the
+/// LaunchAgent, whose `--token` argument would otherwise override the file.
+fn rotate(args: &Args) -> std::io::Result<()> {
+    let token = auth::generate_token();
+    let mut cfg = Config::load();
+    cfg.listen = Some(args.listen.clone());
+    cfg.token = Some(token.clone());
+    cfg.pair_port = Some(args.pair_port);
+    cfg.fps = args.fps;
+    cfg.bitrate = Some(args.bitrate);
+    cfg.display = args.display;
+    cfg.wheel_invert = Some(args.wheel_invert);
+    cfg.adaptive = Some(args.adaptive);
+    cfg.save()?;
+    if let Some(plist) = launch_agent_path() {
+        let status = Command::new("/usr/libexec/PlistBuddy")
+            .arg("-c")
+            .arg(format!("Set :ProgramArguments:4 {token}"))
+            .arg(&plist)
+            .status();
+        if !matches!(status, Ok(s) if s.success()) {
+            warn!("cannot update {}: the running server keeps the old token", plist.display());
+        }
+    }
+    info!("new token written to {}", config::path().display());
+    info!("restart the server, then re-pair the client so its profile gets the new token");
+    Ok(())
+}
+
+/// Serve one pairing request: the client proves it knows the code, and gets the
+/// long-term token plus the ports to write into its profile.
+fn pair_client(
+    stream: std::net::TcpStream,
+    code: &str,
+    name: &str,
+    token: &str,
+    video_port: u16,
+    audio_port: u16,
+) -> std::io::Result<()> {
+    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(30)))?;
+    let secure = server_handshake(stream, code)?;
+    secure.send_bytes(format!("{name}\n{token}\n{video_port}\n{audio_port}").as_bytes())?;
+    let ack = secure.recv_bytes()?;
+    if ack != b"ok" {
+        secure.close();
+        return Err(std::io::Error::other("client did not acknowledge the token"));
+    }
+    secure.close();
+    Ok(())
+}
+
+/// One-shot pairing endpoint, mirroring `lgx-server --pair`.
+fn run_pair(args: &Args) -> std::io::Result<()> {
+    if args.token.is_empty() {
+        return Err(std::io::Error::other("no token; run --rotate first"));
+    }
+    let host = host_of(&args.listen);
+    let video_port = port_of(&args.listen);
+    let audio_port = args.audio_listen.as_deref().map(port_of).unwrap_or(video_port + 1);
+    let addr = format!("{host}:{}", args.pair_port);
+    let listener = TcpListener::bind(&addr)
+        .map_err(|e| std::io::Error::other(format!("bind {addr}: {e}")))?;
+    listener.set_nonblocking(true)?;
+    let code = auth::generate();
+    info!("pairing code: {code}");
+    info!("on the client run:");
+    info!(
+        "  lgx-client {} --pair {host}:{} --pair-code {code}",
+        args.pair_name, args.pair_port
+    );
+    info!("waiting up to 3 minutes for one client...");
+    let deadline = Instant::now() + Duration::from_secs(180);
+    let mut failures = 0u32;
+    loop {
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::other("pairing timed out"));
+        }
+        match listener.accept() {
+            Ok((stream, peer)) => {
+                // On macOS an accepted socket inherits O_NONBLOCK from the
+                // listener, which turns every read into EAGAIN. Pairing needs
+                // ordinary blocking reads with a timeout.
+                let _ = stream.set_nonblocking(false);
+                let _ = stream.set_nodelay(true);
+                info!("pairing client from {peer}");
+                match pair_client(stream, &code, &args.pair_name, &args.token, video_port, audio_port)
+                {
+                    Ok(()) => {
+                        info!(
+                            "paired {peer} as {}; video={video_port} audio={audio_port}",
+                            args.pair_name
+                        );
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        failures += 1;
+                        warn!("pairing failed: {e}");
+                        if failures >= 5 {
+                            return Err(std::io::Error::other("too many failed pairing attempts"));
+                        }
+                    }
+                }
+            }
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Spawn the capture helper and read its startup line to learn the geometry
+/// and the frame rate it settled on.
+/// `lgx-vtenc: capture 1920x1200@60, display 1 1920x1200 60.0 Hz`
+fn spawn_capture(args: &Args) -> std::io::Result<(Child, u32, u32, u32)> {
+    let mut child_cmd = Command::new(&args.helper);
+    // Only pass --fps when the caller pinned one; otherwise the helper follows
+    // the display refresh rate instead of assuming 60 Hz.
+    if let Some(fps) = args.fps {
+        child_cmd.arg("--fps").arg(fps.to_string());
+    }
+    if let Some(display) = args.display {
+        child_cmd.arg("--display").arg(display.to_string());
+    }
+    let mut child = child_cmd
+        .arg("--bitrate")
+        .arg(args.bitrate.to_string())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    let stderr = child.stderr.take().expect("stderr piped");
+    let mut reader = BufReader::new(stderr);
+    let mut line = String::new();
+    let (mut w, mut h, mut fps) = (1920u32, 1200u32, args.fps.unwrap_or(60));
+    if reader.read_line(&mut line).is_ok() {
+        warn!("{}", line.trim_end());
+        if let Some(idx) = line.find("capture ") {
+            let rest = &line[idx + 8..];
+            if let Some(at) = rest.find('@') {
+                let dims = &rest[..at];
+                if let Some((sw, sh)) = dims.split_once('x') {
+                    w = sw.parse().unwrap_or(w);
+                    h = sh.parse().unwrap_or(h);
+                }
+                let digits: String =
+                    rest[at + 1..].chars().take_while(|c| c.is_ascii_digit()).collect();
+                if let Ok(v) = digits.parse::<u32>() {
+                    if v > 0 {
+                        fps = v;
+                    }
+                }
+            }
+        }
+    }
+    // Keep draining stderr so the child never blocks on a full pipe.
+    thread::spawn(move || {
+        let mut sink = String::new();
+        loop {
+            sink.clear();
+            match reader.read_line(&mut sink) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => warn!("{}", sink.trim_end()),
+            }
+        }
+    });
+    Ok((child, w, h, fps))
+}
+
+fn spawn_pb(path: &str) -> Option<Child> {
+    match Command::new(path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+    {
+        Ok(child) => {
+            info!("clipboard helper started ({path})");
+            Some(child)
+        }
+        Err(e) => {
+            warn!("cannot start clipboard helper {path}: {e}");
+            None
+        }
+    }
+}
+
+fn spawn_input(path: &str, wheel_invert: bool) -> Option<Child> {
+    let mut cmd = Command::new(path);
+    if wheel_invert {
+        cmd.env("LGX_WHEEL_INVERT", "1");
+    }
+    match cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+    {
+        Ok(child) => {
+            info!("input helper started ({path})");
+            Some(child)
+        }
+        Err(e) => {
+            warn!("cannot start input helper {path}: {e}");
+            None
+        }
+    }
+}
+
+fn send_helper(helper: &Mutex<Option<std::process::ChildStdin>>, line: &str) {
+    if let Some(stdin) = helper.lock().unwrap().as_mut() {
+        let _ = writeln!(stdin, "{line}");
+        let _ = stdin.flush();
+    }
+}
+
+fn main() {
+    let mut args = parse_args();
+
+    if args.rotate {
+        match rotate(&args) {
+            Ok(()) => return,
+            Err(e) => {
+                warn!("rotate: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    if args.token.is_empty() {
+        // Fresh install: mint a token so the server can start, and let the
+        // client pick it up through --pair instead of a hand-edited plist.
+        let token = auth::generate_token();
+        let mut cfg = Config::load();
+        cfg.listen = Some(args.listen.clone());
+        cfg.token = Some(token.clone());
+        cfg.pair_port = Some(args.pair_port);
+        if let Err(e) = cfg.save() {
+            warn!("cannot write {}: {e}", config::path().display());
+        } else {
+            info!("no token configured; generated one in {}", config::path().display());
+        }
+        args.token = token;
+    }
+
+    if args.pair {
+        if let Err(e) = run_pair(&args) {
+            warn!("pairing: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    let args = Arc::new(args);
+
+    let listener = match TcpListener::bind(&args.listen) {
+        Ok(l) => l,
+        Err(e) => {
+            warn!("bind {}: {e}", args.listen);
+            std::process::exit(1);
+        }
+    };
+    info!("listening on {}", args.listen);
+
+    if args.audio {
+        let addr = args
+            .audio_listen
+            .clone()
+            .unwrap_or_else(|| default_audio_listen(&args.listen));
+        let token = args.token.clone();
+        let helper = args.audio_helper.clone();
+        thread::Builder::new()
+            .name("lgx-audio".into())
+            .spawn(move || {
+                if let Err(e) = audio::serve(&addr, token, helper) {
+                    warn!("audio: {e}");
+                }
+            })
+            .ok();
+    }
+
+    for incoming in listener.incoming() {
+        let stream = match incoming {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("accept: {e}");
+                continue;
+            }
+        };
+        let args = Arc::clone(&args);
+        // One client at a time, like the Linux server.
+        let secure = {
+            let mut stream = stream;
+            let id = match server_read_id(&mut stream) {
+                Ok(id) => id,
+                Err(e) => {
+                    warn!("client id: {e}");
+                    continue;
+                }
+            };
+            match server_handshake(stream, &args.token) {
+                Ok(s) => {
+                    info!("client {id} authenticated");
+                    Arc::new(s)
+                }
+                Err(e) => {
+                    warn!("handshake for {id}: {e}");
+                    continue;
+                }
+            }
+        };
+
+        if let Err(e) = serve(&args, secure) {
+            warn!("session ended: {e}");
+        }
+        info!("client disconnected, waiting for the next one");
+    }
+}
+
+fn serve(args: &Args, secure: Arc<Secure>) -> std::io::Result<()> {
+    let (mut capture, w, h, fps) = spawn_capture(args)?;
+    // The capture helper's stdin asks for an IDR and carries bitrate changes.
+    let capture_stdin: Arc<Mutex<Option<std::process::ChildStdin>>> =
+        Arc::new(Mutex::new(capture.stdin.take()));
+    let input = if args.input_socket.is_some() { None } else { spawn_input(&args.input_helper, args.wheel_invert) };
+    let mut pb_child = spawn_pb(&args.pb_helper);
+    let pb_stdin: Arc<Mutex<Option<std::process::ChildStdin>>> =
+        Arc::new(Mutex::new(pb_child.as_mut().and_then(|c| c.stdin.take())));
+
+    // HELLO carries the geometry the client sizes its window from.
+    secure.send_msg(Msg::new(msg::HELLO, codec::HEVC, w as i32, h as i32), &[])?;
+    // The client draws its own pointer, which follows the local mouse at the
+    // display rate. The flag travels in `a`: the client reads `m.a`, so putting
+    // it in `code` left the local cursor disabled and exposed the cursor that
+    // ScreenCaptureKit composites into the video, which trails by the whole
+    // capture/encode/network pipeline.
+    secure.send_msg(Msg::new(msg::CURSOR_LOCAL, 0, 1, 0), &[])?;
+    info!(
+        "streaming {w}x{h}, fps<= {fps}, {} bps, wheel {}, adaptive {}",
+        args.bitrate,
+        if args.wheel_invert { "inverted" } else { "normal" },
+        if args.adaptive { "on" } else { "off" }
+    );
+
+    // The session dies as soon as either side notices the other is gone; a lost
+    // client must never keep the single-client server busy.
+    let alive = Arc::new(AtomicBool::new(true));
+    let need_idr = Arc::new(AtomicBool::new(false));
+
+    // Reader thread: client -> input helper.
+    // Clipboard changes made on the Mac are pushed to the client.
+    if let Some(stdout) = pb_child.as_mut().and_then(|c| c.stdout.take()) {
+        let sec = Arc::clone(&secure);
+        let pb_alive = Arc::clone(&alive);
+        thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            loop {
+                if !pb_alive.load(Ordering::Relaxed) {
+                    break;
+                }
+                let mut len = [0u8; 4];
+                if reader.read_exact(&mut len).is_err() {
+                    break;
+                }
+                let n = u32::from_be_bytes(len) as usize;
+                if n == 0 || n > 8 * 1024 * 1024 {
+                    break;
+                }
+                let mut kind = [0u8; 1];
+                if reader.read_exact(&mut kind).is_err() {
+                    break;
+                }
+                let mut payload = vec![0u8; n];
+                if reader.read_exact(&mut payload).is_err() {
+                    break;
+                }
+                let typ = if kind[0] == 2 { msg::CLIP_DATA_HTML } else { msg::CLIP_DATA };
+                if sec.send_msg(Msg::new(typ, 0, payload.len() as i32, 0), &payload).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    let sec_reader = Arc::clone(&secure);
+    let reader_alive = Arc::clone(&alive);
+    let reader_idr = Arc::clone(&need_idr);
+    let mut input_child = input;
+    let input_stdin = input_child.as_mut().map(|c| {
+        let stdin = c.stdin.take().expect("stdin piped");
+        std::io::BufWriter::new(stdin)
+    });
+    let input_handle: Option<JoinHandle<()>> = input_stdin.map(|mut cmd| {
+        let pb = Arc::clone(&pb_stdin);
+        thread::spawn(move || {
+            // A read timeout lets the thread notice a dead peer instead of
+            // blocking in recv_msg forever.
+            let _ = sec_reader.set_read_timeout(Some(Duration::from_millis(500)));
+            let _ = write_controls(&sec_reader, &mut cmd, &reader_alive, &pb, &reader_idr);
+        })
+    });
+
+    if let Some(path) = args.input_socket.clone() {
+        let sec = Arc::clone(&secure);
+        let a = Arc::clone(&alive);
+        let pb = Arc::clone(&pb_stdin);
+        let idr = Arc::clone(&need_idr);
+        thread::spawn(move || match std::os::unix::net::UnixStream::connect(&path) {
+            Ok(mut stream) => {
+                info!("input via launcher socket {path}");
+                let _ = write_controls(&sec, &mut stream, &a, &pb, &idr);
+            }
+            Err(e) => warn!("input socket {path}: {e}"),
+        });
+    }
+
+    // Capture thread feeds a bounded channel: a client (or a link) that cannot
+    // keep up must drop frames instead of growing an unbounded backlog, which
+    // only turns low bandwidth into seconds of latency. Every dropped frame
+    // breaks the HEVC reference chain, so the main loop asks for an IDR.
+    let stdout = capture.stdout.take().expect("stdout piped");
+    let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(QUEUE_FRAMES);
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let cap_alive = Arc::clone(&alive);
+    let cap_dropped = Arc::clone(&dropped);
+    let cap_idr = Arc::clone(&need_idr);
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut len = [0u8; 4];
+        loop {
+            if !cap_alive.load(Ordering::Relaxed) {
+                break;
+            }
+            if reader.read_exact(&mut len).is_err() {
+                break;
+            }
+            let n = u32::from_be_bytes(len) as usize;
+            if n == 0 || n > 32 * 1024 * 1024 {
+                break;
+            }
+            let mut au = vec![0u8; n];
+            if reader.read_exact(&mut au).is_err() {
+                break;
+            }
+            match tx.try_send(au) {
+                Ok(()) => {}
+                Err(mpsc::TrySendError::Full(_)) => {
+                    cap_dropped.fetch_add(1, Ordering::Relaxed);
+                    cap_idr.store(true, Ordering::Relaxed);
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => break,
+            }
+        }
+        cap_alive.store(false, Ordering::Relaxed);
+    });
+
+    let mut last_ping = Instant::now();
+    let mut last_idr: Option<Instant> = None;
+    let (mut frames, mut bytes) = (0u64, 0u64);
+    let mut send_secs = 0.0f64;
+    let mut bitrate = args.bitrate;
+    let min_bitrate = (args.bitrate / 8).max(4_000_000);
+    let mut clean_windows = 0u32;
+    let mut t0 = Instant::now();
+    let stats_period = if std::env::var_os("LGX_DEBUG_FPS").is_some() { 1 } else { 5 };
+    let result = loop {
+        if !alive.load(Ordering::Relaxed) {
+            break Err(std::io::Error::new(ErrorKind::ConnectionAborted, "client went away"));
+        }
+        // Ask for an IDR at most twice a second: a slow client must recover,
+        // but must not turn the whole stream into keyframes.
+        if need_idr.load(Ordering::Relaxed)
+            && last_idr.is_none_or(|t| t.elapsed() >= Duration::from_millis(500))
+            && need_idr.swap(false, Ordering::Relaxed)
+        {
+            last_idr = Some(Instant::now());
+            send_helper(&capture_stdin, "idr");
+        }
+        if t0.elapsed() >= Duration::from_secs(stats_period) {
+            let elapsed = t0.elapsed().as_secs_f64();
+            let lost = dropped.swap(0, Ordering::Relaxed);
+            info!(
+                "HEVC {:.1} fps, {:.1} MiB/s, send {:.2} ms, {} dropped, {} kbps",
+                frames as f64 / elapsed,
+                bytes as f64 / elapsed / 1_048_576.0,
+                if frames > 0 { send_secs * 1000.0 / frames as f64 } else { 0.0 },
+                lost,
+                bitrate / 1000
+            );
+            // Adaptive bitrate: drops mean the pipe (or the client) cannot take
+            // the current rate. Back off quickly, recover slowly.
+            if args.adaptive {
+                if lost > 0 {
+                    clean_windows = 0;
+                    let next = (bitrate * 7 / 8).max(min_bitrate);
+                    if next < bitrate {
+                        bitrate = next;
+                        send_helper(&capture_stdin, &format!("bitrate {bitrate}"));
+                        info!("bitrate lowered to {} kbps after {lost} dropped frames", bitrate / 1000);
+                    }
+                } else {
+                    clean_windows += 1;
+                    if clean_windows >= 6 && bitrate < args.bitrate {
+                        bitrate = (bitrate * 9 / 8).min(args.bitrate);
+                        clean_windows = 0;
+                        send_helper(&capture_stdin, &format!("bitrate {bitrate}"));
+                        info!("bitrate raised to {} kbps", bitrate / 1000);
+                    }
+                }
+            }
+            t0 = Instant::now();
+            frames = 0;
+            bytes = 0;
+            send_secs = 0.0;
+        }
+        match rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(au) => {
+                let n = au.len();
+                let send_started = Instant::now();
+                let sent = secure.send_msg(Msg::new(msg::VIDEO, 0, n as i32, 0), &au);
+                send_secs += send_started.elapsed().as_secs_f64();
+                if let Err(e) = sent {
+                    break Err(e);
+                }
+                frames += 1;
+                bytes += n as u64;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // Keepalive: a write to a closed socket fails immediately, which
+                // is what we need to notice a client that vanished silently.
+                if last_ping.elapsed() >= Duration::from_secs(1) {
+                    last_ping = Instant::now();
+                    if let Err(e) = secure.send_msg(Msg::new(msg::PING, 0, 0, 0), &[]) {
+                        break Err(e);
+                    }
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                break Err(std::io::Error::new(ErrorKind::BrokenPipe, "capture ended"));
+            }
+        }
+    };
+
+    alive.store(false, Ordering::Relaxed);
+    let _ = capture.kill();
+    let _ = capture.wait();
+    if let Some(mut child) = input_child {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    if let Some(mut child) = pb_child {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    if let Some(h) = input_handle {
+        let _ = h.join();
+    }
+    result
+}
+
+fn write_clip(out: &mut impl Write, kind: u8, payload: &[u8]) -> std::io::Result<()> {
+    out.write_all(&(payload.len() as u32).to_be_bytes())?;
+    out.write_all(&[kind])?;
+    out.write_all(payload)?;
+    out.flush()
+}
+
+/// Forward input messages to `lgx-cginput` as plain text lines.
+fn write_controls(
+    secure: &Secure,
+    out: &mut impl Write,
+    alive: &Arc<AtomicBool>,
+    pb: &Mutex<Option<std::process::ChildStdin>>,
+    need_idr: &Arc<AtomicBool>,
+) -> std::io::Result<()> {
+    let mut seen: u64 = 0;
+    loop {
+        let (m, payload) = match secure.recv_msg() {
+            Ok(v) => v,
+            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
+                if !alive.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Ok(());
+                }
+                continue;
+            }
+            Err(_) => {
+                alive.store(false, std::sync::atomic::Ordering::Relaxed);
+                return Ok(());
+            }
+        };
+        let line = match m.typ {
+            msg::KEY => format!("key {} {}\n", m.code, if m.a != 0 { 1 } else { 0 }),
+            msg::BTN => format!("btn {} {}\n", m.code, if m.a != 0 { 1 } else { 0 }),
+            msg::MOTION => format!("motion {} {}\n", m.a, m.b),
+            msg::WHEEL => format!("wheel {} {}\n", m.code, m.a),
+            // ScreenCaptureKit cannot compose the pointer without lagging it
+            // by the capture pipeline, so the video never carries a cursor and
+            // the client's own (instant) pointer is the only one on screen.
+            msg::CURSOR => continue,
+            // The client had to drop packets and wants a keyframe now.
+            msg::IDR => {
+                need_idr.store(true, std::sync::atomic::Ordering::Relaxed);
+                continue;
+            }
+            msg::CLIP_SET => {
+                if let Some(stdin) = pb.lock().unwrap().as_mut() {
+                    let _ = write_clip(stdin, 1, &payload);
+                }
+                continue;
+            }
+            msg::CLIP_SET_HTML => {
+                if let Some(stdin) = pb.lock().unwrap().as_mut() {
+                    let _ = write_clip(stdin, 2, &payload);
+                }
+                continue;
+            }
+            msg::PING => continue,
+            // KEYMAP/MODS and gamepads are not handled by this server yet.
+            _ => continue,
+        };
+        seen += 1;
+        if seen <= 5 || seen.is_multiple_of(60) {
+            info!("input #{seen} -> {line}");
+        }
+        out.write_all(line.as_bytes())?;
+        out.flush()?;
+    }
+}

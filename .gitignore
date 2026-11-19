@@ -10,3 +10,5 @@ packaging/*.tar.gz
 *.ppm
 **/*.rs.bk
 scripts/__pycache__/
+
+*.dmg
