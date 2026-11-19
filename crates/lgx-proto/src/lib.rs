@@ -29,6 +29,9 @@ pub mod msg {
     pub const CLIP_DATA_HTML: u8 = 21;
     /// `code` = 1 to overlay the guest pointer, 0 to draw it on the client.
     pub const CURSOR: u8 = 13;
+    /// `a` = 1: the server does not composite the pointer; the client shows
+    /// its own cursor while the window is focused (a smooth local pointer).
+    pub const CURSOR_LOCAL: u8 = 22;
     pub const PING: u8 = 14;
     /// File-clipboard offer: list of entries; length in `a`.
     pub const FILE_BEGIN: u8 = 15;
@@ -37,6 +40,9 @@ pub mod msg {
     pub const FILE_END: u8 = 17;
     /// One gamepad state snapshot; see `GAMEPAD_LEN`.
     pub const GAMEPAD: u8 = 18;
+    /// Client asks for an immediate keyframe after it had to drop packets, so
+    /// the HEVC reference chain heals without waiting for the next GOP.
+    pub const IDR: u8 = 23;
     pub const GAMEPAD_LEN: usize = 24;
 }
 
