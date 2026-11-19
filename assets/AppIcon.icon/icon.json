@@ -1,0 +1,271 @@
+{
+  "fill": {
+    "linear-gradient": [
+      "srgb:0.02,0.06,0.10,1.00",
+      "srgb:0.02,0.13,0.18,1.00"
+    ],
+    "orientation": {
+      "start": {
+        "x": 0.5,
+        "y": 0.0
+      },
+      "stop": {
+        "x": 0.5,
+        "y": 1.0
+      }
+    }
+  },
+  "fill-specializations": [
+    {
+      "value": {
+        "linear-gradient": [
+          "srgb:0.02,0.06,0.10,1.00",
+          "srgb:0.02,0.13,0.18,1.00"
+        ],
+        "orientation": {
+          "start": {
+            "x": 0.5,
+            "y": 0.0
+          },
+          "stop": {
+            "x": 0.5,
+            "y": 1.0
+          }
+        }
+      }
+    },
+    {
+      "appearance": "dark",
+      "value": {
+        "linear-gradient": [
+          "srgb:0.00,0.02,0.05,1.00",
+          "srgb:0.01,0.09,0.13,1.00"
+        ],
+        "orientation": {
+          "start": {
+            "x": 0.5,
+            "y": 0.0
+          },
+          "stop": {
+            "x": 0.5,
+            "y": 1.0
+          }
+        }
+      }
+    },
+    {
+      "appearance": "tinted",
+      "value": {
+        "solid": "srgb:0.10,0.12,0.14,1.00"
+      }
+    }
+  ],
+  "groups": [
+    {
+      "name": "Highlight",
+      "layers": [
+        {
+          "name": "Highlight",
+          "image-name": "highlight.png",
+          "glass": false
+        }
+      ],
+      "shadow": {
+        "kind": "none",
+        "opacity": 0
+      },
+      "specular": false,
+      "translucency": {
+        "enabled": false,
+        "value": 0
+      },
+      "hidden-specializations": [
+        {
+          "appearance": "tinted",
+          "value": true
+        }
+      ]
+    },
+    {
+      "name": "Bolt",
+      "layers": [
+        {
+          "name": "Bolt",
+          "image-name": "bolt.png",
+          "glass": false
+        }
+      ],
+      "shadow": {
+        "kind": "none",
+        "opacity": 0
+      },
+      "specular": false,
+      "translucency": {
+        "enabled": false,
+        "value": 0
+      },
+      "hidden-specializations": [
+        {
+          "appearance": "tinted",
+          "value": true
+        }
+      ]
+    },
+    {
+      "name": "BoltGlow",
+      "layers": [
+        {
+          "name": "BoltGlow",
+          "image-name": "bolt-glow.png",
+          "glass": false
+        }
+      ],
+      "shadow": {
+        "kind": "none",
+        "opacity": 0
+      },
+      "specular": false,
+      "translucency": {
+        "enabled": false,
+        "value": 0
+      },
+      "blend-mode": "screen",
+      "hidden-specializations": [
+        {
+          "appearance": "tinted",
+          "value": true
+        }
+      ]
+    },
+    {
+      "name": "Screen",
+      "layers": [
+        {
+          "name": "Screen",
+          "image-name": "screen.png",
+          "glass": false
+        }
+      ],
+      "shadow": {
+        "kind": "none",
+        "opacity": 0
+      },
+      "specular": false,
+      "translucency": {
+        "enabled": false,
+        "value": 0
+      },
+      "hidden-specializations": [
+        {
+          "appearance": "tinted",
+          "value": true
+        }
+      ]
+    },
+    {
+      "name": "Display",
+      "layers": [
+        {
+          "name": "Display",
+          "image-name": "body.png",
+          "glass": true
+        }
+      ],
+      "shadow": {
+        "kind": "layer-color",
+        "opacity": 0.35
+      },
+      "specular": true,
+      "translucency": {
+        "enabled": true,
+        "value": 0.36
+      },
+      "lighting": "combined",
+      "blur-material": 0.68,
+      "hidden-specializations": [
+        {
+          "appearance": "tinted",
+          "value": true
+        }
+      ]
+    },
+    {
+      "name": "Tinted",
+      "layers": [
+        {
+          "name": "Tinted",
+          "image-name": "tinted.png",
+          "glass": true
+        }
+      ],
+      "shadow": {
+        "kind": "none",
+        "opacity": 0
+      },
+      "specular": true,
+      "translucency": {
+        "enabled": true,
+        "value": 0.25
+      },
+      "lighting": "combined",
+      "blur-material": 0.55,
+      "hidden": true,
+      "hidden-specializations": [
+        {
+          "appearance": "tinted",
+          "value": false
+        }
+      ]
+    },
+    {
+      "name": "Shadow",
+      "layers": [
+        {
+          "name": "Shadow",
+          "image-name": "shadow.png",
+          "glass": false
+        }
+      ],
+      "shadow": {
+        "kind": "none",
+        "opacity": 0
+      },
+      "specular": false,
+      "translucency": {
+        "enabled": false,
+        "value": 0
+      }
+    },
+    {
+      "name": "Glow",
+      "layers": [
+        {
+          "name": "Glow",
+          "image-name": "glow.png",
+          "glass": false
+        }
+      ],
+      "shadow": {
+        "kind": "none",
+        "opacity": 0
+      },
+      "specular": false,
+      "translucency": {
+        "enabled": false,
+        "value": 0
+      },
+      "blend-mode": "screen",
+      "hidden-specializations": [
+        {
+          "appearance": "tinted",
+          "value": true
+        }
+      ]
+    }
+  ],
+  "supported-platforms": {
+    "squares": [
+      "macOS"
+    ]
+  }
+}

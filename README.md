@@ -104,6 +104,13 @@ itself. `codesign` needs an unlocked login keychain, so run the signing scripts
 from the logged-in GUI session, not from a bare SSH shell. The app must remain
 owned by the login user; `build-macos-app.sh` replaces it without sudo.
 
+The app icon is a Liquid Glass `.icon` source at `assets/AppIcon.icon` with
+light, dark and tinted appearances. `assets/make-macos-icon.py` renders its
+layers; `scripts/compile-macos-icon.sh` compiles it to `assets/Assets.car` and
+`assets/lgx.icns` with `actool` (Xcode, or the clean-room `actool` from
+`https://github.com/viraptor/actool`). The app copies both and sets
+`CFBundleIconName=AppIcon`; the `.icns` is only the pre-macOS 26 fallback.
+
 ## Packaging
 
 ```bash

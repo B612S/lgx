@@ -403,6 +403,18 @@ lgx-client archlinux
 The client needs FFmpeg headers, SDL3, ash (Vulkan bindings) and a Vulkan
 driver. The server needs libva headers for the helper.
 
+## macOS app icon
+
+- `assets/AppIcon.icon` is the Icon Composer source (PNG layers + `icon.json`);
+  `assets/make-macos-icon.py` renders it, and
+  `scripts/compile-macos-icon.sh` compiles it with `actool` into
+  `assets/Assets.car` + `assets/lgx.icns`.
+- The app must ship `Assets.car` and `CFBundleIconName=AppIcon`; the `.icns`
+  is the pre-macOS 26 fallback. Keep the Liquid Glass groups and the
+  light/dark/tinted specializations in the `.icon`; a flat `.icns` loses them.
+- The top-level fill covers the full 1024 square; the system applies the
+  squircle. Transparent margins make macOS wrap the icon in a white platter.
+
 ## Known pitfalls
 
 1. VAAPI HEVC with `async_depth > 1` emits several packets per frame; batching

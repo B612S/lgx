@@ -59,6 +59,7 @@ cp "$ROOT/target/macos-helper/lgx-macos-cursor" "$APP/Contents/MacOS/"
 cp "$ROOT/target/macos-helper/lgx-macos-audio" "$APP/Contents/MacOS/"
 cp "$ROOT/target/macos-helper/lgx-pb"        "$APP/Contents/MacOS/"
 [ -f "$ROOT/assets/lgx.icns" ] && cp "$ROOT/assets/lgx.icns" "$APP/Contents/Resources/lgx.icns"
+[ -f "$ROOT/assets/Assets.car" ] && cp "$ROOT/assets/Assets.car" "$APP/Contents/Resources/Assets.car"
 chmod 755 "$APP/Contents/MacOS/"*
 
 cat > "$APP/Contents/Info.plist" <<PLIST
@@ -71,6 +72,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleIdentifier</key><string>$IDENT</string>
     <key>CFBundleExecutable</key><string>lgx-launcher</string>
     <key>CFBundleIconFile</key><string>lgx.icns</string>
+    <key>CFBundleIconName</key><string>AppIcon</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>0.2</string>
     <key>CFBundleVersion</key><string>2</string>
