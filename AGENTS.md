@@ -4,12 +4,14 @@ Rules for agents working on this repository.
 
 ## Project
 
-`lgx` is a HEVC remote desktop for Wayland: a server inside a wlroots
-compositor session encodes HEVC with VAAPI, and a client on the host decodes it
-with NVDEC/CUDA or VAAPI and presents it through Vulkan.
+`lgx` is a low-latency HEVC remote desktop. The server runs inside a wlroots
+compositor on Linux (VAAPI) or as a macOS app (ScreenCaptureKit/VideoToolbox);
+the client runs on Linux/Wayland and decodes with NVDEC/CUDA or VAAPI into a
+Vulkan swapchain.
 
-The guest and host are expected to be on the same machine (VM + host), but the
-transport is TCP so the same binaries work across a LAN.
+Server and client may run on the same machine (VM + host) or on different
+machines on a LAN. The transport is TCP; there is no discovery, so the client
+addresses the server's LAN IP and explicit ports.
 
 ## Layout
 
