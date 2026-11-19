@@ -30,7 +30,8 @@ swiftc -O -o "$ROOT/target/macos-helper/lgx-vtenc" "$ROOT/helper/lgx-vtenc.swift
 clang -O2 -o "$ROOT/target/macos-helper/lgx-cginput" \
   "$ROOT/helper/lgx-cginput.c" "$ROOT/helper/lgx-frontmost.m" \
   "$ROOT/helper/lgx-media.m" \
-  -framework ApplicationServices -framework CoreGraphics -framework AppKit
+  -framework ApplicationServices -framework CoreGraphics -framework AppKit \
+  -framework CoreVideo
 swiftc -O -o "$ROOT/target/macos-helper/lgx-launcher" "$ROOT/helper/lgx-launcher.swift" \
   -framework AppKit -framework ApplicationServices -framework ScreenCaptureKit
 # Audio capture is Swift: CATapDescription is an Objective-C class, so the C

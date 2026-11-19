@@ -239,6 +239,12 @@ the Vulkan shader converts full-range BT.709, and the HEVC VUI says
   between down and up. The client also resends its pointer position before a
   press and sets `SDL_MOUSE_FOCUS_CLICKTHROUGH`, so a click that focuses the
   window still reaches the guest.
+- macOS smooth scrolling is driven by `CVDisplayLink`: one pixel scroll event
+  per display frame with `kCGScrollWheelEventScrollPhase`
+  began/changed/ended. A background `nanosleep` is coalesced by macOS to
+  ~30 Hz and makes the animation stepped even on a 120 Hz panel.
+  `take_slice(0)` must return 0, or every vertical event also jitters
+  horizontally by a pixel. `LGX_SMOOTH_SCROLL=0` falls back to line events.
 - **Rich text only, event-driven.** Both sides use
   `wl-clipboard_rs::watch::Watcher`; no 300 ms polling and no `wl-paste`
   subprocess. The server skips the watcher's initial event so an old guest

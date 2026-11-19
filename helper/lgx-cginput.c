@@ -19,6 +19,7 @@
 // Requires the Accessibility TCC grant for the responsible process.
 #include <ApplicationServices/ApplicationServices.h>
 #include <CoreGraphics/CoreGraphics.h>
+#include <CoreVideo/CoreVideo.h>
 #include <IOKit/hidsystem/ev_keymap.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -358,26 +359,28 @@ static void post_motion(int nx, int ny) {
     if (src) CFRelease(src);
 }
 
-// A mouse wheel delivers one event per notch, and posting one line-based event
-// per notch makes the guest jump; a trackpad instead sends a stream of pixel
-// events that every AppKit/Chromium app already scrolls smoothly. So a notch is
-// expanded into a short ease-out animation of pixel events.
+// A mouse wheel delivers one event per notch. A line-based event makes the
+// guest jump, so a notch is expanded into an ease-out animation of pixel scroll
+// events. The animation is driven by CVDisplayLink: a background nanosleep is
+// coalesced by macOS to ~30 Hz, which made the scroll visibly stepped even on
+// a 120 Hz display. One event per display frame is what a trackpad produces.
 static pthread_mutex_t g_scroll_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t g_scroll_cond = PTHREAD_COND_INITIALIZER;
 static int g_pending_y = 0;   // pixels still to deliver, signed
 static int g_pending_x = 0;
-static int g_scroll_stop = 0;
 static int g_smooth_scroll = 1;
 static int g_wheel_pixels = 48;   // one notch, in pixels
 static int g_wheel_invert = 0;    // 1 = keep the natural-scroll direction
 
-static void post_scroll(int32_t dy, int32_t dx) {
+static void post_scroll(int32_t dy, int32_t dx, int phase) {
     CGEventSourceRef src = CGEventSourceCreate(kCGEventSourceStateHIDSystemState);
     CGEventRef ev = CGEventCreateScrollWheelEvent(src, kCGScrollEventUnitPixel, 2, dy, dx);
     if (ev) {
         // Without this the event is treated as a discrete wheel click and the
         // app scrolls in whole lines again.
         CGEventSetIntegerValueField(ev, kCGScrollWheelEventIsContinuous, 1);
+        // A phase turns the stream into one gesture, so the app smooths the
+        // events instead of treating every frame as a separate wheel click.
+        CGEventSetIntegerValueField(ev, kCGScrollWheelEventScrollPhase, phase);
         CGEventPost(kCGHIDEventTap, ev);
         CFRelease(ev);
     }
@@ -397,8 +400,10 @@ static void post_wheel_lines(int axis, int steps) {
 }
 
 // Take at most a quarter of what is left: the first steps are large and the
-// tail is short, which is the ease-out a trackpad produces.
+// tail is short, which is the ease-out a trackpad produces. A zero axis must
+// stay zero, otherwise every vertical event also jitters horizontally.
 static int take_slice(int pending) {
+    if (pending == 0) return 0;
     int mag = pending < 0 ? -pending : pending;
     int step = mag / 4;
     if (step < 1) step = 1;
@@ -406,29 +411,35 @@ static int take_slice(int pending) {
     return pending < 0 ? -step : step;
 }
 
-static void *scroll_worker(void *arg) {
-    (void)arg;
-    for (;;) {
-        pthread_mutex_lock(&g_scroll_lock);
-        while (g_pending_y == 0 && g_pending_x == 0 && !g_scroll_stop) {
-            pthread_cond_wait(&g_scroll_cond, &g_scroll_lock);
-        }
-        if (g_scroll_stop) {
-            pthread_mutex_unlock(&g_scroll_lock);
-            return NULL;
-        }
-        int dy = take_slice(g_pending_y);
-        int dx = take_slice(g_pending_x);
-        g_pending_y -= dy;
-        g_pending_x -= dx;
-        pthread_mutex_unlock(&g_scroll_lock);
+static int g_scrolling = 0;
+static CVDisplayLinkRef g_display_link = NULL;
 
-        post_scroll(dy, dx);
-        // 8 ms per step: one notch is delivered in about 80 ms, which keeps a
-        // spinning wheel from building a backlog.
-        struct timespec ts = {0, 8L * 1000 * 1000};
-        nanosleep(&ts, NULL);
+// One animation step per display frame. CVDisplayLink runs at the panel rate
+// even for a background helper, so a 120 Hz display gets 120 events/s.
+static CVReturn scroll_frame(CVDisplayLinkRef link, const CVTimeStamp *now,
+                             const CVTimeStamp *output, CVOptionFlags flags_in,
+                             CVOptionFlags *flags_out, void *ctx) {
+    (void)link; (void)now; (void)output; (void)flags_in; (void)flags_out; (void)ctx;
+    pthread_mutex_lock(&g_scroll_lock);
+    if (g_pending_y == 0 && g_pending_x == 0) {
+        pthread_mutex_unlock(&g_scroll_lock);
+        return kCVReturnSuccess;
     }
+    int dy = take_slice(g_pending_y);
+    int dx = take_slice(g_pending_x);
+    g_pending_y -= dy;
+    g_pending_x -= dx;
+    int phase = g_scrolling ? kCGScrollPhaseChanged : kCGScrollPhaseBegan;
+    g_scrolling = 1;
+    int done = g_pending_y == 0 && g_pending_x == 0;
+    pthread_mutex_unlock(&g_scroll_lock);
+
+    post_scroll(dy, dx, phase);
+    if (done) {
+        post_scroll(0, 0, kCGScrollPhaseEnded);
+        g_scrolling = 0;
+    }
+    return kCVReturnSuccess;
 }
 
 // Queue one wheel command. Several notches accumulate, so a fast spin scrolls
@@ -438,7 +449,7 @@ static void queue_wheel(int axis, int steps) {
     // The client sends the wheel notch as the desktop reported it; some mice and
     // drivers (and "natural scrolling" preferences) end up inverted on macOS.
     if (g_wheel_invert) steps = -steps;
-    if (!g_smooth_scroll) {
+    if (!g_smooth_scroll || !g_display_link) {
         post_wheel_lines(axis, steps);
         return;
     }
@@ -449,7 +460,6 @@ static void queue_wheel(int axis, int steps) {
     } else {
         g_pending_x += px;
     }
-    pthread_cond_signal(&g_scroll_cond);
     pthread_mutex_unlock(&g_scroll_lock);
 }
 
@@ -464,13 +474,18 @@ int main(void) {
     const char *invert = getenv("LGX_WHEEL_INVERT");
     if (invert && invert[0] == '1') g_wheel_invert = 1;
     if (g_smooth_scroll) {
-        pthread_t worker;
-        if (pthread_create(&worker, NULL, scroll_worker, NULL) == 0) {
-            pthread_detach(worker);
+        if (CVDisplayLinkCreateWithActiveCGDisplays(&g_display_link) == kCVReturnSuccess
+            && CVDisplayLinkSetOutputCallback(g_display_link, scroll_frame, NULL) == kCVReturnSuccess
+            && CVDisplayLinkStart(g_display_link) == kCVReturnSuccess) {
             fprintf(stderr, "lgx-cginput: smooth scroll, %d px per notch%s\n",
                     g_wheel_pixels, g_wheel_invert ? ", inverted" : "");
         } else {
+            if (g_display_link) {
+                CVDisplayLinkRelease(g_display_link);
+                g_display_link = NULL;
+            }
             g_smooth_scroll = 0;
+            fprintf(stderr, "lgx-cginput: smooth scroll unavailable, using line events\n");
         }
     }
 
@@ -489,6 +504,15 @@ int main(void) {
         } else if (strcmp(cmd, "wheel") == 0) {
             queue_wheel(a, b);
         }
+    }
+    if (g_display_link) {
+        CVDisplayLinkStop(g_display_link);
+        if (g_scrolling) {
+            post_scroll(0, 0, kCGScrollPhaseEnded);
+            g_scrolling = 0;
+        }
+        CVDisplayLinkRelease(g_display_link);
+        g_display_link = NULL;
     }
     return 0;
 }
