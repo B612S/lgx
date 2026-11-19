@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use lgx_proto::secure::{self, Secure};
-use lgx_proto::{codec, msg, Msg};
+use lgx_proto::{codec, file, msg, Msg};
 
 use crate::clients;
 use crate::clip;
@@ -166,6 +166,35 @@ impl Hub {
         });
     }
 
+    /// A file clipboard is a short burst; send it directly on each client's
+    /// secure stream. The writer thread's video messages can interleave, but
+    /// every message is sealed atomically.
+    pub fn broadcast_file(&self, name: &str, data: &[u8]) {
+        if data.len() as u64 > file::MAX_BYTES {
+            return;
+        }
+        let begin = file::encode_begin(name, data.len() as u64);
+        let list = self.clients.lock().unwrap();
+        eprintln!("lgx-server: broadcasting file {} to {} client(s)", name, list.len());
+        for c in list.iter() {
+            if c.secure
+                .send_msg(Msg::new(msg::FILE_BEGIN, 0, begin.len() as i32, 0), &begin)
+                .is_err()
+            {
+                continue;
+            }
+            for chunk in data.chunks(32 * 1024) {
+                if c.secure
+                    .send_msg(Msg::new(msg::FILE_DATA, 0, chunk.len() as i32, 0), chunk)
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            let _ = c.secure.send_msg(Msg::new(msg::FILE_END, 0, 0, 0), &[]);
+        }
+    }
+
 }
 
 /// Streams a file clipboard to one client, locking the socket per message so
@@ -263,6 +292,7 @@ fn handle(
     }
 
     let (tx, rx) = std::sync::mpsc::sync_channel::<Out>(2);
+    let mut incoming_file: Option<(String, u64, Vec<u8>)> = None;
     let token_hash = clients::token_fingerprint(&token);
     hub.clients.lock().unwrap().push(Client {
         id,
@@ -362,8 +392,38 @@ fn handle(
                     }
                 }
             }
-            msg::FILE_BEGIN | msg::FILE_DATA | msg::FILE_END => {
-                eprintln!("lgx-server: ignoring file clipboard (text only)");
+            msg::FILE_BEGIN => {
+                incoming_file = match file::decode_begin(&payload) {
+                    Some((name, size)) if size <= file::MAX_BYTES => {
+                        Some((name, size, Vec::new()))
+                    }
+                    _ => None,
+                };
+            }
+            msg::FILE_DATA => {
+                let Some((_, size, data)) = incoming_file.as_mut() else {
+                    continue;
+                };
+                if data.len() as u64 + payload.len() as u64 > *size {
+                    incoming_file = None;
+                    continue;
+                }
+                data.extend_from_slice(&payload);
+            }
+            msg::FILE_END => {
+                let Some((name, size, data)) = incoming_file.take() else {
+                    continue;
+                };
+                if data.len() as u64 != size {
+                    continue;
+                }
+                *last_remote.lock().unwrap() = clip::signature(&clip::Clip::File {
+                    name: name.clone(),
+                    data: data.clone(),
+                });
+                if let Err(e) = clip::set_file(&name, &data) {
+                    eprintln!("lgx-server: file clipboard: {e}");
+                }
             }
             msg::GAMEPAD => {
                 if payload.len() >= msg::GAMEPAD_LEN {

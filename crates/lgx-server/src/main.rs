@@ -626,6 +626,10 @@ fn main() {
                     clip::Clip::Text(text) if !text.is_empty() => {
                         hub.broadcast_clip(&text);
                     }
+                    clip::Clip::File { name, data } => {
+                        eprintln!("lgx-server: file clipboard {} ({} bytes)", name, data.len());
+                        hub.broadcast_file(&name, &data);
+                    }
                     _ => {}
                 }
             },

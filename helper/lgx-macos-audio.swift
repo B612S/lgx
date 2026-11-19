@@ -6,9 +6,9 @@
 // the Mac itself stays quiet. No virtual audio driver is installed and the
 // system's default output device is not changed.
 //
-// stdout carries raw little-endian signed 16-bit stereo frames at 48 kHz,
-// which is exactly what the lgx audio port transports. stderr carries status
-// for the server log.
+// stdout carries framed PCM: u64 LE timestamp, u32 LE byte count, then
+// little-endian signed 16-bit stereo frames at 48 kHz. The timestamp is the
+// server timeline used for A/V sync. stderr carries status for the server log.
 //
 // The host app must declare NSAudioCaptureUsageDescription; without the
 // "System Audio Recording" grant the tap is created successfully but delivers
@@ -115,11 +115,10 @@ func quantize(_ sample: Float) -> Int16 {
     return Int16(max(-32768.0, min(32767.0, scaled)))
 }
 
-func writeAll(_ bytes: Int) {
+func writeRaw(_ bytes: UnsafeRawPointer, _ count: Int) {
     var offset = 0
-    let base = UnsafeMutableRawPointer(outBuffer)
-    while offset < bytes {
-        let written = write(STDOUT_FILENO, base + offset, bytes - offset)
+    while offset < count {
+        let written = write(STDOUT_FILENO, bytes + offset, count - offset)
         if written > 0 {
             offset += written
         } else if written < 0 && errno == EINTR {
@@ -130,6 +129,27 @@ func writeAll(_ bytes: Int) {
             writeFailed = true
             return
         }
+    }
+}
+
+/// Writes one PCM chunk with the server-side timeline timestamp of its first
+/// sample. Header: u64 LE nanoseconds, u32 LE byte count, then s16le stereo.
+/// The timestamp is taken at the write: the client uses it for A/V sync and
+/// the tap's fixed buffer latency is compensated on the client.
+func writeFrame(_ frames: Int) {
+    let bytes = frames * 4
+    var header = [UInt8](repeating: 0, count: 12)
+    var timestamp = DispatchTime.now().uptimeNanoseconds.littleEndian
+    var count = UInt32(bytes).littleEndian
+    withUnsafeBytes(of: &timestamp) { raw in
+        for i in 0..<8 { header[i] = raw[i] }
+    }
+    withUnsafeBytes(of: &count) { raw in
+        for i in 0..<4 { header[8 + i] = raw[i] }
+    }
+    header.withUnsafeBytes { writeRaw($0.baseAddress!, 12) }
+    if !writeFailed {
+        writeRaw(UnsafeRawPointer(outBuffer), bytes)
     }
 }
 
@@ -183,7 +203,7 @@ func handleInput(_ input: UnsafePointer<AudioBufferList>) {
         written = frames
     }
     if written > 0 {
-        writeAll(written * 4)
+        writeFrame(written)
         emittedFrames += UInt64(written)
     }
 }
@@ -200,7 +220,7 @@ func writeSilence(_ frames: Int) {
     for index in 0..<(frames * 2) {
         outBuffer[index] = quantize(0)
     }
-    writeAll(frames * 4)
+    writeFrame(frames)
 }
 
 func shutdown() {
@@ -291,6 +311,17 @@ func start() {
         shutdown()
         fail("cannot start the tap: \(startStatus)")
     }
+    // The pacer's clock starts when the tap actually starts. Otherwise the
+    // hundreds of milliseconds spent creating the process tap and aggregate
+    // are emitted as one startup burst of silence, which the client prebuffers
+    // and plays before the first real sample.
+    emitLock.lock()
+    let now = DispatchTime.now().uptimeNanoseconds
+    lastCallbackAt = now
+    clockStartNs = now
+    emittedFrames = 0
+    tapIdle = true
+    emitLock.unlock()
     log("capturing the system mix at 48 kHz stereo; local playback is muted while streaming")
 }
 

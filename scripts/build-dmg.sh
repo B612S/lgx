@@ -5,8 +5,8 @@
 #   LGX_SIGN_ID="LGX Dev Signing 2" ./scripts/build-dmg.sh
 #
 # Run it from a Terminal in the logged-in GUI session (codesign needs the login
-# keychain unlocked), or from the one-shot LaunchAgent that agent-notes.md
-# describes. The app inside the image is signed with the same stable identity as
+# keychain unlocked), or from a one-shot LaunchAgent in that session. The app
+# inside the image is signed with the same stable identity as
 # a direct install, so TCC grants survive dragging the new copy over the old one.
 set -euo pipefail
 

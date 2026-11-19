@@ -19,6 +19,8 @@ import Foundation
 
 let kindText: UInt8 = 1
 let kindHtml: UInt8 = 2
+let kindFile: UInt8 = 3
+let maxFileBytes = 16 * 1024 * 1024
 
 func log(_ message: String) {
     FileHandle.standardError.write(("lgx-pb: " + message + "\n").data(using: .utf8)!)
@@ -66,6 +68,51 @@ func appendLe32(_ out: inout Data, _ value: UInt32) {
     out.append(UInt8(truncatingIfNeeded: value >> 24))
 }
 
+func appendLe64(_ out: inout Data, _ value: UInt64) {
+    for shift in stride(from: 0, to: 64, by: 8) {
+        out.append(UInt8(truncatingIfNeeded: value >> UInt64(shift)))
+    }
+}
+
+func readLe64(_ data: Data, _ offset: Int) -> UInt64? {
+    guard data.count >= offset + 8 else { return nil }
+    var value: UInt64 = 0
+    for i in 0..<8 {
+        value |= UInt64(data[offset + i]) << UInt64(i * 8)
+    }
+    return value
+}
+
+/// File record payload: u32 LE name length, UTF-8 name, u64 LE size, data.
+func decodeFileRecord(_ payload: Data) -> (String, Data)? {
+    guard let nameLength = readLe32(payload, 0), nameLength > 0, nameLength <= 255,
+          payload.count >= 4 + Int(nameLength) + 8 else { return nil }
+    let nameData = payload.subdata(in: 4..<(4 + Int(nameLength)))
+    guard let name = String(data: nameData, encoding: .utf8) else { return nil }
+    guard let base = name.split(separator: "/").last.map(String.init), !base.isEmpty,
+          base != ".", base != "..", !base.contains("\0") else { return nil }
+    guard let size = readLe64(payload, 4 + Int(nameLength)) else { return nil }
+    let start = 4 + Int(nameLength) + 8
+    guard size <= UInt64(maxFileBytes), payload.count - start == Int(size) else { return nil }
+    return (base, payload.subdata(in: start..<payload.count))
+}
+
+func fileRecord(name: String, data: Data) -> Data {
+    let nameData = Data(name.utf8)
+    var out = Data(capacity: 4 + nameData.count + 8 + data.count)
+    appendLe32(&out, UInt32(nameData.count))
+    out.append(nameData)
+    appendLe64(&out, UInt64(data.count))
+    out.append(data)
+    return out
+}
+
+func cacheDirectory() -> URL {
+    let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+        ?? URL(fileURLWithPath: NSTemporaryDirectory())
+    return base.appendingPathComponent("lgx/clipboard", isDirectory: true)
+}
+
 func writeRecord(_ kind: UInt8, _ payload: Data) {
     var frame = Data(capacity: 5 + payload.count)
     let length = UInt32(payload.count)
@@ -81,6 +128,27 @@ func writeRecord(_ kind: UInt8, _ payload: Data) {
 func apply(_ kind: UInt8, _ payload: Data) {
     lock.lock()
     defer { lock.unlock() }
+    if kind == kindFile {
+        guard let (name, data) = decodeFileRecord(payload) else {
+            log("ignoring a malformed file clipboard record")
+            return
+        }
+        do {
+            let dir = cacheDirectory().appendingPathComponent(UUID().uuidString, isDirectory: true)
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let url = dir.appendingPathComponent(name)
+            try data.write(to: url)
+            pasteboard.clearContents()
+            if !pasteboard.writeObjects([url as NSURL]) {
+                log("could not publish the clipboard file")
+                return
+            }
+            lastChange = pasteboard.changeCount
+        } catch {
+            log("file clipboard: \(error.localizedDescription)")
+        }
+        return
+    }
     // Validate before touching the pasteboard: a malformed record used to clear
     // the clipboard and leave it empty, which made every Paste do nothing.
     if kind == kindHtml {
@@ -112,6 +180,23 @@ func publish() {
         return
     }
     lastChange = change
+    // A file offer must win over text; otherwise a copied file is sent as its
+    // path and pasted back as a text file.
+    if let urls = pasteboard.readObjects(
+        forClasses: [NSURL.self],
+        options: [.urlReadingFileURLsOnly: true]) as? [URL], !urls.isEmpty
+    {
+        guard urls.count == 1 else { return }
+        let url = urls[0]
+        guard url.isFileURL,
+              let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
+              values.isRegularFile == true,
+              let size = values.fileSize, size > 0, size <= maxFileBytes,
+              let data = try? Data(contentsOf: url)
+        else { return }
+        writeRecord(kindFile, fileRecord(name: url.lastPathComponent, data: data))
+        return
+    }
     if let html = pasteboard.data(forType: .html), !html.isEmpty {
         let plain = pasteboard.string(forType: .string) ?? ""
         var payload = Data(capacity: 4 + html.count + plain.utf8.count)

@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use lgx_proto::secure::{self, Secure};
-use lgx_proto::{codec, msg, Msg};
+use lgx_proto::{codec, file, msg, Msg};
 
 use crate::dec::Chunk;
 
@@ -85,6 +85,8 @@ pub struct Conn {
     pub local_cursor: std::sync::atomic::AtomicBool,
     /// Latest cursor shape for the locally drawn pointer.
     pub cursor: Arc<Mutex<Option<CursorShape>>>,
+    /// The guest hid its pointer (for example over a video); hide the local one.
+    pub cursor_hidden: std::sync::atomic::AtomicBool,
 }
 
 impl Conn {
@@ -154,6 +156,7 @@ pub fn connect(
         closed: std::sync::atomic::AtomicBool::new(false),
         local_cursor: std::sync::atomic::AtomicBool::new(false),
         cursor: Arc::new(Mutex::new(None)),
+        cursor_hidden: std::sync::atomic::AtomicBool::new(false),
     });
     let conn_for_reader = conn.clone();
     std::thread::Builder::new()
@@ -177,6 +180,8 @@ fn reader(
     // one, so latency stays bounded and the reference chain heals quickly.
     let mut skipping = false;
     let mut last_idr_request: Option<std::time::Instant> = None;
+    // Incoming file clipboard transfer.
+    let mut incoming_file: Option<(String, u64, Vec<u8>)> = None;
     while let Ok((m, payload)) = secure.recv_msg_raw() {
         let body = &payload[secure::MSG_HEADER..];
         match m.typ {
@@ -188,10 +193,14 @@ fn reader(
                     }
                     skipping = false;
                 }
+                // 48-bit capture timestamp in microseconds, 0 if the server
+                // does not timestamp video.
+                let capture_us = ((m.code as u64) << 32) | (m.b as u32 as u64);
                 let chunk = Chunk {
                     data: payload,
                     off: secure::MSG_HEADER,
                     at: std::time::Instant::now(),
+                    capture_us,
                 };
                 match video.try_send(chunk) {
                     Ok(()) => {}
@@ -235,8 +244,16 @@ fn reader(
             }
             msg::CURSOR_IMAGE => {
                 if let Some(shape) = CursorShape::parse(body) {
+                    if conn.cursor_hidden.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                        eprintln!("lgx-client: guest cursor visible");
+                    }
                     *conn.cursor.lock().unwrap() = Some(shape);
                 }
+            }
+            msg::CURSOR_HIDDEN => {
+                eprintln!("lgx-client: guest cursor hidden");
+                conn.cursor_hidden
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
             }
             msg::CLIP_DATA => {
                 if !clipboard.allows(body.len()) {
@@ -248,8 +265,46 @@ fn reader(
                     eprintln!("lgx-client: wl-copy: {e}");
                 }
             }
-            msg::FILE_BEGIN | msg::FILE_DATA | msg::FILE_END => {
-                eprintln!("lgx-client: ignoring file clipboard (text only)");
+            msg::FILE_BEGIN => {
+                eprintln!("lgx-client: file begin ({} bytes)", body.len());
+                if !clipboard.enabled {
+                    incoming_file = None;
+                    continue;
+                }
+                match file::decode_begin(body) {
+                    Some((name, size)) if size <= file::MAX_BYTES => {
+                        incoming_file = Some((name, size, Vec::new()));
+                    }
+                    _ => incoming_file = None,
+                }
+            }
+            msg::FILE_DATA => {
+                let Some((_, size, data)) = incoming_file.as_mut() else {
+                    continue;
+                };
+                if data.len() as u64 + body.len() as u64 > *size {
+                    incoming_file = None;
+                    continue;
+                }
+                data.extend_from_slice(body);
+            }
+            msg::FILE_END => {
+                let Some((name, size, data)) = incoming_file.take() else {
+                    continue;
+                };
+                if data.len() as u64 != size {
+                    continue;
+                }
+                eprintln!("lgx-client: file end {} ({} bytes)", name, data.len());
+                if let Some(sig) = Some(crate::clip::signature(&crate::clip::Clip::File {
+                    name: name.clone(),
+                    data: data.clone(),
+                })) {
+                    *last_remote.lock().unwrap() = sig;
+                }
+                if let Err(e) = crate::clip::set_file(&name, &data) {
+                    eprintln!("lgx-client: file clipboard: {e}");
+                }
             }
             _ => {}
         }

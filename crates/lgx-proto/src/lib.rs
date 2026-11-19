@@ -50,11 +50,89 @@ pub mod msg {
     /// Client asks the server to send cursor shapes. Clients that do not send
     /// this never receive CURSOR_IMAGE, so older clients keep working.
     pub const CURSOR_SHAPE: u8 = 25;
+    /// Server-side cursor is hidden (for example a video player hides it).
+    /// The client must hide its locally drawn pointer until the next
+    /// CURSOR_IMAGE.
+    pub const CURSOR_HIDDEN: u8 = 27;
+    /// Client tells the audio server that it understands the LGXA timestamp
+    /// framing. Sent once after the token; an older server ignores it and an
+    /// older client never sends it, so both keep raw PCM compatibility.
+    pub const AUDIO_SYNC: u8 = 26;
     pub const GAMEPAD_LEN: usize = 24;
 }
 
 pub mod codec {
     pub const HEVC: u16 = 1;
+}
+
+/// File clipboard (one regular file at a time, light files only).
+///
+/// FILE_BEGIN payload: u32 LE name length, UTF-8 name, u64 LE size.
+/// FILE_DATA payload: raw file bytes. FILE_END: empty.
+/// A transfer is only accepted when the total size is within `MAX_BYTES`.
+pub mod file {
+    pub const MAX_BYTES: u64 = 16 * 1024 * 1024;
+    pub const MAX_NAME: usize = 255;
+
+    /// Keep only the final path component; reject empty, dot and NUL names.
+    pub fn sanitize_name(name: &str) -> Option<String> {
+        let base = std::path::Path::new(name).file_name()?.to_str()?;
+        if base.is_empty() || base == "." || base == ".." || base.contains('\0') {
+            return None;
+        }
+        if base.len() > MAX_NAME {
+            return None;
+        }
+        Some(base.to_string())
+    }
+
+    pub fn encode_begin(name: &str, size: u64) -> Vec<u8> {
+        let name = sanitize_name(name).unwrap_or_else(|| "file".to_string());
+        let mut out = Vec::with_capacity(12 + name.len());
+        out.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(&size.to_le_bytes());
+        out
+    }
+
+    pub fn decode_begin(payload: &[u8]) -> Option<(String, u64)> {
+        if payload.len() < 12 {
+            return None;
+        }
+        let name_len = u32::from_le_bytes(payload[0..4].try_into().ok()?) as usize;
+        if name_len == 0 || name_len > MAX_NAME || payload.len() != 12 + name_len {
+            return None;
+        }
+        let name = std::str::from_utf8(&payload[4..4 + name_len]).ok()?;
+        let name = sanitize_name(name)?;
+        let size = u64::from_le_bytes(payload[4 + name_len..12 + name_len].try_into().ok()?);
+        Some((name, size))
+    }
+
+    /// Record used between the macOS helper and the Rust server:
+    /// the FILE_BEGIN header followed by the complete file data.
+    pub fn encode_record(name: &str, data: &[u8]) -> Vec<u8> {
+        let mut out = encode_begin(name, data.len() as u64);
+        out.extend_from_slice(data);
+        out
+    }
+
+    pub fn decode_record(payload: &[u8]) -> Option<(String, Vec<u8>)> {
+        if payload.len() < 12 {
+            return None;
+        }
+        let name_len = u32::from_le_bytes(payload[0..4].try_into().ok()?) as usize;
+        if name_len == 0 || name_len > MAX_NAME || payload.len() < 12 + name_len {
+            return None;
+        }
+        let name = std::str::from_utf8(&payload[4..4 + name_len]).ok()?;
+        let name = sanitize_name(name)?;
+        let size = u64::from_le_bytes(payload[4 + name_len..12 + name_len].try_into().ok()?);
+        if size > MAX_BYTES || size as usize != payload.len() - 12 - name_len {
+            return None;
+        }
+        Some((name, payload[12 + name_len..].to_vec()))
+    }
 }
 
 pub mod evdev {
@@ -162,7 +240,6 @@ pub fn read_msg<R: Read>(r: &mut R) -> io::Result<(Msg, Vec<u8>)> {
 }
 
 pub mod auth;
-pub mod files;
 pub mod secure;
 
 #[cfg(test)]

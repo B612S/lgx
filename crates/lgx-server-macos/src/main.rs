@@ -45,7 +45,7 @@ use std::thread::{self, JoinHandle};
 use lgx_proto::auth;
 use lgx_proto::msg;
 use lgx_proto::secure::{server_handshake, server_read_id, Secure};
-use lgx_proto::{codec, Msg};
+use lgx_proto::{codec, file, Msg};
 
 use config::Config;
 
@@ -347,7 +347,7 @@ fn run_pair(args: &Args) -> std::io::Result<()> {
 /// Spawn the capture helper and read its startup line to learn the geometry
 /// and the frame rate it settled on.
 /// `lgx-vtenc: capture 1920x1200@60, display 1 1920x1200 60.0 Hz`
-fn spawn_capture(args: &Args) -> std::io::Result<(Child, u32, u32, u32)> {
+fn spawn_capture(args: &Args) -> std::io::Result<(Child, u32, u32, u32, Option<u32>)> {
     let mut child_cmd = Command::new(&args.helper);
     // Only pass --fps when the caller pinned one; otherwise the helper follows
     // the display refresh rate instead of assuming 60 Hz.
@@ -369,8 +369,18 @@ fn spawn_capture(args: &Args) -> std::io::Result<(Child, u32, u32, u32)> {
     let mut reader = BufReader::new(stderr);
     let mut line = String::new();
     let (mut w, mut h, mut fps) = (1920u32, 1200u32, args.fps.unwrap_or(60));
+    let mut display_id = None;
     if reader.read_line(&mut line).is_ok() {
         warn!("{}", line.trim_end());
+        // `lgx-vtenc` reports the ScreenCaptureKit display id. Input must use
+        // the same display, not the main one, when --display selects another.
+        if let Some(idx) = line.find(" id=") {
+            let digits: String = line[idx + 4..]
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            display_id = digits.parse::<u32>().ok();
+        }
         if let Some(idx) = line.find("capture ") {
             let rest = &line[idx + 8..];
             if let Some(at) = rest.find('@') {
@@ -400,7 +410,7 @@ fn spawn_capture(args: &Args) -> std::io::Result<(Child, u32, u32, u32)> {
             }
         }
     });
-    Ok((child, w, h, fps))
+    Ok((child, w, h, fps, display_id))
 }
 
 fn spawn_pb(path: &str) -> Option<Child> {
@@ -429,6 +439,7 @@ fn spawn_cursor(
     alive: Arc<AtomicBool>,
     enabled: Arc<AtomicBool>,
     last: Arc<Mutex<Option<Vec<u8>>>>,
+    hidden: Arc<AtomicBool>,
 ) -> Option<Child> {
     let mut cmd = Command::new(path);
     match cmd
@@ -452,6 +463,18 @@ fn spawn_cursor(
                                 break;
                             }
                             let n = u32::from_be_bytes(len) as usize;
+                            if n == 0 {
+                                // Zero-length frame: the guest cursor is hidden.
+                                hidden.store(true, Ordering::Relaxed);
+                                if enabled.load(Ordering::Relaxed)
+                                    && secure
+                                        .send_msg(Msg::new(msg::CURSOR_HIDDEN, 0, 0, 0), &[])
+                                        .is_err()
+                                {
+                                    break;
+                                }
+                                continue;
+                            }
                             if !(16..=256 * 1024).contains(&n) {
                                 break;
                             }
@@ -459,6 +482,7 @@ fn spawn_cursor(
                             if reader.read_exact(&mut payload).is_err() {
                                 break;
                             }
+                            hidden.store(false, Ordering::Relaxed);
                             *last.lock().unwrap() = Some(payload.clone());
                             if enabled.load(Ordering::Relaxed)
                                 && secure
@@ -484,10 +508,13 @@ fn spawn_cursor(
     }
 }
 
-fn spawn_input(path: &str, wheel_invert: bool) -> Option<Child> {
+fn spawn_input(path: &str, wheel_invert: bool, display_id: Option<u32>) -> Option<Child> {
     let mut cmd = Command::new(path);
     if wheel_invert {
         cmd.env("LGX_WHEEL_INVERT", "1");
+    }
+    if let Some(id) = display_id {
+        cmd.env("LGX_DISPLAY_ID", id.to_string());
     }
     match cmd
         .stdin(Stdio::piped())
@@ -617,11 +644,15 @@ fn main() {
 }
 
 fn serve(args: &Args, secure: Arc<Secure>) -> std::io::Result<()> {
-    let (mut capture, w, h, fps) = spawn_capture(args)?;
+    let (mut capture, w, h, fps, display_id) = spawn_capture(args)?;
     // The capture helper's stdin asks for an IDR and carries bitrate changes.
     let capture_stdin: Arc<Mutex<Option<std::process::ChildStdin>>> =
         Arc::new(Mutex::new(capture.stdin.take()));
-    let input = if args.input_socket.is_some() { None } else { spawn_input(&args.input_helper, args.wheel_invert) };
+    let input = if args.input_socket.is_some() {
+        None
+    } else {
+        spawn_input(&args.input_helper, args.wheel_invert, display_id)
+    };
     let mut pb_child = spawn_pb(&args.pb_helper);
     let pb_stdin: Arc<Mutex<Option<std::process::ChildStdin>>> =
         Arc::new(Mutex::new(pb_child.as_mut().and_then(|c| c.stdin.take())));
@@ -647,6 +678,7 @@ fn serve(args: &Args, secure: Arc<Secure>) -> std::io::Result<()> {
     let need_idr = Arc::new(AtomicBool::new(false));
     let cursor_enabled = Arc::new(AtomicBool::new(false));
     let cursor_last: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
+    let cursor_hidden = Arc::new(AtomicBool::new(false));
     let cursor_child = sibling("lgx-macos-cursor").and_then(|path| {
         spawn_cursor(
             &path,
@@ -654,6 +686,7 @@ fn serve(args: &Args, secure: Arc<Secure>) -> std::io::Result<()> {
             Arc::clone(&alive),
             Arc::clone(&cursor_enabled),
             Arc::clone(&cursor_last),
+            Arc::clone(&cursor_hidden),
         )
     });
 
@@ -673,7 +706,7 @@ fn serve(args: &Args, secure: Arc<Secure>) -> std::io::Result<()> {
                     break;
                 }
                 let n = u32::from_be_bytes(len) as usize;
-                if n == 0 || n > 8 * 1024 * 1024 {
+                if n == 0 || n > 32 * 1024 * 1024 {
                     break;
                 }
                 let mut kind = [0u8; 1];
@@ -683,6 +716,31 @@ fn serve(args: &Args, secure: Arc<Secure>) -> std::io::Result<()> {
                 let mut payload = vec![0u8; n];
                 if reader.read_exact(&mut payload).is_err() {
                     break;
+                }
+                if kind[0] == 3 {
+                    if let Some((name, data)) = file::decode_record(&payload) {
+                        let begin = file::encode_begin(&name, data.len() as u64);
+                        if sec
+                            .send_msg(Msg::new(msg::FILE_BEGIN, 0, begin.len() as i32, 0), &begin)
+                            .is_err()
+                        {
+                            break;
+                        }
+                        let mut ok = true;
+                        for chunk in data.chunks(32 * 1024) {
+                            if sec
+                                .send_msg(Msg::new(msg::FILE_DATA, 0, chunk.len() as i32, 0), chunk)
+                                .is_err()
+                            {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        if !ok || sec.send_msg(Msg::new(msg::FILE_END, 0, 0, 0), &[]).is_err() {
+                            break;
+                        }
+                    }
+                    continue;
                 }
                 let typ = if kind[0] == 2 { msg::CLIP_DATA_HTML } else { msg::CLIP_DATA };
                 if sec.send_msg(Msg::new(typ, 0, payload.len() as i32, 0), &payload).is_err() {
@@ -704,6 +762,7 @@ fn serve(args: &Args, secure: Arc<Secure>) -> std::io::Result<()> {
         let pb = Arc::clone(&pb_stdin);
         let cursor_enabled = Arc::clone(&cursor_enabled);
         let cursor_last = Arc::clone(&cursor_last);
+        let cursor_hidden = Arc::clone(&cursor_hidden);
         thread::spawn(move || {
             // A read timeout lets the thread notice a dead peer instead of
             // blocking in recv_msg forever.
@@ -716,6 +775,7 @@ fn serve(args: &Args, secure: Arc<Secure>) -> std::io::Result<()> {
                 &reader_idr,
                 &cursor_enabled,
                 &cursor_last,
+                &cursor_hidden,
             );
         })
     });
@@ -727,6 +787,7 @@ fn serve(args: &Args, secure: Arc<Secure>) -> std::io::Result<()> {
         let idr = Arc::clone(&need_idr);
         let cursor_enabled = Arc::clone(&cursor_enabled);
         let cursor_last = Arc::clone(&cursor_last);
+        let cursor_hidden = Arc::clone(&cursor_hidden);
         thread::spawn(move || match std::os::unix::net::UnixStream::connect(&path) {
             Ok(mut stream) => {
                 info!("input via launcher socket {path}");
@@ -738,6 +799,7 @@ fn serve(args: &Args, secure: Arc<Secure>) -> std::io::Result<()> {
                     &idr,
                     &cursor_enabled,
                     &cursor_last,
+                    &cursor_hidden,
                 );
             }
             Err(e) => warn!("input socket {path}: {e}"),
@@ -749,7 +811,7 @@ fn serve(args: &Args, secure: Arc<Secure>) -> std::io::Result<()> {
     // only turns low bandwidth into seconds of latency. Every dropped frame
     // breaks the HEVC reference chain, so the main loop asks for an IDR.
     let stdout = capture.stdout.take().expect("stdout piped");
-    let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(QUEUE_FRAMES);
+    let (tx, rx) = mpsc::sync_channel::<(Vec<u8>, u64)>(QUEUE_FRAMES);
     let dropped = Arc::new(AtomicUsize::new(0));
     let cap_alive = Arc::clone(&alive);
     let cap_dropped = Arc::clone(&dropped);
@@ -768,11 +830,16 @@ fn serve(args: &Args, secure: Arc<Secure>) -> std::io::Result<()> {
             if n == 0 || n > 32 * 1024 * 1024 {
                 break;
             }
+            let mut ts = [0u8; 8];
+            if reader.read_exact(&mut ts).is_err() {
+                break;
+            }
+            let capture_us = u64::from_be_bytes(ts);
             let mut au = vec![0u8; n];
             if reader.read_exact(&mut au).is_err() {
                 break;
             }
-            match tx.try_send(au) {
+            match tx.try_send((au, capture_us)) {
                 Ok(()) => {}
                 Err(mpsc::TrySendError::Full(_)) => {
                     cap_dropped.fetch_add(1, Ordering::Relaxed);
@@ -844,10 +911,15 @@ fn serve(args: &Args, secure: Arc<Secure>) -> std::io::Result<()> {
             send_secs = 0.0;
         }
         match rx.recv_timeout(Duration::from_millis(250)) {
-            Ok(au) => {
+            Ok((au, capture_us)) => {
                 let n = au.len();
                 let send_started = Instant::now();
-                let sent = secure.send_msg(Msg::new(msg::VIDEO, 0, n as i32, 0), &au);
+                // `code`/`b` carry a 48-bit capture timestamp in microseconds;
+                // zero means unknown. The client uses it to align video with
+                // the audio stream, which carries the same server clock.
+                let code = (capture_us >> 32) as u16;
+                let b = capture_us as u32 as i32;
+                let sent = secure.send_msg(Msg::new(msg::VIDEO, code, n as i32, b), &au);
                 send_secs += send_started.elapsed().as_secs_f64();
                 if let Err(e) = sent {
                     break Err(e);
@@ -900,6 +972,9 @@ fn write_clip(out: &mut impl Write, kind: u8, payload: &[u8]) -> std::io::Result
 }
 
 /// Forward input messages to `lgx-cginput` as plain text lines.
+// The cursor state is three independent Arcs shared with the cursor thread;
+// grouping them would only add a wrapper used by this function and spawn_cursor.
+#[allow(clippy::too_many_arguments)]
 fn write_controls(
     secure: &Secure,
     out: &mut impl Write,
@@ -908,8 +983,10 @@ fn write_controls(
     need_idr: &Arc<AtomicBool>,
     cursor_enabled: &Arc<AtomicBool>,
     cursor_last: &Arc<Mutex<Option<Vec<u8>>>>,
+    cursor_hidden: &Arc<AtomicBool>,
 ) -> std::io::Result<()> {
     let mut seen: u64 = 0;
+    let mut incoming_file: Option<(String, u64, Vec<u8>)> = None;
     loop {
         let (m, payload) = match secure.recv_msg() {
             Ok(v) => v,
@@ -950,10 +1027,41 @@ fn write_controls(
                 }
                 continue;
             }
+            msg::FILE_BEGIN => {
+                incoming_file = match file::decode_begin(&payload) {
+                    Some((name, size)) if size <= file::MAX_BYTES => {
+                        Some((name, size, Vec::new()))
+                    }
+                    _ => None,
+                };
+                continue;
+            }
+            msg::FILE_DATA => {
+                if let Some((_, size, data)) = incoming_file.as_mut() {
+                    if data.len() as u64 + payload.len() as u64 <= *size {
+                        data.extend_from_slice(&payload);
+                    } else {
+                        incoming_file = None;
+                    }
+                }
+                continue;
+            }
+            msg::FILE_END => {
+                if let Some((name, size, data)) = incoming_file.take() {
+                    if data.len() as u64 == size && data.len() as u64 <= file::MAX_BYTES {
+                        let record = file::encode_record(&name, &data);
+                        if let Some(stdin) = pb.lock().unwrap().as_mut() {
+                            let _ = write_clip(stdin, 3, &record);
+                        }
+                    }
+                }
+                continue;
+            }
             msg::CURSOR_SHAPE => {
                 cursor_enabled.store(true, Ordering::Relaxed);
-                let last = cursor_last.lock().unwrap().clone();
-                if let Some(payload) = last {
+                if cursor_hidden.load(Ordering::Relaxed) {
+                    let _ = secure.send_msg(Msg::new(msg::CURSOR_HIDDEN, 0, 0, 0), &[]);
+                } else if let Some(payload) = cursor_last.lock().unwrap().clone() {
                     let _ = secure.send_msg(
                         Msg::new(msg::CURSOR_IMAGE, 0, payload.len() as i32, 0),
                         &payload,

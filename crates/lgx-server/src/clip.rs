@@ -1,9 +1,13 @@
 //! Guest clipboard through wl-clipboard-rs (text and HTML).
 
+use std::fs;
 use std::io::{self, Read, Write};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::process;
 
+use lgx_proto::file as proto_file;
 use wl_clipboard_rs::{paste, watch};
 
 
@@ -11,12 +15,25 @@ use wl_clipboard_rs::{paste, watch};
 pub enum Clip {
     Text(String),
     Rich { html: String, text: String },
+    File { name: String, data: Vec<u8> },
+}
+
+fn fnv(data: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in data {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x1000_0000_01b3);
+    }
+    h
 }
 
 pub fn signature(c: &Clip) -> String {
     match c {
         Clip::Text(t) => format!("t:{t}"),
         Clip::Rich { html, text } => format!("h:{html}{text}"),
+        Clip::File { name, data } => {
+            format!("f:{}:{}:{:016x}", name, data.len(), fnv(data))
+        }
     }
 }
 
@@ -54,15 +71,161 @@ pub fn set_rich(html: &str, text: &str) -> io::Result<()> {
 
 
 
-fn read_offer(mime_types: &[String], offer: &mut watch::Offer<'_>) -> Option<Clip> {
-    if mime_types.iter().any(|m| m == "text/uri-list") {
+fn clipboard_cache() -> PathBuf {
+    std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+        .unwrap_or_else(std::env::temp_dir)
+        .join("lgx")
+        .join("clipboard")
+}
+
+/// Publishes one regular file on the Wayland clipboard as a file URL. The
+/// file manager reads the URI path, so the temp file must outlive this call.
+pub fn set_file(name: &str, data: &[u8]) -> io::Result<()> {
+    if data.len() as u64 > proto_file::MAX_BYTES {
+        return Err(io::Error::other("file clipboard exceeds the size limit"));
+    }
+    let name = proto_file::sanitize_name(name)
+        .ok_or_else(|| io::Error::other("invalid clipboard file name"))?;
+    let root = clipboard_cache();
+    fs::create_dir_all(&root)?;
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dir = root.join(format!("clip-{stamp}-{}", process::id()));
+    fs::create_dir_all(&dir)?;
+    let path = dir.join(&name);
+    fs::write(&path, data)?;
+    // Drop older temp copies; the current clipboard keeps only its own dir.
+    if let Ok(entries) = fs::read_dir(&root) {
+        for entry in entries.flatten() {
+            if entry.path() != dir {
+                let _ = fs::remove_dir_all(entry.path());
+            }
+        }
+    }
+    let uri = format!("file://{}", percent_encode(path.as_os_str().as_encoded_bytes()));
+    let uri_list = format!("{uri}\r\n");
+    let gnome = format!("copy\n{uri}\r\n");
+    use wl_clipboard_rs::copy::{copy_multi, MimeSource, MimeType, Options, Source};
+    let sources = vec![
+        MimeSource {
+            source: Source::Bytes(uri_list.into_bytes().into()),
+            mime_type: MimeType::Specific("text/uri-list".to_string()),
+        },
+        MimeSource {
+            source: Source::Bytes(gnome.into_bytes().into()),
+            mime_type: MimeType::Specific("x-special/gnome-copied-files".to_string()),
+        },
+    ];
+    // copy_multi serves the selection until it is replaced; do not block the
+    // video reader thread.
+    std::thread::spawn(move || {
+        if let Err(e) = copy_multi(Options::new(), sources) {
+            eprintln!("lgx: file clipboard: {e}");
+        }
+    });
+    Ok(())
+}
+
+fn percent_decode(text: &str) -> Option<Vec<u8>> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len() {
+                return None;
+            }
+            let hi = (bytes[i + 1] as char).to_digit(16)?;
+            let lo = (bytes[i + 2] as char).to_digit(16)?;
+            out.push((hi * 16 + lo) as u8);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    Some(out)
+}
+
+fn percent_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len());
+    for b in bytes {
+        let c = *b;
+        if c.is_ascii_alphanumeric() || matches!(c, b'/' | b'-' | b'.' | b'_' | b'~') {
+            out.push(c as char);
+        } else {
+            out.push_str(&format!("%{c:02X}"));
+        }
+    }
+    out
+}
+
+fn uri_to_path(uri: &str) -> Option<PathBuf> {
+    let rest = uri.strip_prefix("file://")?;
+    let path = if rest.starts_with('/') {
+        rest.to_string()
+    } else {
+        let slash = rest.find('/')?;
+        format!("/{}", &rest[slash + 1..])
+    };
+    let bytes = percent_decode(&path)?;
+    let text = String::from_utf8(bytes).ok()?;
+    Some(PathBuf::from(text))
+}
+
+/// One regular file from a `text/uri-list` or GNOME copied-files payload.
+fn file_from_uri_text(text: &str) -> Option<Clip> {
+    let mut uris: Vec<&str> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim_end_matches('\r').trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line == "copy" || line == "cut" {
+            continue;
+        }
+        if line.starts_with("file://") {
+            uris.push(line);
+        }
+    }
+    // Multiple files are intentionally not turned into one; the local
+    // clipboard stays intact instead of becoming a text file.
+    if uris.len() != 1 {
         return None;
     }
+    let path = uri_to_path(uris[0])?;
+    let metadata = fs::metadata(&path).ok()?;
+    if !metadata.is_file() || metadata.len() > proto_file::MAX_BYTES {
+        return None;
+    }
+    let data = fs::read(&path).ok()?;
+    let name = path.file_name()?.to_str()?.to_string();
+    Some(Clip::File { name, data })
+}
+
+fn read_offer(mime_types: &[String], offer: &mut watch::Offer<'_>) -> Option<Clip> {
     fn read(offer: &mut watch::Offer<'_>, mime: &str) -> Option<String> {
         let mut pipe = offer.receive(mime).ok()?;
         let mut text = String::new();
         pipe.read_to_string(&mut text).ok()?;
         Some(text)
+    }
+    // A file offer must never fall through to text: that is what turned a
+    // copied file into a text file in the other direction.
+    for mime in ["text/uri-list", "x-special/gnome-copied-files"] {
+        if mime_types.iter().any(|m| m == mime) {
+            if let Some(text) = read(offer, mime) {
+                if let Some(clip) = file_from_uri_text(&text) {
+                    return Some(clip);
+                }
+                eprintln!("lgx: file clipboard offer could not be parsed");
+            }
+            return None;
+        }
     }
     if let Some(html_mime) = mime_types.iter().find(|m| m.starts_with("text/html")) {
         if let Some(html) = read(offer, html_mime) {

@@ -98,6 +98,9 @@ pub struct Chunk {
     pub data: Vec<u8>,
     pub off: usize,
     pub at: Instant,
+    /// Server capture timestamp in microseconds; 0 when the server does not
+    /// timestamp its access units.
+    pub capture_us: u64,
 }
 
 /// dma-buf planes exported from a VAAPI surface.
@@ -137,6 +140,8 @@ pub struct Frame {
     pub pts: i64,
     /// When the chunk that produced this frame arrived from the network.
     pub arrival: Instant,
+    /// Server capture timestamp in microseconds; 0 when unknown.
+    pub capture_us: u64,
     pub pixels: Pixels,
 }
 
@@ -279,7 +284,9 @@ impl Frame {
         if r != 1 || handle.is_null() {
             return Err(io::Error::other("cannot download the decoded surface"));
         }
-        frame_from_info(info, handle, self.arrival)
+        let mut frame = frame_from_info(info, handle, self.arrival)?;
+        frame.capture_us = self.capture_us;
+        Ok(frame)
     }
 }
 
@@ -327,6 +334,7 @@ fn frame_from_info(
         height: info.height as u32,
         pts: info.pts,
         arrival,
+        capture_us: 0,
         pixels,
     })
 }
@@ -424,7 +432,7 @@ pub fn spawn(
                     match dec.push(&chunk.data[chunk.off..], pts) {
                         Ok(true) => break,
                         Ok(false) => {
-                            if let Err(e) = drain(&mut dec, &sink, chunk.at, &wake) {
+                            if let Err(e) = drain(&mut dec, &sink, chunk.at, chunk.capture_us, &wake) {
                                 fail(&sink, e);
                                 return;
                             }
@@ -436,7 +444,7 @@ pub fn spawn(
                     }
                 }
                 pts = pts.wrapping_add(1);
-                if let Err(e) = drain(&mut dec, &sink, chunk.at, &wake) {
+                if let Err(e) = drain(&mut dec, &sink, chunk.at, chunk.capture_us, &wake) {
                     fail(&sink, e);
                     return;
                 }
@@ -450,11 +458,13 @@ fn drain(
     dec: &mut Decoder,
     sink: &Arc<Sink>,
     arrival: Instant,
+    capture_us: u64,
     wake: &Option<Box<dyn Fn() + Send>>,
 ) -> io::Result<()> {
     loop {
         match dec.pull(arrival)? {
-            Some(frame) => {
+            Some(mut frame) => {
+                frame.capture_us = capture_us;
                 if std::env::var_os("LGX_DEBUG_LAT").is_some() {
                     let us = frame.arrival.elapsed().as_micros();
                     eprintln!("lgx-client: decode+queue {us} us ({}x{})", frame.width, frame.height);

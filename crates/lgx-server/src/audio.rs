@@ -298,6 +298,7 @@ fn handle(
     clients: Arc<Mutex<Vec<Client>>>,
     capture: Arc<Mutex<Option<CaptureHandle>>>,
 ) -> io::Result<()> {
+    let _ = stream.set_nodelay(true);
     let client_id = secure::server_read_id(&mut stream)?;
     let token = match clients::token_for(&client_id)? {
         Some(t) => t,

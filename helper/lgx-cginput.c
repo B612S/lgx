@@ -7,7 +7,10 @@
 //
 // One command per line on stdin:
 //   key <evdev> <0|1>      key down/up
-//   btn <evdev> <0|1>      mouse button (0x110 left, 0x111 right, 0x112 middle)
+//   btn <evdev> <0|1>      mouse button (0x110 left, 0x111 right, 0x112 middle,
+//                          0x113 back, 0x114 forward; back/forward use Mac
+//                          Mouse Fix's universal mapping: a navigation swipe
+//                          or menu shortcut where raw buttons are ignored)
 //   motion <x> <y>         absolute pointer, both 0..65535
 //   wheel <axis> <steps>   axis 0 = vertical, 1 = horizontal; one step is a
 //                          wheel notch and is replayed as a short pixel
@@ -22,6 +25,7 @@
 #include <CoreVideo/CoreVideo.h>
 #include <IOKit/hidsystem/ev_keymap.h>
 #include <pthread.h>
+#include <time.h>
 #include <stdarg.h>
 #include <sys/types.h>
 #include <time.h>
@@ -120,9 +124,10 @@ static int media_key(unsigned short evdev) {
     return -1;
 }
 
-// Implemented in lgx-frontmost.m (AppKit). Used for function keys only; see
-// post_key().
+// Implemented in lgx-frontmost.m (AppKit). Used for function keys (see
+// post_key()) and for the app-under-pointer back/forward choice.
 extern pid_t lgx_frontmost_pid(void);
+extern const char *lgx_app_under_pointer_bundle_id(void);
 
 // Implemented in lgx-media.m (AppKit). Media keys are NX_SYSDEFINED events,
 // not keyboard keycodes.
@@ -230,6 +235,11 @@ static int dragging = 0;   // 0 none, 1 left, 2 right, 3 other
 static int g_have_motion = 0;
 static CGPoint g_motion_point = {0, 0};
 
+// The display selected by the server's --display option. ScreenCaptureKit
+// reports its CGDirectDisplayID; mapping motion against the main display
+// would move and click on the wrong monitor when another one is streamed.
+static CGDirectDisplayID g_display_id = 0;
+
 // Synthetic mouse events carry their own click count: macOS does not derive
 // double/triple clicks for injected events, and always sending 1 makes every
 // press a single click. Track each button separately.
@@ -240,7 +250,10 @@ typedef struct {
     int count;
 } ClickState;
 
-static ClickState g_clicks[3];
+static ClickState g_clicks[5];
+// The button number used for OtherMouseDragged; extra mouse buttons must keep
+// their own number instead of always dragging as the middle button.
+static CGMouseButton g_drag_button = kCGMouseButtonLeft;
 
 static double now_sec(void) {
     struct timespec ts;
@@ -248,13 +261,169 @@ static double now_sec(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
 }
 
+// Undocumented CGEvent fields and IOHID constants for a trackpad navigation
+// swipe. Mac Mouse Fix and SensibleSideButtons use the same values: field 55 is
+// NSEventTypeGesture, 110 the IOHID event type, 132 its phase and 115 the swipe
+// direction. Mac Mouse Fix posts them at the session tap, not the HID tap.
+// The event sequence is adapted from Mac Mouse Fix (MMF License); see
+// THIRD_PARTY_NOTICES.md. Mac Mouse Fix credits SensibleSideButtons and
+// Calftrail Touch for the original reverse engineering.
+enum {
+    kLGXFieldEventType = 55,
+    kLGXFieldHIDEventType = 110,
+    kLGXFieldHIDPhase = 132,
+    kLGXFieldHIDSwipe = 115,
+};
+
+// ANSI keycodes for the menu-shortcut fallback. Mac Mouse Fix additionally
+// emulates Apple's automatic key-equivalent localization; this helper uses the
+// ANSI positions, which match the ABC layout used by default.
+enum {
+    kLGXKeyLeftBracket = 0x21,  // [
+    kLGXKeyRightBracket = 0x1E, // ]
+    kLGXKeyLeftArrow = 0x7B,
+    kLGXKeyRightArrow = 0x7C,
+};
+
+typedef enum {
+    SIDE_RAW = 0,
+    SIDE_SWIPE,
+    SIDE_CMD_BRACKET,
+    SIDE_CMD_ARROW,
+    SIDE_OPT_CMD_BRACKET,
+} SideAction;
+
+static int starts_with(const char *s, const char *prefix) {
+    return strncmp(s, prefix, strlen(prefix)) == 0;
+}
+
+// The same decision tree as Mac Mouse Fix's "Universal Back and Forward":
+// the app under the pointer picks the method, because a navigation swipe acts
+// on the window under the pointer.
+//   - navigation swipe: the native back/forward gesture (Safari, Finder and
+//     the other Apple apps that implement it)
+//   - menu shortcuts: apps that expose back/forward only as a menu item
+//   - raw button 3/4: everything else (Chrome, Firefox, editors), so those
+//     apps keep their own handling
+static SideAction side_action(void) {
+    const char *id = lgx_app_under_pointer_bundle_id();
+    if (!id || !id[0]) return SIDE_RAW;
+
+    if (starts_with(id, "com.operasoftware.Opera")) return SIDE_SWIPE;
+    if (starts_with(id, "com.binarynights.ForkLift")) return SIDE_SWIPE;
+
+    if (starts_with(id, "org.zotero.zotero")) return SIDE_CMD_BRACKET;
+    if (starts_with(id, "com.apple.systempreferences")) return SIDE_CMD_BRACKET;
+    if (starts_with(id, "com.apple.AppStore")) return SIDE_CMD_BRACKET;
+    if (starts_with(id, "com.adobe.Acrobat.Pro")) return SIDE_CMD_ARROW;
+    if (starts_with(id, "dev.warp.Warp")) return SIDE_CMD_BRACKET;
+
+    if (starts_with(id, "com.apple.Music")) return SIDE_CMD_BRACKET;
+    if (starts_with(id, "com.apple.iCal")) return SIDE_CMD_ARROW;
+    if (starts_with(id, "com.apple.AddressBook")) return SIDE_CMD_BRACKET;
+    if (starts_with(id, "com.apple.Notes")) return SIDE_OPT_CMD_BRACKET;
+    if (starts_with(id, "com.apple.freeform")) return SIDE_OPT_CMD_BRACKET;
+    if (starts_with(id, "com.apple.TV")) return SIDE_CMD_BRACKET;
+    if (starts_with(id, "com.apple.iBooksX")) return SIDE_CMD_BRACKET;
+    if (starts_with(id, "com.apple.Preview")) return SIDE_CMD_BRACKET;
+
+    if (starts_with(id, "com.apple.")) return SIDE_SWIPE;
+    return SIDE_RAW;
+}
+
+static void post_navigation_swipe(int back) {
+    CGEventRef ev = CGEventCreate(NULL);
+    if (!ev) return;
+    CGEventSetIntegerValueField(ev, kLGXFieldEventType, 29);     // NSEventTypeGesture
+    CGEventSetIntegerValueField(ev, kLGXFieldHIDEventType, 16);  // kIOHIDEventTypeNavigationSwipe
+    CGEventSetIntegerValueField(ev, kLGXFieldHIDPhase, 1);       // kIOHIDEventPhaseBegan
+    CGEventSetIntegerValueField(ev, kLGXFieldHIDSwipe, back ? 4 : 8); // kIOHIDSwipeLeft/Right
+    CGEventPost(kCGSessionEventTap, ev);
+    CGEventSetIntegerValueField(ev, kLGXFieldHIDSwipe, 0);       // kIOHIDSwipeNone
+    CGEventSetIntegerValueField(ev, kLGXFieldHIDPhase, 4);       // kIOHIDEventPhaseEnded
+    CGEventPost(kCGSessionEventTap, ev);
+    CFRelease(ev);
+}
+
+// A complete modifier+key chord for the apps that only expose back/forward as
+// a menu shortcut. The final plain event clears any modifier state the
+// WindowServer may have latched from the synthetic chord.
+static void post_shortcut(CGKeyCode key, CGEventFlags flags) {
+    CGEventRef down = CGEventCreateKeyboardEvent(NULL, key, true);
+    CGEventRef up = CGEventCreateKeyboardEvent(NULL, key, false);
+    if (down) CGEventSetFlags(down, flags);
+    if (up) CGEventSetFlags(up, flags);
+    if (down) {
+        CGEventPost(kCGHIDEventTap, down);
+        CFRelease(down);
+    }
+    if (up) {
+        CGEventPost(kCGHIDEventTap, up);
+        CFRelease(up);
+    }
+    CGEventRef restore = CGEventCreate(NULL);
+    if (restore) {
+        CGEventPost(kCGHIDEventTap, restore);
+        CFRelease(restore);
+    }
+}
+
+static void post_side_action(SideAction action, int back) {
+    switch (action) {
+        case SIDE_SWIPE:
+            logf_("  -> navigation swipe %s", back ? "back" : "forward");
+            post_navigation_swipe(back);
+            break;
+        case SIDE_CMD_BRACKET:
+            logf_("  -> shortcut Cmd+%s", back ? "[" : "]");
+            post_shortcut(back ? kLGXKeyLeftBracket : kLGXKeyRightBracket,
+                          kCGEventFlagMaskCommand);
+            break;
+        case SIDE_CMD_ARROW:
+            logf_("  -> shortcut Cmd+%s", back ? "Left" : "Right");
+            post_shortcut(back ? kLGXKeyLeftArrow : kLGXKeyRightArrow,
+                          kCGEventFlagMaskCommand);
+            break;
+        case SIDE_OPT_CMD_BRACKET:
+            logf_("  -> shortcut Opt+Cmd+%s", back ? "[" : "]");
+            post_shortcut(back ? kLGXKeyLeftBracket : kLGXKeyRightBracket,
+                          kCGEventFlagMaskAlternate | kCGEventFlagMaskCommand);
+            break;
+        case SIDE_RAW:
+            break;
+    }
+}
+
+// A side-button down that became a swipe or shortcut has no raw mouse-up:
+// swallow it even if the application under the pointer changed in between.
+static SideAction g_side_action[2];
+
 static void post_button(unsigned short evdev, int down) {
+    if (evdev == 0x113 || evdev == 0x114) {
+        int slot = evdev == 0x113 ? 0 : 1;
+        if (down) {
+            SideAction action = side_action();
+            g_side_action[slot] = action;
+            if (action != SIDE_RAW) {
+                post_side_action(action, slot == 0);
+                return;
+            }
+        } else {
+            SideAction action = g_side_action[slot];
+            g_side_action[slot] = SIDE_RAW;
+            if (action != SIDE_RAW) return;
+        }
+    }
     CGMouseButton button;
     CGEventType type;
     switch (evdev) {
         case 0x110: button = kCGMouseButtonLeft; type = down ? kCGEventLeftMouseDown : kCGEventLeftMouseUp; break;
         case 0x111: button = kCGMouseButtonRight; type = down ? kCGEventRightMouseDown : kCGEventRightMouseUp; break;
         case 0x112: button = kCGMouseButtonCenter; type = down ? kCGEventOtherMouseDown : kCGEventOtherMouseUp; break;
+        // X1 (BTN_SIDE) and X2 (BTN_EXTRA) are the browser back/forward
+        // buttons. macOS numbers them 3 and 4.
+        case 0x113: button = (CGMouseButton)3; type = down ? kCGEventOtherMouseDown : kCGEventOtherMouseUp; break;
+        case 0x114: button = (CGMouseButton)4; type = down ? kCGEventOtherMouseDown : kCGEventOtherMouseUp; break;
         default: return;
     }
     CGPoint loc;
@@ -267,7 +436,7 @@ static void post_button(unsigned short evdev, int down) {
     }
 
     int idx = (int)button;
-    if (idx < 0 || idx > 2) idx = 0;
+    if (idx < 0 || idx > 4) idx = 0;
     ClickState *cs = &g_clicks[idx];
     double now = now_sec();
     if (down) {
@@ -324,13 +493,15 @@ static void post_button(unsigned short evdev, int down) {
     if (src) CFRelease(src);
     if (down) {
         dragging = button == kCGMouseButtonLeft ? 1 : button == kCGMouseButtonRight ? 2 : 3;
+        g_drag_button = button;
     } else {
         dragging = 0;
     }
 }
 
 static void post_motion(int nx, int ny) {
-    CGRect screen = CGDisplayBounds(CGMainDisplayID());
+    CGDirectDisplayID display = g_display_id != 0 ? g_display_id : CGMainDisplayID();
+    CGRect screen = CGDisplayBounds(display);
     CGPoint pt;
     pt.x = screen.origin.x + (CGFloat)nx / 65535.0 * screen.size.width;
     pt.y = screen.origin.y + (CGFloat)ny / 65535.0 * screen.size.height;
@@ -347,7 +518,7 @@ static void post_motion(int nx, int ny) {
         moveButton = kCGMouseButtonRight;
     } else if (dragging == 3) {
         moveType = kCGEventOtherMouseDragged;
-        moveButton = kCGMouseButtonCenter;
+        moveButton = g_drag_button;
     }
     CGEventSourceRef src = CGEventSourceCreate(kCGEventSourceStateHIDSystemState);
     CGEventRef ev = CGEventCreateMouseEvent(src, moveType, pt, moveButton);
@@ -413,6 +584,54 @@ static int take_slice(int pending) {
 
 static int g_scrolling = 0;
 static CVDisplayLinkRef g_display_link = NULL;
+static int g_display_link_running = 0;
+static pthread_mutex_t g_link_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_t g_watchdog;
+static volatile int g_watchdog_run = 1;
+static uint64_t g_last_wheel_ns = 0;
+
+static uint64_t now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+// CVDisplayLink wakes the process at the panel rate (120 Hz here). It is only
+// needed while a smooth-scroll animation is running, so create it once and
+// start/stop it on demand instead of leaving a 120 Hz timer alive forever.
+static void display_link_start(void) {
+    pthread_mutex_lock(&g_link_lock);
+    if (!g_display_link_running && g_display_link) {
+        if (CVDisplayLinkStart(g_display_link) == kCVReturnSuccess) {
+            g_display_link_running = 1;
+        }
+    }
+    pthread_mutex_unlock(&g_link_lock);
+}
+
+static void display_link_stop(void) {
+    pthread_mutex_lock(&g_link_lock);
+    if (g_display_link_running && g_display_link) {
+        CVDisplayLinkStop(g_display_link);
+        g_display_link_running = 0;
+    }
+    pthread_mutex_unlock(&g_link_lock);
+}
+
+static void *scroll_watchdog(void *arg) {
+    (void)arg;
+    while (g_watchdog_run) {
+        usleep(250000);
+        pthread_mutex_lock(&g_scroll_lock);
+        int idle = g_pending_x == 0 && g_pending_y == 0 && !g_scrolling;
+        uint64_t last = g_last_wheel_ns;
+        pthread_mutex_unlock(&g_scroll_lock);
+        if (idle && now_ns() - last > 750000000ull) {
+            display_link_stop();
+        }
+    }
+    return NULL;
+}
 
 // One animation step per display frame. CVDisplayLink runs at the panel rate
 // even for a background helper, so a 120 Hz display gets 120 events/s.
@@ -437,7 +656,9 @@ static CVReturn scroll_frame(CVDisplayLinkRef link, const CVTimeStamp *now,
     post_scroll(dy, dx, phase);
     if (done) {
         post_scroll(0, 0, kCGScrollPhaseEnded);
-        g_scrolling = 0;
+        pthread_mutex_lock(&g_scroll_lock);
+        if (g_pending_y == 0 && g_pending_x == 0) g_scrolling = 0;
+        pthread_mutex_unlock(&g_scroll_lock);
     }
     return kCVReturnSuccess;
 }
@@ -454,7 +675,13 @@ static void queue_wheel(int axis, int steps) {
         return;
     }
     int px = steps * g_wheel_pixels;
+    display_link_start();
+    if (!g_display_link_running) {
+        post_wheel_lines(axis, steps);
+        return;
+    }
     pthread_mutex_lock(&g_scroll_lock);
+    g_last_wheel_ns = now_ns();
     if (axis == 0) {
         g_pending_y += -px;
     } else {
@@ -467,6 +694,13 @@ int main(void) {
     fprintf(stderr, "lgx-cginput: accessibility=%s pid=%d\n",
             AXIsProcessTrusted() ? "granted" : "MISSING", (int)getpid());
 
+    const char *display_env = getenv("LGX_DISPLAY_ID");
+    if (display_env && display_env[0]) {
+        unsigned long id = strtoul(display_env, NULL, 10);
+        if (id != 0) g_display_id = (CGDirectDisplayID)id;
+    }
+    fprintf(stderr, "lgx-cginput: display id %u\n", (unsigned)g_display_id);
+
     const char *smooth = getenv("LGX_SMOOTH_SCROLL");
     if (smooth && smooth[0] == '0') g_smooth_scroll = 0;
     const char *pixels = getenv("LGX_WHEEL_PIXELS");
@@ -475,10 +709,16 @@ int main(void) {
     if (invert && invert[0] == '1') g_wheel_invert = 1;
     if (g_smooth_scroll) {
         if (CVDisplayLinkCreateWithActiveCGDisplays(&g_display_link) == kCVReturnSuccess
-            && CVDisplayLinkSetOutputCallback(g_display_link, scroll_frame, NULL) == kCVReturnSuccess
-            && CVDisplayLinkStart(g_display_link) == kCVReturnSuccess) {
-            fprintf(stderr, "lgx-cginput: smooth scroll, %d px per notch%s\n",
-                    g_wheel_pixels, g_wheel_invert ? ", inverted" : "");
+            && CVDisplayLinkSetOutputCallback(g_display_link, scroll_frame, NULL) == kCVReturnSuccess) {
+            if (pthread_create(&g_watchdog, NULL, scroll_watchdog, NULL) == 0) {
+                fprintf(stderr, "lgx-cginput: smooth scroll on demand, %d px per notch%s\n",
+                        g_wheel_pixels, g_wheel_invert ? ", inverted" : "");
+            } else {
+                CVDisplayLinkRelease(g_display_link);
+                g_display_link = NULL;
+                g_smooth_scroll = 0;
+                fprintf(stderr, "lgx-cginput: smooth scroll thread failed, using line events\n");
+            }
         } else {
             if (g_display_link) {
                 CVDisplayLinkRelease(g_display_link);
@@ -505,8 +745,12 @@ int main(void) {
             queue_wheel(a, b);
         }
     }
+    g_watchdog_run = 0;
+    if (g_smooth_scroll && g_display_link) {
+        pthread_join(g_watchdog, NULL);
+    }
+    display_link_stop();
     if (g_display_link) {
-        CVDisplayLinkStop(g_display_link);
         if (g_scrolling) {
             post_scroll(0, 0, kCGScrollPhaseEnded);
             g_scrolling = 0;

@@ -16,7 +16,8 @@ CapabilityBoundingSet=
 ProtectSystem=full
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 UMask=0077
-PrivateTmp=yes
+# The file clipboard reads user-chosen paths; a private /tmp would hide
+# files copied from /tmp. The service is still protected by ProtectSystem.
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes

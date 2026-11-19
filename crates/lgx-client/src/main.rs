@@ -600,9 +600,32 @@ fn main() {
                 if sig == *conn.last_remote.lock().unwrap() {
                     return;
                 }
+                if let clip::Clip::File { name, data } = &clip {
+                    if data.len() as u64 > lgx_proto::file::MAX_BYTES {
+                        return;
+                    }
+                    let begin = lgx_proto::file::encode_begin(name, data.len() as u64);
+                    if conn
+                        .send(Msg::new(msg::FILE_BEGIN, 0, begin.len() as i32, 0), &begin)
+                        .is_err()
+                    {
+                        return;
+                    }
+                    for chunk in data.chunks(32 * 1024) {
+                        if conn
+                            .send(Msg::new(msg::FILE_DATA, 0, chunk.len() as i32, 0), chunk)
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    let _ = conn.send(Msg::new(msg::FILE_END, 0, 0, 0), &[]);
+                    return;
+                }
                 let size = match &clip {
                     clip::Clip::Text(text) => text.len(),
                     clip::Clip::Rich { html, text } => html.len() + text.len(),
+                    clip::Clip::File { .. } => 0,
                 };
                 if max_bytes != 0 && size > max_bytes {
                     return;
@@ -638,16 +661,21 @@ fn main() {
 
     let audio_focus = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     let mute_unfocused = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(s.mute_unfocused));
+    // Shared A/V clock; the video presenter waits for the audio timeline to
+    // reach each frame's capture timestamp. It stays inactive when audio is
+    // disabled or the server does not timestamp its packets.
+    let av_sync = audio::Sync::new();
     if s.audio {
         let addr = audio_addr;
         let token = token.clone();
         let client_id = s.client_id.clone();
         let focus = audio_focus.clone();
         let mute = mute_unfocused.clone();
+        let sync = av_sync.clone();
         std::thread::Builder::new()
             .name("lgx-audio".into())
             .spawn(move || {
-                if let Err(e) = audio::run(&addr, &client_id, &token, mute, focus) {
+                if let Err(e) = audio::run(&addr, &client_id, &token, mute, focus, sync) {
                     eprintln!("lgx-client: audio: {e}");
                 }
             })
@@ -676,10 +704,9 @@ fn main() {
 
     let sdl = sdl3::init().expect("SDL");
     let video = sdl.video().expect("SDL video");
-    // Let the click that focuses the window reach the guest. Otherwise the
-    // compositor swallows the first click after focus loss, which looks like
-    // a dead remote mouse until the window is recreated.
-    sdl3::hint::set(sdl3::hint::names::MOUSE_FOCUS_CLICKTHROUGH, "1");
+    // Do not set SDL_MOUSE_FOCUS_CLICKTHROUGH: the click that focuses the
+    // window must only focus it. Otherwise hovering a guest button and then
+    // clicking to focus looks like the remote mouse pressed by itself.
     if let Err(e) = video.vulkan_load_library_default() {
         eprintln!("lgx-client: cannot load Vulkan: {e}");
         std::process::exit(1);
@@ -854,6 +881,29 @@ fn main() {
     // arrow is restored when it is not.
     let local_arrow = Cursor::from_system(SystemCursor::Arrow).ok();
     let mut remote_cursor: Option<Cursor> = None;
+    // A/V sync: hold the newest video frame until the audio timeline reaches
+    // its capture timestamp. A stalled audio stream must not freeze video
+    // forever, hence the cap. The lead can be tuned at runtime while measuring
+    // the residual offset.
+    // Never turn audio buffering into hundreds of milliseconds of video lag.
+    // The audio timeline is kept tight in the playback callback as well; this
+    // cap only covers a transient stall.
+    const AV_MAX_HOLD_US: i64 = 30_000;
+    // The hold is opt-in. Holding video to the audio head made the presenter
+    // miss slots and drop frames at 60 Hz; the natural timestamp offset is
+    // small in practice. LGX_AV_SYNC=1 enables the hold for testing.
+    let av_enabled = std::env::var("LGX_AV_SYNC").map(|v| v == "1").unwrap_or(false);
+    let av_lead_us: i64 = std::env::var("LGX_AV_LEAD_US")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let av_debug = std::env::var_os("LGX_DEBUG_AV").is_some();
+    let mut pending_frame: Option<dec::Frame> = None;
+    let mut av_last_log = Instant::now();
+    // A dead or muted audio socket must not keep the last head timestamp
+    // alive and delay every video frame by the hold cap.
+    let mut av_last_head = 0u64;
+    let mut av_head_seen = Instant::now();
 
     {
         let px = window.size_in_pixels();
@@ -864,23 +914,60 @@ fn main() {
         heartbeat.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Some(shape) = conn.cursor.lock().unwrap().take() {
             if let Some(cursor) = cursor_from_shape(shape) {
-                if window_focused {
+                if window_focused && !conn.cursor_hidden.load(std::sync::atomic::Ordering::Relaxed) {
                     cursor.set();
                 }
                 remote_cursor = Some(cursor);
             }
         }
-        let mut frame = sink.take();
+        if let Some(new_frame) = sink.take() {
+            // Newest frame wins while a previous one is held for sync.
+            pending_frame = Some(new_frame);
+        }
+        let mut frame = None;
+        if let Some(f) = pending_frame.take() {
+            let mut hold = false;
+            let head = av_sync.head_us.load(std::sync::atomic::Ordering::Relaxed);
+            if head != av_last_head {
+                av_last_head = head;
+                av_head_seen = Instant::now();
+            }
+            if av_enabled
+                && f.capture_us != 0
+                && av_sync.active.load(std::sync::atomic::Ordering::Relaxed)
+                && !av_sync.paused.load(std::sync::atomic::Ordering::Relaxed)
+                && av_head_seen.elapsed() < Duration::from_millis(200)
+            {
+                let target = f.capture_us as i64 + av_lead_us;
+                let wait = target - head as i64;
+                if wait > 0 && wait <= AV_MAX_HOLD_US {
+                    hold = true;
+                }
+                if av_debug && av_last_log.elapsed() >= Duration::from_secs(1) {
+                    av_last_log = Instant::now();
+                    eprintln!(
+                        "lgx-client: av video={} audio={} delta={} wait={} hold={} us",
+                        f.capture_us, head, head as i64 - f.capture_us as i64, wait, hold
+                    );
+                }
+            }
+            if hold {
+                pending_frame = Some(f);
+            } else {
+                frame = Some(f);
+            }
+        }
         let events: Vec<Event> = if frame.is_some() {
             pump.poll_iter().collect()
         } else {
-            let mut v: Vec<Event> = pump.wait_timeout_iter(100).next().into_iter().collect();
+            // Cursor shapes arrive through the reader thread, not as SDL
+            // events, and a static macOS capture produces no frames. Poll
+            // often enough that an arrow -> I-beam/resize change is applied
+            // without waiting for a video frame.
+            let mut v: Vec<Event> = pump.wait_timeout_iter(10).next().into_iter().collect();
             v.extend(pump.poll_iter());
             v
         };
-        if frame.is_none() {
-            frame = sink.take();
-        }
         if conn.closed.load(std::sync::atomic::Ordering::Relaxed) {
             eprintln!("lgx-client: server closed the connection");
             connection_lost = true;
@@ -913,10 +1000,15 @@ fn main() {
                     window.set_mouse_grab(grab_active);
                     // Focused: guest cursor only unless the server asked for a
                     // local one; grab state does not change the cursor.
-                    if let Some(cursor) = &remote_cursor {
-                        cursor.set();
-                    } else if let Some(cursor) = &local_arrow {
-                        cursor.set();
+                    if !conn
+                        .cursor_hidden
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        if let Some(cursor) = &remote_cursor {
+                            cursor.set();
+                        } else if let Some(cursor) = &local_arrow {
+                            cursor.set();
+                        }
                     }
                     let _ = conn.send(Msg::new(msg::CURSOR, 1, 0, 0), &[]);
                 }
@@ -1143,7 +1235,10 @@ fn main() {
         // server does not composite one, otherwise only the guest cursor in
         // the video.
         let show_local = !window_focused
-            || conn.local_cursor.load(std::sync::atomic::Ordering::Relaxed);
+            || (conn.local_cursor.load(std::sync::atomic::Ordering::Relaxed)
+                && !conn
+                    .cursor_hidden
+                    .load(std::sync::atomic::Ordering::Relaxed));
         if show_local != cursor_shown {
             sdl.mouse().show_cursor(show_local);
             cursor_shown = show_local;

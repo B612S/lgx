@@ -403,8 +403,10 @@ macOS server: input is injected with CGEvent. The pointer is drawn locally by
 the client for latency, and the server sends the current cursor shape
 (`CURSOR_IMAGE`: arrow, resize, move, wait, ...) so the local pointer shows the
 right cursor. Function keys are delivered to the focused app, media keys use
-`NX_SYSDEFINED`, and smooth scrolling is generated as a display-synced
-pixel-event gesture.
+`NX_SYSDEFINED`, back/forward side buttons follow Mac Mouse Fix's mapping
+(navigation swipe in Safari/Finder and most Apple apps, the app's menu
+shortcut where needed, raw buttons 3/4 elsewhere), and smooth scrolling is
+generated as a display-synced pixel-event gesture.
 
 Clipboard is rich text only (`text/html` plus a plain fallback), event-driven
 in both directions. Files and directories are not synchronized; there are no
@@ -452,4 +454,5 @@ the Linux server only; the macOS server does not create virtual gamepads.
 
 ## License
 
-MIT.
+MIT, except the macOS back/forward handling adapted from Mac Mouse
+Fix; see `THIRD_PARTY_NOTICES.md`.

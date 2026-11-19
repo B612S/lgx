@@ -5,18 +5,25 @@
 //! no PulseAudio compatibility layer are involved, so there is nothing that
 //! can outlive the client and the mixer sees the stream's real properties.
 //!
+//! Timestamp-aware servers prefix every record with `LGXA`, the server
+//! timestamp of the first sample and the PCM length. The playback callback
+//! keeps that timeline at its head; the video presenter uses it to hold a
+//! frame until audio reaches the same instant. Raw PCM from an older server is
+//! still accepted and simply plays without A/V sync.
+//!
 //! With `mute_unfocused = true`, focus loss still drains the network stream
 //! but discards it; the playback stream keeps running with silence, and any
 //! data already queued is dropped by the callback instead of being replayed
 //! on focus regain.
 
+use std::collections::VecDeque;
 use std::io;
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use lgx_proto::secure;
+use lgx_proto::{msg, secure, Msg};
 use pipewire as pw;
 use pw::properties::properties;
 use pw::spa;
@@ -25,11 +32,88 @@ use ringbuf::traits::{Consumer as _, Observer as _, Producer as _, Split};
 use ringbuf::HeapRb;
 
 const RING_BYTES: usize = 64 * 1024;
-/// Playout cushion: two server chunks at 48 kHz stereo s16le.
-const TARGET_BYTES: usize = 8192;
+/// Playout cushion: three server chunks at 48 kHz stereo s16le (~64 ms).
+/// Two chunks left the stream with almost no margin for scheduler/TCP jitter.
+const TARGET_BYTES: usize = 12 * 1024;
 /// Only trim a runaway backlog (clock drift), never the normal cushion.
-const HIGH_WATER: usize = 48 * 1024;
+const HIGH_WATER: usize = 32 * 1024;
 const LOW_WATER: usize = 16 * 1024;
+/// Stereo s16le at 48 kHz: one second of PCM.
+const BYTES_PER_SEC: u64 = 48_000 * 4;
+/// Audio records from a timestamp-aware server start with this magic. Old
+/// servers send raw PCM and are played without A/V sync.
+const AUDIO_MAGIC: &[u8; 4] = b"LGXA";
+
+/// Shared A/V clock. `head_us` is the server capture/write timestamp of the
+/// next sample the playback callback will consume; the video presenter holds a
+/// frame until the audio reaches the same point on the server timeline.
+pub struct Sync {
+    pub head_us: AtomicU64,
+    pub active: AtomicBool,
+    pub paused: AtomicBool,
+}
+
+impl Sync {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            head_us: AtomicU64::new(0),
+            active: AtomicBool::new(false),
+            paused: AtomicBool::new(false),
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ChunkInfo {
+    /// Absolute producer byte offset of this chunk in the PCM stream.
+    start: u64,
+    len: u32,
+    /// Server timestamp of the chunk's first sample, in microseconds.
+    ts_us: u64,
+}
+
+#[derive(Default)]
+struct Timeline {
+    infos: VecDeque<ChunkInfo>,
+    produced: u64,
+    consumed: u64,
+}
+
+impl Timeline {
+    fn push(&mut self, ts_us: u64, len: usize) {
+        if ts_us == 0 || len == 0 {
+            return;
+        }
+        self.infos.push_back(ChunkInfo {
+            start: self.produced,
+            len: len as u32,
+            ts_us,
+        });
+        self.produced += len as u64;
+        // A stalled consumer must not grow an unbounded metadata queue.
+        while self.infos.len() > 1024 {
+            self.infos.pop_front();
+        }
+    }
+
+    fn refresh(&mut self, sync: &Sync) {
+        while let Some(front) = self.infos.front() {
+            if self.consumed >= front.start + front.len as u64 {
+                self.infos.pop_front();
+            } else {
+                break;
+            }
+        }
+        if let Some(front) = self.infos.front() {
+            let delta = self.consumed.saturating_sub(front.start);
+            let head = front.ts_us + delta * 1_000_000 / BYTES_PER_SEC;
+            sync.head_us.store(head, Ordering::Relaxed);
+            sync.active.store(true, Ordering::Relaxed);
+        } else {
+            sync.active.store(false, Ordering::Relaxed);
+        }
+    }
+}
 
 struct PlaybackState {
     cons: ringbuf::HeapCons<u8>,
@@ -40,6 +124,25 @@ struct PlaybackState {
     /// Wait for one quantum before starting, instead of playing half a
     /// buffer followed by silence.
     prebuffer: bool,
+    timeline: Arc<Mutex<Timeline>>,
+    sync: Arc<Sync>,
+    /// Consumed bytes not yet accounted for while the producer holds the
+    /// timeline lock.
+    pending_consumed: u64,
+}
+
+impl PlaybackState {
+    fn advance(&mut self, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        self.pending_consumed += bytes as u64;
+        if let Ok(mut timeline) = self.timeline.try_lock() {
+            timeline.consumed += self.pending_consumed;
+            self.pending_consumed = 0;
+            timeline.refresh(&self.sync);
+        }
+    }
 }
 
 fn pipewire_thread(
@@ -123,7 +226,15 @@ fn pipewire_thread(
             if state.paused.load(Ordering::Relaxed) {
                 // Drop whatever was queued before the window lost focus.
                 let mut scratch = [0u8; 8192];
-                while state.cons.pop_slice(&mut scratch) > 0 {}
+                let mut drained = 0usize;
+                loop {
+                    let n = state.cons.pop_slice(&mut scratch);
+                    if n == 0 {
+                        break;
+                    }
+                    drained += n;
+                }
+                state.advance(drained);
                 state.prebuffer = true;
                 slice[..size].fill(0);
             } else if state.prebuffer {
@@ -135,6 +246,7 @@ fn pipewire_thread(
                     if n < size {
                         slice[n..size].fill(0);
                     }
+                    state.advance(n);
                 }
             } else {
                 // Keep the normal cushion. Only a runaway backlog (a very
@@ -144,17 +256,26 @@ fn pipewire_thread(
                 // constant underrun/stutter.
                 if state.cons.occupied_len() > HIGH_WATER {
                     let mut scratch = [0u8; 8192];
+                    let mut dropped = 0usize;
                     while state.cons.occupied_len() > LOW_WATER {
-                        if state.cons.pop_slice(&mut scratch) == 0 {
+                        let n = state.cons.pop_slice(&mut scratch);
+                        if n == 0 {
                             break;
                         }
+                        dropped += n;
                     }
+                    state.advance(dropped);
                 }
                 let n = state.cons.pop_slice(&mut slice[..size]);
                 if n < size {
                     slice[n..size].fill(0);
                     state.underruns.fetch_add(1, Ordering::Relaxed);
+                    // Rebuild the cushion instead of continuing to run on
+                    // empty; otherwise one late chunk becomes a run of tiny
+                    // gaps and clipped syllables.
+                    state.prebuffer = true;
                 }
+                state.advance(n);
             }
             let chunk = data.chunk_mut();
             *chunk.offset_mut() = 0;
@@ -213,18 +334,23 @@ type Playback = (
     Arc<AtomicBool>,
     Arc<AtomicU64>,
     std::sync::mpsc::Receiver<()>,
+    Arc<Mutex<Timeline>>,
 );
 
-fn spawn_playback(app_name: &str, media_name: &str) -> io::Result<Playback> {
+fn spawn_playback(app_name: &str, media_name: &str, sync: Arc<Sync>) -> io::Result<Playback> {
     let ring = HeapRb::<u8>::new(RING_BYTES);
     let (prod, cons) = ring.split();
     let paused = Arc::new(AtomicBool::new(false));
     let underruns = Arc::new(AtomicU64::new(0));
+    let timeline = Arc::new(Mutex::new(Timeline::default()));
     let state = PlaybackState {
         cons,
         paused: paused.clone(),
         underruns: underruns.clone(),
         prebuffer: true,
+        timeline: timeline.clone(),
+        sync,
+        pending_consumed: 0,
     };
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<()>(1);
     let (quit_tx, quit_rx) = pw::channel::channel::<()>();
@@ -237,7 +363,7 @@ fn spawn_playback(app_name: &str, media_name: &str) -> io::Result<Playback> {
                 eprintln!("lgx-client: PipeWire playback: {e}");
             }
         })?;
-    Ok((prod, quit_tx, handle, paused, underruns, ready_rx))
+    Ok((prod, quit_tx, handle, paused, underruns, ready_rx, timeline))
 }
 
 pub fn run(
@@ -246,11 +372,12 @@ pub fn run(
     token: &str,
     mute_unfocused: Arc<AtomicBool>,
     focus: Arc<AtomicBool>,
+    sync: Arc<Sync>,
 ) -> std::io::Result<()> {
     let app_name = format!("lgx - {client_id}");
     let media_name = format!("lgx audio ({client_id})");
-    let (mut audio_tx, quit, handle, paused, underruns, ready) =
-        spawn_playback(&app_name, &media_name)?;
+    let (mut audio_tx, quit, handle, paused, underruns, ready, timeline) =
+        spawn_playback(&app_name, &media_name, sync.clone())?;
     // Connect the audio socket only after the playback stream is streaming.
     // Otherwise the server can send hundreds of milliseconds of audio while
     // the stream is still linking, and that backlog becomes permanent
@@ -259,11 +386,19 @@ pub fn run(
 
     let result = (|| -> std::io::Result<()> {
         let stream = TcpStream::connect(addr)?;
+        // Audio is many small records; Nagle would batch them and add tens
+        // of milliseconds of jitter, which is audible as clipped syllables.
+        let _ = stream.set_nodelay(true);
         let secure = secure::client_handshake_id(stream, client_id, token)?;
         secure.send_bytes(token.as_bytes())?;
+        // Opt in to the timestamped LGXA records. An old server ignores this
+        // frame (it is client -> server, so it cannot corrupt playback) and
+        // keeps sending raw PCM, which the parser below still accepts.
+        secure.send_msg(Msg::new(msg::AUDIO_SYNC, 0, 0, 0), &[])?;
 
         let mut total = 0u64;
         let mut last = Instant::now();
+        let mut logged_sync = false;
         loop {
             let chunk = match secure.recv_bytes() {
                 Ok(chunk) => chunk,
@@ -274,12 +409,36 @@ pub fn run(
             }
             let mute = mute_unfocused.load(Ordering::Relaxed) && !focus.load(Ordering::Relaxed);
             paused.store(mute, Ordering::Relaxed);
+            sync.paused.store(mute, Ordering::Relaxed);
             if mute {
                 // Keep draining the secure stream instead of backing it up.
                 continue;
             }
-            let _ = audio_tx.push_slice(&chunk);
-            total += chunk.len() as u64;
+            // A timestamp-aware server prefixes every record with LGXA, the
+            // u64 LE timestamp in microseconds and the u32 LE PCM length. A
+            // plain PCM record from an old server is played without sync.
+            let (ts_us, pcm) = if chunk.len() >= 16 && &chunk[..4] == AUDIO_MAGIC {
+                let ts = u64::from_le_bytes(chunk[4..12].try_into().unwrap());
+                let len = u32::from_le_bytes(chunk[12..16].try_into().unwrap()) as usize;
+                if len > 0 && len.is_multiple_of(4) && 16 + len == chunk.len() {
+                    (ts, &chunk[16..])
+                } else {
+                    (0, &chunk[..])
+                }
+            } else {
+                (0, &chunk[..])
+            };
+            let pushed = audio_tx.push_slice(pcm);
+            if pushed > 0 && ts_us != 0 {
+                if !logged_sync {
+                    logged_sync = true;
+                    eprintln!("lgx-client: audio A/V timestamps enabled");
+                }
+                if let Ok(mut timeline) = timeline.lock() {
+                    timeline.push(ts_us, pushed);
+                }
+            }
+            total += pcm.len() as u64;
             if last.elapsed() >= Duration::from_secs(5) {
                 // Underruns are the audible kind of quality problem; surface
                 // them instead of hiding the gaps as silence.

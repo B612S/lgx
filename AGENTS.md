@@ -24,7 +24,7 @@ crates/lgx-server-macos/  ScreenCaptureKit/VideoToolbox server for macOS
 helper/lgx-vaenc.c   VAAPI HEVC encoder that exports dma-buf surfaces
 helper/lgx-uinput.c  root helper that creates the uinput devices
 helper/lgx-cginput.c macOS CGEvent input injection
-helper/lgx-frontmost.m frontmost-application PID for function keys
+helper/lgx-frontmost.m frontmost-application PID/bundle ID for the macOS helper
 helper/lgx-media.m   NX_SYSDEFINED media keys for the macOS helper
 helper/lgx-macos-cursor.m  NSCursor shape helper for the local pointer
 scripts/             fake-server.py
@@ -127,7 +127,8 @@ Commit format: `area: short imperative summary`, for example
   `--no-gamepads`) skips the SDL gamepad subsystem and sends no `GAMEPAD`
   packets; keyboard/mouse are unaffected. `clipboard = false` disables sync,
   `clipboard_rich = false` forces plain text, and `clipboard_max_bytes` limits
-  both directions (0 = unlimited). `[input] cursor_grab = true` confines the
+  text payloads in both directions (0 = unlimited). The file clipboard has a
+  fixed 16 MiB limit. `[input] cursor_grab = true` confines the
   pointer to the window; `Ctrl+Alt+Shift+G` toggles the confinement; cursor
   visibility stays remote-style (guest cursor while focused, host cursor when
   unfocused). Launch with
@@ -239,15 +240,37 @@ the Vulkan shader converts full-range BT.709, and the HEVC VUI says
 - macOS synthetic clicks use the last motion point, not the current system
   cursor (a cursor warp can lag), carry a computed
   `kCGMouseEventClickState` for double/triple clicks, and keep at least 30 ms
-  between down and up. The client also resends its pointer position before a
-  press and sets `SDL_MOUSE_FOCUS_CLICKTHROUGH`, so a click that focuses the
-  window still reaches the guest.
+  between down and up. The client resends its pointer position before a press
+  but does not set `SDL_MOUSE_FOCUS_CLICKTHROUGH`: the click that focuses the
+  window must only focus it, never activate a guest control under the pointer.
+- macOS has no system-wide back/forward for mouse buttons 3/4: the
+  WindowServer gives them to the app under the pointer, and Safari/Finder
+  ignore them. `lgx-cginput` mirrors Mac Mouse Fix's Universal Back and
+  Forward: the app under the pointer picks the method. A synthetic trackpad
+  navigation swipe (the undocumented CGEvent fields Mac Mouse Fix and
+  SensibleSideButtons use, posted at `kCGSessionEventTap`) is the default for
+  Safari, Finder and the other `com.apple.*` apps; Preview, Music, TV, Books,
+  App Store, System Settings, Zotero and Warp get Cmd+[ / Cmd+], Notes and
+  Freeform get Opt+Cmd+[, Calendar and Acrobat get Cmd+Left/Right; everything
+  else gets the raw button 3/4 so Chrome, Firefox and editors keep their own
+  handling. The menu-shortcut fallback uses ANSI keycodes; Mac Mouse Fix also
+  emulates Apple's key-equivalent localization for non-ABC layouts, which this
+  helper does not.
 - macOS cursor shape: `helper/lgx-macos-cursor.m` polls
   `NSCursor.currentSystemCursor` (Objective-C; the Swift binding is obsolete),
   crops the alpha bounds and the server forwards `CURSOR_IMAGE` (1x RGBA plus
-  hotspot). The client installs it as an SDL color cursor, so resize/move/wait
-  shapes show while the pointer itself is still drawn locally. Never composite
-  the cursor into the video: it trails the pointer.
+  hotspot). It polls at 60 Hz; the client checks for a shape every iteration
+  and its idle SDL wait is 10 ms, because a static macOS capture produces no
+  frames to wake it. The client installs the shape as an SDL color cursor, so
+  resize/move/wait shapes show while the pointer itself is still drawn
+  locally. There is no idle-based hiding: the local pointer stays visible
+  until the server sends CURSOR_HIDDEN. The protocol carries that message for
+  a server that can detect a hidden guest cursor; the public macOS APIs no
+  longer expose that state. Never composite the cursor into the video: it
+  trails the pointer.
+- `--display N` input: `lgx-vtenc` reports the ScreenCaptureKit display id,
+  the server passes it as `LGX_DISPLAY_ID` to `lgx-cginput`, and motion/clicks
+  are mapped against `CGDisplayBounds` of that display, not the main display.
 - macOS smooth scrolling is driven by `CVDisplayLink`: one pixel scroll event
   per display frame with `kCGScrollWheelEventScrollPhase`
   began/changed/ended. A background `nanosleep` is coalesced by macOS to
@@ -264,11 +287,23 @@ the Vulkan shader converts full-range BT.709, and the HEVC VUI says
   `CLIP_DATA_HTML`; plain uses `CLIP_SET`/`CLIP_DATA`.
 - Rich clipboard is installed with `wl-clipboard-rs::copy_multi`, offering
   plain text first and `text/html` second. Plain must be first so the extra
-  text MIME fallbacks use it; never put HTML first. Files are not synchronized.
+  text MIME fallbacks use it; never put HTML first.
 - On connect the client's watcher sends its current host clipboard; the server
   ignores its watcher's first event, so the host clipboard wins.
-- Never add file synchronization, clipboard hotkeys, `CLIP_GET`/`CLIP_ACK` or
-  a paste injection back. Normal Ctrl+C/Ctrl+V is the whole UX.
+- One **light regular file** can be synchronized in each direction (16 MiB
+  limit, `lgx_proto::file::MAX_BYTES`). It uses FILE_BEGIN (u32 LE name length,
+  UTF-8 name, u64 LE size), FILE_DATA and FILE_END. The receiver writes a temp
+  file under `~/.cache/lgx/clipboard` and offers it as a file URL
+  (`text/uri-list` + `x-special/gnome-copied-files` on Linux; an NSURL file
+  pasteboard item on macOS). Multiple files, directories and oversized files
+  are left untouched rather than turned into text; a file offer must never
+  fall back to text. Receivers record the file signature to suppress the
+  clipboard echo.
+- The Linux server unit no longer uses `PrivateTmp=yes`: a private /tmp made
+  files copied from /tmp unreadable by the server while still setting the
+  clipboard URI. Keep /tmp visible to the service.
+- Never add clipboard hotkeys, `CLIP_GET`/`CLIP_ACK` or a paste injection back.
+  Normal Ctrl+C/Ctrl+V is the whole UX.
 - Audio is on by default (`--no-audio` disables it) and uses the same secure
   handshake/record layer with the same token PSK. Both sides use native
   PipeWire streams (`pipewire-rs`); do not reintroduce `parec`/`pacat`,
@@ -302,6 +337,38 @@ the Vulkan shader converts full-range BT.709, and the HEVC VUI says
   capture/fanout channels hold four chunks. `mute_unfocused`
   discards received chunks and the process callback drains the ring buffer
   and emits silence; no external process is stopped or left behind.
+  Timestamped records use the `LGXA` framing described under A/V sync; the
+  8 KiB cushion is unchanged by sync.
+
+## A/V sync
+
+- Video access units carry a 48-bit capture timestamp in microseconds in
+  `Msg.code` (high 16 bits) and `Msg.b` (low 32 bits); `a` stays the payload
+  length. `lgx-vtenc` timestamps at the ScreenCaptureKit callback, before
+  encoding, and frames it as `u32 BE length, u64 BE timestamp, AU`. Zero means
+  unknown (older servers).
+- The macOS audio helper frames each PCM write as `u64 LE timestamp, u32 LE
+  byte count, PCM`. The server forwards `LGXA, u64 LE ts_us, u32 LE length,
+  PCM`; the client also accepts raw PCM from an old server and plays it
+  without sync. Update client and server together for the macOS path.
+- The client tracks the server timestamp at the audio ring's head. The
+  video hold is **opt-in** (`LGX_AV_SYNC=1`): holding the newest frame until
+  the audio head reaches its capture timestamp made the presenter miss slots
+  and drop frames at 60 Hz, while the natural offset is only a few tens of
+  milliseconds. With the hold enabled `AV_MAX_HOLD_US` caps it at 30 ms; a
+  head that has not advanced for 200 ms disables it. `LGX_DEBUG_AV=1` prints
+  head/video/wait, and `LGX_AV_LEAD_US` tunes the target. Do not make the hold
+  larger or enable it by default: a deep audio backlog would become video lag.
+- Timestamps are written by the same host clock: `mach_absolute_time` on
+  macOS for video and `DispatchTime.now()` for the audio helper. Do not mix a
+  wall-clock epoch into one side only.
+- The Linux server does not timestamp yet; its video timestamp is zero and the
+  client presents immediately.
+- `lgx-vtenc` logs `SCK x fps, encoded y fps, encode errors n` every 5 s and
+  whether VideoToolbox chose the hardware encoder. A low HEVC fps with a much
+  higher SCK rate means the encoder is dropping input; both equal means the
+  display content itself changed at that rate. The first frame of every
+  session is forced to an IDR.
 
 ## Pairing and clients
 

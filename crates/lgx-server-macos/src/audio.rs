@@ -2,9 +2,10 @@
 //!
 //! The capture itself lives in the `lgx-macos-audio` helper: a Core Audio
 //! process tap reads the macOS system mix, mutes the local playback while the
-//! tap is being read, and writes s16le 48 kHz stereo to stdout. This module
-//! owns the audio TCP listener, the lgx secure handshake, and the pipe between
-//! the helper and the client.
+//! tap is being read, and writes timestamped s16le 48 kHz stereo frames to
+//! stdout. This module owns the audio TCP listener, the lgx secure handshake,
+//! the pipe between the helper and the client, and the timestamp framing that
+//! lets the client align audio with the video timeline.
 //!
 //! Capture starts with the first authenticated audio client and stops when
 //! that client goes away, so an idle server neither holds a tap nor silences
@@ -18,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use lgx_proto::secure;
+use lgx_proto::{msg, secure};
 
 /// One audio client at a time, like the Linux server.
 struct Slot {
@@ -77,6 +78,7 @@ fn handle(
     token: &str,
     state: &Arc<State>,
 ) -> io::Result<()> {
+    let _ = stream.set_nodelay(true);
     let client_id = secure::server_read_id(&mut stream)?;
     let secure = Arc::new(secure::server_handshake(stream, token)?);
     // The client re-sends the token inside the encrypted record layer; the
@@ -88,6 +90,15 @@ fn handle(
         secure.close();
         return Ok(());
     }
+
+    // New clients opt in to the LGXA timestamp framing immediately after the
+    // token. Wait briefly; an old client sends nothing, and keeping raw PCM
+    // for it means a client/server package mismatch cannot turn audio into
+    // noise. The flag is client -> server, so an old server that never reads
+    // it is unaffected.
+    let _ = secure.set_read_timeout(Some(Duration::from_millis(250)));
+    let framed = matches!(secure.recv_msg(), Ok((m, _)) if m.typ == msg::AUDIO_SYNC);
+    let _ = secure.set_read_timeout(None);
 
     let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(4);
     let generation = {
@@ -103,7 +114,7 @@ fn handle(
     };
     eprintln!("lgx-server-macos: audio client {client_id} connected");
 
-    if let Err(e) = start_capture(state) {
+    if let Err(e) = start_capture(state, framed) {
         eprintln!("lgx-server-macos: audio capture unavailable: {e}");
         unregister(state, generation);
         secure.close();
@@ -139,7 +150,7 @@ fn unregister(state: &Arc<State>, generation: u64) {
     }
 }
 
-fn start_capture(state: &Arc<State>) -> Result<(), String> {
+fn start_capture(state: &Arc<State>, framed: bool) -> Result<(), String> {
     let mut capture = state.capture.lock().unwrap();
     if capture.is_some() {
         return Ok(());
@@ -161,33 +172,60 @@ fn start_capture(state: &Arc<State>) -> Result<(), String> {
     let sink = Arc::clone(state);
     let reader = thread::Builder::new()
         .name("lgx-audio-read".into())
-        .spawn(move || read_pcm(stdout, sink))
+        .spawn(move || read_pcm(stdout, sink, framed))
         .map_err(|e| format!("audio reader thread: {e}"))?;
     *capture = Some(Capture { child, reader });
     Ok(())
 }
 
-/// Reads whatever the helper wrote and hands it to the audio client. Chunks
-/// are dropped, not queued, when the client falls behind: a growing backlog
-/// would turn into latency, and the client already reports underruns.
-fn read_pcm(mut stdout: impl Read, state: Arc<State>) {
-    let mut buffer = vec![0u8; 4096];
+/// Reads framed PCM from the helper and hands it to the audio client. Each
+/// helper write is `u64 LE timestamp, u32 LE byte count, s16le stereo`; the
+/// record sent to the client is `LGXA`, `u64 LE ts_us`, `u32 LE byte count`,
+/// then PCM, so a client that needs A/V sync can rebuild the server timeline.
+/// Chunks are dropped, not queued, when the client falls behind: a growing
+/// backlog would turn into latency, and the client already reports underruns.
+fn read_pcm(mut stdout: impl Read, state: Arc<State>, framed: bool) {
+    let mut header = [0u8; 12];
     let mut dropped = 0u64;
     let mut last_report = Instant::now();
     loop {
-        match stdout.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(n) => {
-                let slot = state.slot.lock().unwrap();
-                if let Some(tx) = &slot.tx {
-                    if tx.try_send(buffer[..n].to_vec()).is_err() {
-                        dropped += 1;
-                    }
-                }
+        if let Err(e) = stdout.read_exact(&mut header) {
+            if e.kind() == ErrorKind::Interrupted {
+                continue;
             }
-            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-            Err(_) => break,
+            break;
         }
+        let ts_ns = u64::from_le_bytes(header[0..8].try_into().unwrap());
+        let bytes = u32::from_le_bytes(header[8..12].try_into().unwrap()) as usize;
+        // The tap writes at most one aggregate buffer; the pacer writes at
+        // most 100 ms of silence. Reject garbage rather than allocating it.
+        if bytes == 0 || bytes > 128 * 1024 || !bytes.is_multiple_of(4) {
+            eprintln!("lgx-server-macos: audio: bad helper frame size {bytes}");
+            break;
+        }
+        let mut pcm = vec![0u8; bytes];
+        if stdout.read_exact(&mut pcm).is_err() {
+            break;
+        }
+        let ts_us = ts_ns / 1000;
+        let record = if framed {
+            let mut record = Vec::with_capacity(16 + pcm.len());
+            record.extend_from_slice(b"LGXA");
+            record.extend_from_slice(&ts_us.to_le_bytes());
+            record.extend_from_slice(&(pcm.len() as u32).to_le_bytes());
+            record.extend_from_slice(&pcm);
+            record
+        } else {
+            // Old client: raw PCM, no A/V sync.
+            pcm
+        };
+        let slot = state.slot.lock().unwrap();
+        if let Some(tx) = &slot.tx {
+            if tx.try_send(record).is_err() {
+                dropped += 1;
+            }
+        }
+        drop(slot);
         if dropped > 0 && last_report.elapsed() >= Duration::from_secs(5) {
             eprintln!("lgx-server-macos: audio: dropped {dropped} chunk(s), client behind");
             dropped = 0;

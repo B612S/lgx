@@ -10,11 +10,16 @@
 // hotspot_y, followed by width*height RGBA pixels (top-down, straight alpha).
 #import <AppKit/AppKit.h>
 #include <arpa/inet.h>
+#include <fcntl.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 static uint32_t last_hash = 0;
+static int last_visible = -1;
+static char g_probe_path[PATH_MAX];
 
 static uint32_t hash_bytes(const uint8_t *p, size_t n) {
     uint32_t h = 2166136261u;
@@ -108,23 +113,66 @@ static NSData *cursor_payload(void) {
     return out;
 }
 
+static void write_frame(const void *bytes, size_t length) {
+    uint32_t len = htonl((uint32_t)length);
+    if (fwrite(&len, 1, 4, stdout) != 4) exit(1);
+    if (length > 0 && fwrite(bytes, 1, length, stdout) != length) exit(1);
+    fflush(stdout);
+}
+
+// The exact visibility state comes from lgx-vtenc's cursor-inclusive probe.
+// A one-byte file is written only when the state changes, so this helper does
+// not run a second capture pipeline of its own.
+static int probe_hidden(void) {
+    if (g_probe_path[0] == '\0') return 0;
+    int fd = open(g_probe_path, O_RDONLY);
+    if (fd < 0) return 0;
+    char c = '0';
+    ssize_t n = read(fd, &c, 1);
+    close(fd);
+    return n == 1 && c == '1';
+}
+
 static void poll_cursor(void) {
     @autoreleasepool {
+        // A video player or a game can hide the system pointer without
+        // changing its shape. A zero-length frame means "hidden", the normal
+        // image frame means "visible".
+        if (probe_hidden()) {
+            if (last_visible != 0) {
+                write_frame(NULL, 0);
+                last_visible = 0;
+                last_hash = 0;
+            }
+            return;
+        }
         NSData *payload = cursor_payload();
-        if (!payload) return;
+        if (!payload) {
+            // Fully transparent or unavailable cursor: report it as hidden.
+            if (last_visible != 0) {
+                write_frame(NULL, 0);
+                last_visible = 0;
+                last_hash = 0;
+            }
+            return;
+        }
+        if (last_visible == 0) last_hash = 0;
+        last_visible = 1;
         uint32_t hash = hash_bytes(payload.bytes, payload.length);
         if (hash == last_hash) return;
         last_hash = hash;
-        uint32_t len = htonl((uint32_t)payload.length);
-        if (fwrite(&len, 1, 4, stdout) != 4) exit(1);
-        if (fwrite(payload.bytes, 1, payload.length, stdout) != payload.length) exit(1);
-        fflush(stdout);
+        write_frame(payload.bytes, payload.length);
     }
 }
 
 int main(void) {
+    const char *probe = getenv("LGX_CURSOR_PROBE");
+    if (probe && probe[0]) {
+        snprintf(g_probe_path, sizeof g_probe_path, "%s", probe);
+    }
     poll_cursor();
-    NSTimer *timer = [NSTimer timerWithTimeInterval:0.05
+    // 30 Hz is enough for shape changes and halves the wakeups versus 60 Hz.
+    NSTimer *timer = [NSTimer timerWithTimeInterval:1.0 / 30.0
                                             repeats:YES
                                               block:^(NSTimer *t) {
         (void)t;
