@@ -27,6 +27,9 @@ use std::time::{Duration, Instant};
 
 use lgx_proto::{evdev, msg, Msg};
 use sdl3::event::Event;
+use sdl3::mouse::{Cursor, SystemCursor};
+use sdl3::pixels::PixelFormat;
+use sdl3::surface::Surface;
 
 use dec::Backend;
 
@@ -269,6 +272,31 @@ fn backends(spec: &str, gl_renderer: &str) -> Vec<Backend> {
             } else {
                 vec![Backend::Vaapi, Backend::Cuda, Backend::Software]
             }
+        }
+    }
+}
+
+fn cursor_from_shape(shape: net::CursorShape) -> Option<Cursor> {
+    let mut rgba = shape.rgba;
+    let pitch = shape.width * 4;
+    let surface = match Surface::from_data(
+        &mut rgba,
+        shape.width,
+        shape.height,
+        pitch,
+        PixelFormat::RGBA32,
+    ) {
+        Ok(surface) => surface,
+        Err(e) => {
+            eprintln!("lgx-client: cursor surface: {e}");
+            return None;
+        }
+    };
+    match Cursor::from_surface(&surface, shape.hot_x, shape.hot_y) {
+        Ok(cursor) => Some(cursor),
+        Err(e) => {
+            eprintln!("lgx-client: cursor: {e}");
+            None
         }
     }
 }
@@ -821,6 +849,11 @@ fn main() {
     // truncating them to i32 dropped most events. Whole steps are pieced
     // together here, and axis 1 is forwarded so horizontal wheels work.
     let mut wheel_acc = [0.0f32; 2];
+    // The server may send the guest cursor shape because the pointer is drawn
+    // locally. SDL shows that shape while the window is focused; the host
+    // arrow is restored when it is not.
+    let local_arrow = Cursor::from_system(SystemCursor::Arrow).ok();
+    let mut remote_cursor: Option<Cursor> = None;
 
     {
         let px = window.size_in_pixels();
@@ -829,6 +862,14 @@ fn main() {
 
     while !quit {
         heartbeat.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(shape) = conn.cursor.lock().unwrap().take() {
+            if let Some(cursor) = cursor_from_shape(shape) {
+                if window_focused {
+                    cursor.set();
+                }
+                remote_cursor = Some(cursor);
+            }
+        }
         let mut frame = sink.take();
         let events: Vec<Event> = if frame.is_some() {
             pump.poll_iter().collect()
@@ -861,6 +902,9 @@ fn main() {
                     window.set_mouse_grab(false);
                     // Unfocused: show the host cursor and exclude the guest
                     // cursor from the video, so exactly one is visible.
+                    if let Some(cursor) = &local_arrow {
+                        cursor.set();
+                    }
                     let _ = conn.send(Msg::new(msg::CURSOR, 0, 0, 0), &[]);
                 }
                 Event::Window { win_event: sdl3::event::WindowEvent::FocusGained, .. } => {
@@ -869,6 +913,11 @@ fn main() {
                     window.set_mouse_grab(grab_active);
                     // Focused: guest cursor only unless the server asked for a
                     // local one; grab state does not change the cursor.
+                    if let Some(cursor) = &remote_cursor {
+                        cursor.set();
+                    } else if let Some(cursor) = &local_arrow {
+                        cursor.set();
+                    }
                     let _ = conn.send(Msg::new(msg::CURSOR, 1, 0, 0), &[]);
                 }
                 Event::Window { .. } => redraw = true,

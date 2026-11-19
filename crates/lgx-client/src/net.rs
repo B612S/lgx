@@ -36,6 +36,45 @@ impl ClipPolicy {
     }
 }
 
+/// One cursor shape sent by a server that asks the client to draw the pointer.
+#[derive(Clone)]
+pub struct CursorShape {
+    pub width: u32,
+    pub height: u32,
+    pub hot_x: i32,
+    pub hot_y: i32,
+    pub rgba: Vec<u8>,
+}
+
+impl CursorShape {
+    fn parse(body: &[u8]) -> Option<Self> {
+        if body.len() < 16 {
+            return None;
+        }
+        let width = u32::from_le_bytes(body[0..4].try_into().ok()?);
+        let height = u32::from_le_bytes(body[4..8].try_into().ok()?);
+        let hot_x = i32::from_le_bytes(body[8..12].try_into().ok()?);
+        let hot_y = i32::from_le_bytes(body[12..16].try_into().ok()?);
+        if width == 0 || height == 0 || width > 256 || height > 256 {
+            return None;
+        }
+        if hot_x < 0 || hot_y < 0 || hot_x >= width as i32 || hot_y >= height as i32 {
+            return None;
+        }
+        let need = 16 + (width as usize).checked_mul(height as usize)?.checked_mul(4)?;
+        if body.len() != need {
+            return None;
+        }
+        Some(Self {
+            width,
+            height,
+            hot_x,
+            hot_y,
+            rgba: body[16..].to_vec(),
+        })
+    }
+}
+
 pub struct Conn {
     secure: Arc<Secure>,
     pub last_remote: Arc<Mutex<String>>,
@@ -44,6 +83,8 @@ pub struct Conn {
     pub closed: std::sync::atomic::AtomicBool,
     /// Server asked for a local cursor (it does not composite the pointer).
     pub local_cursor: std::sync::atomic::AtomicBool,
+    /// Latest cursor shape for the locally drawn pointer.
+    pub cursor: Arc<Mutex<Option<CursorShape>>>,
 }
 
 impl Conn {
@@ -100,6 +141,10 @@ pub fn connect(
         )));
     }
 
+    // Opt in to cursor-shape updates. Older clients never send this, so the
+    // server can keep sending them only a video stream with no unknown
+    // CURSOR_IMAGE payloads.
+    secure.send_msg(Msg::new(msg::CURSOR_SHAPE, 0, 0, 0), &[])?;
     let last_remote: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
     let lr = last_remote.clone();
     let conn = Arc::new(Conn {
@@ -108,6 +153,7 @@ pub fn connect(
         bytes: AtomicU64::new(0),
         closed: std::sync::atomic::AtomicBool::new(false),
         local_cursor: std::sync::atomic::AtomicBool::new(false),
+        cursor: Arc::new(Mutex::new(None)),
     });
     let conn_for_reader = conn.clone();
     std::thread::Builder::new()
@@ -187,6 +233,11 @@ fn reader(
                 conn.local_cursor
                     .store(m.a != 0, std::sync::atomic::Ordering::Relaxed);
             }
+            msg::CURSOR_IMAGE => {
+                if let Some(shape) = CursorShape::parse(body) {
+                    *conn.cursor.lock().unwrap() = Some(shape);
+                }
+            }
             msg::CLIP_DATA => {
                 if !clipboard.allows(body.len()) {
                     continue;
@@ -238,6 +289,26 @@ pub const VIDEO_QUEUE: usize = 6;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cursor_image_payload_is_validated() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&2u32.to_le_bytes());
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        payload.extend_from_slice(&1i32.to_le_bytes());
+        payload.extend_from_slice(&0i32.to_le_bytes());
+        payload.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        let shape = CursorShape::parse(&payload).expect("valid shape");
+        assert_eq!((shape.width, shape.height), (2, 1));
+        assert_eq!((shape.hot_x, shape.hot_y), (1, 0));
+        assert_eq!(shape.rgba.len(), 8);
+        let mut bad = payload.clone();
+        bad.pop();
+        assert!(CursorShape::parse(&bad).is_none());
+        let mut bad_hotspot = payload.clone();
+        bad_hotspot[8..12].copy_from_slice(&2i32.to_le_bytes());
+        assert!(CursorShape::parse(&bad_hotspot).is_none());
+    }
 
     #[test]
     fn clipboard_policy_limits() {
