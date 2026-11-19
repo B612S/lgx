@@ -42,6 +42,8 @@ pub struct Conn {
     pub bytes: AtomicU64,
     /// Set by the reader when the server closes or the stream fails.
     pub closed: std::sync::atomic::AtomicBool,
+    /// Server asked for a local cursor (it does not composite the pointer).
+    pub local_cursor: std::sync::atomic::AtomicBool,
 }
 
 impl Conn {
@@ -66,7 +68,7 @@ pub fn connect(
     keymap: &[u8],
     client_id: &str,
     token: &str,
-    video: std::sync::mpsc::Sender<Chunk>,
+    video: std::sync::mpsc::SyncSender<Chunk>,
     clipboard: ClipPolicy,
 ) -> std::io::Result<(Arc<Conn>, Hello)> {
     let stream = TcpStream::connect(addr)?;
@@ -105,6 +107,7 @@ pub fn connect(
         last_remote,
         bytes: AtomicU64::new(0),
         closed: std::sync::atomic::AtomicBool::new(false),
+        local_cursor: std::sync::atomic::AtomicBool::new(false),
     });
     let conn_for_reader = conn.clone();
     std::thread::Builder::new()
@@ -119,21 +122,43 @@ fn reader(
     secure: Arc<Secure>,
     conn: Arc<Conn>,
     last_remote: Arc<Mutex<String>>,
-    video: std::sync::mpsc::Sender<Chunk>,
+    video: std::sync::mpsc::SyncSender<Chunk>,
     clipboard: ClipPolicy,
 ) {
+    // Decoded frames are dropped, never queued without bound: a slow decoder
+    // used to turn a 120 fps stream into smooth but seconds-old video. When the
+    // queue is full the reader skips to the next IDR and asks the server for
+    // one, so latency stays bounded and the reference chain heals quickly.
+    let mut skipping = false;
+    let mut last_idr_request: Option<std::time::Instant> = None;
     while let Ok((m, payload)) = secure.recv_msg_raw() {
         let body = &payload[secure::MSG_HEADER..];
         match m.typ {
             msg::VIDEO => {
                 conn.bytes.fetch_add(body.len() as u64, Ordering::Relaxed);
+                if skipping {
+                    if !is_idr(body) {
+                        continue;
+                    }
+                    skipping = false;
+                }
                 let chunk = Chunk {
                     data: payload,
                     off: secure::MSG_HEADER,
                     at: std::time::Instant::now(),
                 };
-                if video.send(chunk).is_err() {
-                    break;
+                match video.try_send(chunk) {
+                    Ok(()) => {}
+                    Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                        skipping = true;
+                        let due = last_idr_request
+                            .is_none_or(|t| t.elapsed() >= std::time::Duration::from_millis(500));
+                        if due {
+                            last_idr_request = Some(std::time::Instant::now());
+                            let _ = conn.send(Msg::new(msg::IDR, 0, 0, 0), &[]);
+                        }
+                    }
+                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => break,
                 }
             }
             msg::CLIP_DATA_HTML => {
@@ -158,6 +183,10 @@ fn reader(
                     }
                 }
             }
+            msg::CURSOR_LOCAL => {
+                conn.local_cursor
+                    .store(m.a != 0, std::sync::atomic::Ordering::Relaxed);
+            }
             msg::CLIP_DATA => {
                 if !clipboard.allows(body.len()) {
                     continue;
@@ -177,6 +206,35 @@ fn reader(
     conn.closed.store(true, Ordering::Relaxed);
 }
 
+/// True when an Annex-B access unit contains an HEVC IDR NAL (type 19 or 20).
+fn is_idr(data: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 3 <= data.len() {
+        if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
+            let mut nal = i + 3;
+            // 4-byte start codes leave a zero byte before the NAL header.
+            if nal < data.len() && data[nal] == 0 {
+                nal += 1;
+            }
+            if nal < data.len() {
+                let typ = (data[nal] >> 1) & 0x3f;
+                if typ == 19 || typ == 20 {
+                    return true;
+                }
+                i = nal;
+            }
+            i += 1;
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
+/// Frames buffered between the reader and the decoder. Six frames at 120 Hz
+/// bound the extra latency to ~50 ms.
+pub const VIDEO_QUEUE: usize = 6;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,3 +250,4 @@ mod tests {
         assert!(!p.allows(1));
     }
 }
+

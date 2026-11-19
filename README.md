@@ -287,8 +287,13 @@ Restart `lgx-input` after updating the server package.
   grayscale antialiasing in the guest (GTK3: `gtk-xft-rgba=none`; KDE:
   Sub-pixel rendering = None). This is a 4:2:0 limitation, not a shader bug.
 - Audio is raw PCM (no Opus), about 187 KiB/s.
-- The Vulkan path uploads NV12; dma-buf import is the next optimization.
-  Decoding is still hardware (CUDA/NVDEC or VAAPI).
+- The Vulkan client imports decoded dma-buf planes directly when the device
+  supports the decoder's DRM modifier, and otherwise downloads NV12 and
+  uploads it. Import needs the decoder and the renderer on the same GPU
+  driver (for example Intel VAAPI + Intel Vulkan); `LGX_VK_DEVICE=<substring>`
+  pins the Vulkan device and `LGX_NO_DMABUF=1` forces the upload path.
+  FFmpeg's CUDA hwcontext cannot export DRM_PRIME, so NVDEC frames always use
+  the upload path.
 - KMS capture is not supported: without DRM master `GETFB2` returns zero
   handles, so the compositor keeps the `wlr-screencopy` path.
 - VPP needs a VAAPI driver with video processing (Intel iHD here). Other

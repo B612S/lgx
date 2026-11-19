@@ -49,6 +49,11 @@ typedef struct LgxFrameInfo {
     uint32_t pitches[LGX_MAX_PLANES];
     uint64_t modifier;
     uint32_t fourcc;
+    /* 1 = a single NV12 layer whose two planes share one dma-buf object,
+     * 2 = two layers (R8 luma, R8G8 chroma), each with its own plane (the
+     * layers may still reference the same object). The Vulkan importer needs
+     * this: one two-plane image or two one-plane images, respectively. */
+    uint32_t layers;
     int64_t pts;
 } LgxFrameInfo;
 
@@ -210,6 +215,11 @@ static int map_dmabuf(LgxDec *d, AVFrame *src, LgxFrameInfo *out, void **handle)
     if (!drm) {
         return 0;
     }
+    /* av_hwframe_map() only produces a DRM descriptor when the destination
+     * asks for that format. With the default (unset) format the VAAPI
+     * hwcontext maps the surface to CPU NV12 instead, which is the old
+     * fallback behaviour and never a dma-buf. */
+    drm->format = AV_PIX_FMT_DRM_PRIME;
     if (av_hwframe_map(drm, src, AV_HWFRAME_MAP_READ) < 0 || !drm->data[0]) {
         av_frame_free(&drm);
         return 0;
@@ -217,13 +227,16 @@ static int map_dmabuf(LgxDec *d, AVFrame *src, LgxFrameInfo *out, void **handle)
     (void)d;
     AVDRMFrameDescriptor *desc = (AVDRMFrameDescriptor *)drm->data[0];
     int nv12 = 0;
+    int layers = 0;
     if (desc->nb_layers == 1 && desc->nb_objects >= 1) {
         nv12 = desc->layers[0].format == LGX_DRM_FORMAT_NV12 && desc->layers[0].nb_planes == 2;
+        layers = 1;
     } else if (desc->nb_layers == 2 && desc->nb_objects >= 1) {
         uint32_t f0 = desc->layers[0].format;
         uint32_t f1 = desc->layers[1].format;
         nv12 = desc->layers[0].nb_planes == 1 && desc->layers[1].nb_planes == 1 &&
                f0 == LGX_DRM_FORMAT_R8 && f1 == LGX_DRM_FORMAT_GR88;
+        layers = 2;
     }
     if (!nv12 || desc->objects[0].format_modifier == LGX_DRM_MOD_INVALID) {
         av_frame_free(&drm);
@@ -251,6 +264,7 @@ static int map_dmabuf(LgxDec *d, AVFrame *src, LgxFrameInfo *out, void **handle)
     out->fourcc = LGX_DRM_FORMAT_NV12;
     out->modifier = desc->objects[0].format_modifier;
     out->nb_planes = np;
+    out->layers = (uint32_t)layers;
     LgxOwned *own = owned_new(drm, av_frame_clone(src), NULL);
     if (!own) {
         return -1;

@@ -38,6 +38,7 @@ struct FrameInfo {
     pitches: [u32; 4],
     modifier: u64,
     fourcc: u32,
+    layers: u32,
     pts: i64,
 }
 
@@ -108,6 +109,9 @@ pub struct Dmabuf {
     pub planes: u32,
     pub modifier: u64,
     pub fourcc: u32,
+    /// 1 = one NV12 layer (both planes in one dma-buf object), 2 = separate
+    /// R8 luma and R8G8 chroma layers.
+    pub layers: u32,
     handle: *mut c_void,
 }
 
@@ -157,6 +161,8 @@ impl Drop for Nv12 {
 pub struct Decoder {
     raw: *mut LgxDec,
     hw: bool,
+    want_dmabuf: bool,
+    logged_kind: bool,
     pub backend: Backend,
 }
 
@@ -191,7 +197,13 @@ impl Decoder {
             }));
         }
         let hw = unsafe { lgx_dec_is_hw(raw) != 0 };
-        Ok(Self { raw, hw, backend })
+        Ok(Self {
+            raw,
+            hw,
+            want_dmabuf,
+            logged_kind: false,
+            backend,
+        })
     }
 
     pub fn hardware(&self) -> bool {
@@ -234,7 +246,21 @@ impl Decoder {
         if r < 0 || handle.is_null() {
             return Err(io::Error::other(self.last_error()));
         }
-        Ok(Some(frame_from_info(info, handle, arrival)?))
+        let frame = frame_from_info(info, handle, arrival)?;
+        // Report what actually arrives, not what was requested: NVDEC and
+        // some VAAPI setups cannot export dma-buf at all and silently fall
+        // back to CPU frames inside the shim.
+        if !self.logged_kind {
+            self.logged_kind = true;
+            match &frame.pixels {
+                Pixels::Dmabuf(_) => eprintln!("lgx-client: decoder frames: zero-copy dma-buf"),
+                Pixels::Nv12(_) if self.want_dmabuf => eprintln!(
+                    "lgx-client: decoder frames: CPU NV12 (the driver could not export the surface as dma-buf)"
+                ),
+                Pixels::Nv12(_) => eprintln!("lgx-client: decoder frames: CPU NV12"),
+            }
+        }
+        Ok(Some(frame))
     }
 }
 
@@ -270,11 +296,12 @@ fn frame_from_info(
             planes: info.nb_planes as u32,
             modifier: info.modifier,
             fourcc: info.fourcc,
+            layers: info.layers,
             handle,
         };
-        if d.planes != 2 {
+        if d.planes != 2 || !(1..=2).contains(&d.layers) {
             unsafe { lgx_dec_free_frame(handle) };
-            return Err(io::Error::other("decoder exported an unsupported plane count"));
+            return Err(io::Error::other("decoder exported an unsupported dma-buf layout"));
         }
         for fd in d.fds.iter().take(d.planes as usize) {
             if *fd < 0 {
@@ -386,9 +413,8 @@ pub fn spawn(
             };
             sink.hw.store(dec.hardware(), Ordering::Relaxed);
             eprintln!(
-                "lgx-client: HEVC decoder ready ({}, {} frame)",
-                if dec.hardware() { dec.backend.name() } else { "software" },
-                if dec.hardware() && want_dmabuf { "zero-copy dma-buf" } else { "CPU NV12" }
+                "lgx-client: HEVC decoder ready ({})",
+                if dec.hardware() { dec.backend.name() } else { "software" }
             );
 
             let mut pts = 0i64;

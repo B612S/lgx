@@ -499,7 +499,7 @@ fn main() {
     let mut connect_attempt = reconnect_attempt();
     let mut dialog: Option<reconnect_ui::Dialog> = None;
     let (conn, hello, video_rx) = loop {
-        let (video_tx, video_rx) = std::sync::mpsc::channel::<dec::Chunk>();
+        let (video_tx, video_rx) = std::sync::mpsc::sync_channel::<dec::Chunk>(net::VIDEO_QUEUE);
         let clip_policy = net::ClipPolicy {
             enabled: s.clipboard,
             rich: s.clipboard_rich,
@@ -682,7 +682,9 @@ fn main() {
     };
     let chosen = backends(&s.decoder, renderer.device_name());
     let want_dmabuf = renderer.can_import_dmabuf();
-    if !want_dmabuf {
+    if want_dmabuf {
+        eprintln!("lgx-client: decoder frames will be imported as dma-buf (LGX_NO_DMABUF=1 forces NV12 uploads)");
+    } else {
         eprintln!("lgx-client: decoder frames are uploaded as NV12 (no dma-buf import in the Vulkan path)");
     }
     let sink = dec::Sink::new();
@@ -794,6 +796,15 @@ fn main() {
     let mut fullscreen_hold: Option<(Instant, (u32, u32))> = None;
     let mut dst = vk::fit_rect(win_w, win_h, win_w, win_h);
     let mut config_saved = s.width.is_some() && s.height.is_some();
+    // Cursor visibility: hidden while the server composites the pointer into
+    // the video, shown when the server asked for a local cursor (it captures
+    // at the frame rate; the local pointer follows the host at its own rate).
+    let mut window_focused = true;
+    let mut cursor_shown = false;
+    // Wheel deltas arrive as floats: a trackpad sends fractions of a notch, and
+    // truncating them to i32 dropped most events. Whole steps are pieced
+    // together here, and axis 1 is forwarded so horizontal wheels work.
+    let mut wheel_acc = [0.0f32; 2];
 
     {
         let px = window.size_in_pixels();
@@ -830,18 +841,18 @@ fn main() {
                 }
                 Event::Window { win_event: sdl3::event::WindowEvent::FocusLost, .. } => {
                     audio_focus.store(false, std::sync::atomic::Ordering::Relaxed);
+                    window_focused = false;
                     window.set_mouse_grab(false);
-                    sdl.mouse().show_cursor(true);
                     // Unfocused: show the host cursor and exclude the guest
                     // cursor from the video, so exactly one is visible.
                     let _ = conn.send(Msg::new(msg::CURSOR, 0, 0, 0), &[]);
                 }
                 Event::Window { win_event: sdl3::event::WindowEvent::FocusGained, .. } => {
                     audio_focus.store(true, std::sync::atomic::Ordering::Relaxed);
+                    window_focused = true;
                     window.set_mouse_grab(grab_active);
-                    sdl.mouse().show_cursor(false);
-                    // Focused: guest cursor only; grab state does not change
-                    // which cursor is drawn.
+                    // Focused: guest cursor only unless the server asked for a
+                    // local one; grab state does not change the cursor.
                     let _ = conn.send(Msg::new(msg::CURSOR, 1, 0, 0), &[]);
                 }
                 Event::Window { .. } => redraw = true,
@@ -1010,9 +1021,18 @@ fn main() {
                         let _ = conn.send(Msg::new(msg::BTN, code, 0, 0), &[]);
                     }
                 }
-                Event::MouseWheel { y, .. } => {
-                    if y != 0.0 {
-                        let _ = conn.send(Msg::new(msg::WHEEL, 0, y as i32, 0), &[]);
+                Event::MouseWheel { x, y, .. } => {
+                    wheel_acc[0] += y;
+                    wheel_acc[1] += x;
+                    for (axis, acc) in wheel_acc.iter_mut().enumerate() {
+                        while *acc >= 1.0 {
+                            *acc -= 1.0;
+                            let _ = conn.send(Msg::new(msg::WHEEL, axis as u16, 1, 0), &[]);
+                        }
+                        while *acc <= -1.0 {
+                            *acc += 1.0;
+                            let _ = conn.send(Msg::new(msg::WHEEL, axis as u16, -1, 0), &[]);
+                        }
                     }
                 }
                 Event::KeyDown { scancode: Some(sc), .. } => {
@@ -1042,6 +1062,16 @@ fn main() {
                 }
                 _ => {}
             }
+        }
+
+        // Exactly one pointer: the host cursor when unfocused or when the
+        // server does not composite one, otherwise only the guest cursor in
+        // the video.
+        let show_local = !window_focused
+            || conn.local_cursor.load(std::sync::atomic::Ordering::Relaxed);
+        if show_local != cursor_shown {
+            sdl.mouse().show_cursor(show_local);
+            cursor_shown = show_local;
         }
 
         let win_px = window.size_in_pixels();
@@ -1320,18 +1350,28 @@ fn display_host(addr: &str) -> &str {
 }
 
 fn save_frame(path: &str, frame: &dec::Frame) {
-    if let dec::Pixels::Nv12(n) = &frame.pixels {
-        let (w, h) = (frame.width, frame.height);
-        let y = unsafe { std::slice::from_raw_parts(n.y, n.y_stride as usize * h as usize) };
-        let uv = unsafe {
-            std::slice::from_raw_parts(n.uv, n.uv_stride as usize * (h as usize / 2))
-        };
-        match write_ppm_nv12(path, w, h, y, n.y_stride as usize, uv, n.uv_stride as usize) {
-            Ok(()) => eprintln!("lgx-client: saved {path} ({w}x{h})"),
+    match &frame.pixels {
+        dec::Pixels::Nv12(n) => write_frame(path, frame, n),
+        // A zero-copy frame has no CPU pixels; download it once for the file.
+        dec::Pixels::Dmabuf(_) => match frame.download() {
+            Ok(cpu) => match &cpu.pixels {
+                dec::Pixels::Nv12(n) => write_frame(path, &cpu, n),
+                dec::Pixels::Dmabuf(_) => {
+                    eprintln!("lgx-client: screenshot: cannot download the frame")
+                }
+            },
             Err(e) => eprintln!("lgx-client: screenshot: {e}"),
-        }
-    } else {
-        eprintln!("lgx-client: screenshot needs a CPU NV12 frame");
+        },
+    }
+}
+
+fn write_frame(path: &str, frame: &dec::Frame, n: &dec::Nv12) {
+    let (w, h) = (frame.width, frame.height);
+    let y = unsafe { std::slice::from_raw_parts(n.y, n.y_stride as usize * h as usize) };
+    let uv = unsafe { std::slice::from_raw_parts(n.uv, n.uv_stride as usize * (h as usize / 2)) };
+    match write_ppm_nv12(path, w, h, y, n.y_stride as usize, uv, n.uv_stride as usize) {
+        Ok(()) => eprintln!("lgx-client: saved {path} ({w}x{h})"),
+        Err(e) => eprintln!("lgx-client: screenshot: {e}"),
     }
 }
 

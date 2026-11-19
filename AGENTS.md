@@ -149,12 +149,32 @@ Commit format: `area: short imperative summary`, for example
   headers. Do not mirror libavcodec structs in Rust.
 - Backends: software (0), VAAPI (1), CUDA/NVDEC (2). `pick_format` uses
   `ctx->opaque` to request the matching hardware format.
-- The client currently asks the decoder for CPU NV12 (`want_dmabuf = false`)
-  and uploads it to Vulkan. The C shim still has the dma-buf export code; it
-  will be used when the Vulkan dma-buf import path lands.
-- `src/vk.rs` owns the Vulkan instance, surface (from SDL), swapchain, render
-  pass and pipeline. Two textures (R8 for Y, R8G8 for UV) are uploaded from
-  staging buffers each frame; a full-range BT.709 shader converts to RGB.
+- The client asks the decoder for dma-buf frames when the Vulkan device
+  advertises `VK_KHR_external_memory_fd`, `VK_EXT_external_memory_dma_buf` and
+  `VK_EXT_image_drm_format_modifier`; `LGX_NO_DMABUF=1` forces the CPU path.
+  The shim reports the DRM fourcc, modifier, per-plane fd/offset/pitch and
+  whether the frame is one NV12 layer or two (R8 luma + R8G8 chroma) layers.
+  `av_hwframe_map` only produces a DRM descriptor when the destination frame's
+  format is `AV_PIX_FMT_DRM_PRIME`; without that it quietly maps to CPU NV12.
+  FFmpeg's CUDA hwcontext has no DRM_PRIME export, so NVDEC frames always take
+  the CPU path.
+- `src/vk.rs` imports those planes with
+  `VkImageDrmFormatModifierExplicitCreateInfoEXT` + `VkExternalMemoryImageCreateInfo`
+  (DMA_BUF), imports each fd with `VkImportMemoryFdInfoKHR`, and samples R8 /
+  R8G8 views of the result. A single NV12 layer becomes one two-plane image
+  (views use `VK_IMAGE_ASPECT_PLANE_0/1_BIT`, which requires `MUTABLE_FORMAT`
+  and a format list); two decoder layers become two single-plane images. Any
+  failure is logged once and that frame — and every later dma-buf frame — is
+  downloaded to CPU NV12 instead, so an unsupported modifier cannot black out
+  the window.
+- Import requires the decoder and the renderer to use the same GPU driver
+  (Intel VAAPI + Intel Vulkan, for example). `LGX_VK_DEVICE=<substring>` pins
+  the Vulkan physical device by name; without it a discrete GPU is preferred
+  and cross-driver modifiers usually fail the import (with a logged reason).
+- `src/vk.rs` also owns the Vulkan instance, surface (from SDL), swapchain,
+  render pass and pipeline. On the CPU path two textures (R8 for Y, R8G8 for
+  UV) are uploaded from staging buffers each frame; a full-range BT.709 shader
+  converts to RGB either way.
 - Shaders are SPIR-V files committed under `src/shaders/`. Regenerate after
   editing GLSL:
   `glslangValidator -V shaders/video.vert -o shaders/video.vert.spv`.
@@ -398,13 +418,22 @@ driver. The server needs libva headers for the helper.
     `release_frame`). wlroots and Hyprland keep the resource alive until the
     client destroys it; dropping the Rust proxy leaks one compositor object
     per captured frame.
-17. Continuous capture at the panel rate is intentional. A damage-driven
+17. `av_hwframe_map` maps to CPU memory unless `dst->format` asks for
+    `AV_PIX_FMT_DRM_PRIME`; the destination frame also must outlive the
+    Vulkan import because it owns the descriptor and its fds. Importing an fd
+    transfers it to Vulkan, so the client `dup()`s it first. A DRM-modifier
+    image must be validated with `vkGetPhysicalDeviceImageFormatProperties2`
+    (chained `VkPhysicalDeviceImageDrmFormatModifierInfoEXT`) and its plane
+    count with `VkDrmFormatModifierPropertiesListEXT` before
+    `vkCreateImage`, otherwise the failure only shows up as
+    `VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT`.
+18. Continuous capture at the panel rate is intentional. A damage-driven
     `copy_with_damage` experiment reduced idle CPU/GPU but made mouse motion
     lag badly: a hardware cursor can move without committing a new output
     frame, so the pending capture has no damage to complete on. If this is
     revisited, keep a continuous plain-`copy` window while the pointer is
     moving; do not make the whole stream damage-driven.
-18. HEVC 4:2:0 cannot carry RGB subpixel antialiasing. Guest text rendered
+19. HEVC 4:2:0 cannot carry RGB subpixel antialiasing. Guest text rendered
     with `rgba=rgb` (GTK3 `gtk-xft-rgba=rgb`, KDE sub-pixel rendering) shows
     coloured fringes after encoding, especially in screenshots. The fix is
     grayscale antialiasing in the guest, not a colour-matrix change in the

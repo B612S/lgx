@@ -1,10 +1,15 @@
-//! Vulkan presentation of decoded NV12 frames.
+//! Vulkan presentation of decoded HEVC frames.
 //!
-//! The decoder produces CPU NV12 (hardware decode + transfer), which is
-//! uploaded into two R8/R8G8 images and converted to RGB in a fragment
-//! shader with the same full-range BT.709 matrix as the rest of lgx. The
-//! swapchain is created from SDL's Vulkan surface; presentation is immediate
-//! unless vsync is requested.
+//! The preferred path imports the decoder's dma-buf planes directly
+//! (`VK_EXT_image_drm_format_modifier`, `VK_EXT_external_memory_dma_buf`) and
+//! samples them without a CPU transfer. When the device cannot import the
+//! frame's modifier, or the import fails at runtime, the renderer falls back
+//! to CPU NV12: the frame is downloaded, uploaded into two R8/R8G8 images from
+//! staging buffers, and presented with the same fragment shader. The shader
+//! converts full-range BT.709 to RGB either way.
+//!
+//! The swapchain is created from SDL's Vulkan surface; presentation is
+//! immediate unless vsync is requested.
 
 use std::ffi::{c_char, CStr, CString};
 
@@ -61,6 +66,33 @@ struct Staging {
     pitch: u32,
 }
 
+/// A dma-buf frame imported into Vulkan memory.
+///
+/// The decoder exports either one NV12 layer (both planes inside one dma-buf
+/// object) or two layers (R8 luma and R8G8 chroma, each with its own object).
+/// The first case becomes a single two-plane VkImage with one view per plane,
+/// the second two one-plane images. Both end up as the same two descriptor
+/// bindings the CPU path uses, so the shader sees an R8 and an R8G8 texture.
+struct ImportedFrame {
+    images: Vec<vk::Image>,
+    memories: Vec<vk::DeviceMemory>,
+    views: [vk::ImageView; 2],
+    /// (image, aspect) of the luma and chroma plane, used for the layout
+    /// barriers that make the imported memory visible to the shader.
+    planes: [(vk::Image, vk::ImageAspectFlags); 2],
+}
+
+/// One decoder layer expressed as the Vulkan image it has to become.
+struct Layer {
+    name: &'static str,
+    format: vk::Format,
+    extent: vk::Extent2D,
+    layouts: Vec<vk::SubresourceLayout>,
+    /// File descriptor owned by the decoder's AVFrame; it is dup()ed before
+    /// a Vulkan import because importing transfers fd ownership.
+    fd: i32,
+}
+
 pub struct Renderer {
     entry: ash::Entry,
     instance: ash::Instance,
@@ -106,6 +138,21 @@ pub struct Renderer {
     render_done: vk::Semaphore,
     in_flight: vk::Fence,
     device_name: String,
+    dmabuf_capable: bool,
+    /// Device-side entry point for `vkGetMemoryFdPropertiesKHR`; present only
+    /// when the external memory extensions were enabled.
+    dmabuf_fd: Option<ash::khr::external_memory_fd::Device>,
+    /// Frame imported for the current dma-buf frame, if any.
+    dmabuf: Option<ImportedFrame>,
+    /// Set after the first failed import: every later dma-buf frame is
+    /// downloaded instead of retried, so a driver that cannot import this
+    /// modifier still shows the picture.
+    dmabuf_disabled: bool,
+    dmabuf_logged: bool,
+    /// Whether the descriptor set currently points at imported plane views.
+    desc_dmabuf: bool,
+    /// Size of the frame being presented, used for the fit rectangle.
+    frame_size: (u32, u32),
     vsync: bool,
 }
 
@@ -157,7 +204,8 @@ impl Renderer {
         let physical = instance
             .enumerate_physical_devices()
             .map_err(|e| format!("enumerate physical devices: {e:?}"))?;
-        let mut chosen = None;
+        // (physical device, score, queue family, name)
+        let mut candidates: Vec<(vk::PhysicalDevice, u32, u32, String)> = Vec::new();
         for pd in physical {
             let props = instance.get_physical_device_properties(pd);
             let qfs = instance.get_physical_device_queue_family_properties(pd);
@@ -183,29 +231,112 @@ impl Renderer {
             if !has_swapchain {
                 continue;
             }
+            let name = CStr::from_ptr(props.device_name.as_ptr())
+                .to_string_lossy()
+                .into_owned();
             let discrete = props.device_type == vk::PhysicalDeviceType::DISCRETE_GPU;
             let score = if discrete { 2 } else { 1 };
-            if chosen.as_ref().is_none_or(|(_, s, _)| score > *s) {
-                chosen = Some((pd, score, family));
-            }
+            candidates.push((pd, score, family, name));
         }
-        let (pd, _, family) = chosen.ok_or("no Vulkan device with a present queue")?;
+        let best = |list: &[(vk::PhysicalDevice, u32, u32, String)]| {
+            list.iter()
+                .max_by_key(|c| c.1)
+                .map(|c| (c.0, c.2))
+        };
+        // Hybrid systems decode and render on different GPUs by default (for
+        // example Intel VAAPI + the discrete card). dma-buf import only works
+        // when both use the same driver, so allow pinning the Vulkan device by
+        // name substring to test or prefer the decoder's GPU.
+        let want_device = std::env::var("LGX_VK_DEVICE")
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .filter(|v| !v.is_empty());
+        let pinned = want_device.as_deref().and_then(|want| {
+            let matching: Vec<_> = candidates
+                .iter()
+                .filter(|c| c.3.to_ascii_lowercase().contains(want))
+                .cloned()
+                .collect();
+            best(&matching)
+        });
+        let (pd, family) = match pinned {
+            Some(choice) => choice,
+            None => {
+                if let Some(want) = &want_device {
+                    eprintln!(
+                        "lgx-client: no Vulkan device matches LGX_VK_DEVICE={want}; using the default choice"
+                    );
+                }
+                best(&candidates).ok_or("no Vulkan device with a present queue")?
+            }
+        };
         let props = instance.get_physical_device_properties(pd);
         let device_name = CStr::from_ptr(props.device_name.as_ptr()).to_string_lossy().into_owned();
+
+        // dma-buf import needs the fd handle type, the DRM modifier extension and
+        // the dma-buf extension. Report honestly instead of assuming.
+        let available: Vec<String> = instance
+            .enumerate_device_extension_properties(pd)
+            .map(|v| {
+                v.iter()
+                    .map(|e| CStr::from_ptr(e.extension_name.as_ptr()).to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let has = |name: &std::ffi::CStr| available.iter().any(|e| e == &name.to_string_lossy());
+        let ext_mem_fd = has(ash::khr::external_memory_fd::NAME);
+        let ext_dmabuf = has(ash::ext::external_memory_dma_buf::NAME);
+        let ext_modifier = has(ash::ext::image_drm_format_modifier::NAME);
+        let dmabuf_capable = ext_mem_fd && ext_dmabuf && ext_modifier;
+        eprintln!(
+            "lgx-client: dma-buf import {} (external_memory_fd={ext_mem_fd}, dma_buf={ext_dmabuf}, drm_modifier={ext_modifier})",
+            if dmabuf_capable { "available" } else { "unavailable" }
+        );
 
         let priority = [1.0f32];
         let queue_info = [vk::DeviceQueueCreateInfo::default()
             .queue_family_index(family)
             .queue_priorities(&priority)];
-        let device_exts = [ash::khr::swapchain::NAME.as_ptr()];
-        let device_info = vk::DeviceCreateInfo::default()
-            .queue_create_infos(&queue_info)
-            .enabled_extension_names(&device_exts);
-        let device = instance
-            .create_device(pd, &device_info, None)
-            .map_err(|e| format!("vkCreateDevice: {e:?}"))?;
+        let mut device_exts = vec![ash::khr::swapchain::NAME.as_ptr()];
+        if dmabuf_capable {
+            device_exts.push(ash::khr::external_memory_fd::NAME.as_ptr());
+            device_exts.push(ash::ext::external_memory_dma_buf::NAME.as_ptr());
+            device_exts.push(ash::ext::image_drm_format_modifier::NAME.as_ptr());
+        }
+        let mut dmabuf_capable = dmabuf_capable;
+        let device = match instance.create_device(
+            pd,
+            &vk::DeviceCreateInfo::default()
+                .queue_create_infos(&queue_info)
+                .enabled_extension_names(&device_exts),
+            None,
+        ) {
+            Ok(device) => device,
+            // Enabling the import extensions must never cost the window: if
+            // the driver refuses them, recreate the device for the CPU path.
+            Err(e) if dmabuf_capable => {
+                eprintln!("lgx-client: dma-buf device extensions were rejected ({e:?}); using NV12 uploads");
+                dmabuf_capable = false;
+                let minimal = [ash::khr::swapchain::NAME.as_ptr()];
+                instance
+                    .create_device(
+                        pd,
+                        &vk::DeviceCreateInfo::default()
+                            .queue_create_infos(&queue_info)
+                            .enabled_extension_names(&minimal),
+                        None,
+                    )
+                    .map_err(|e| format!("vkCreateDevice: {e:?}"))?
+            }
+            Err(e) => return Err(format!("vkCreateDevice: {e:?}")),
+        };
         let queue = device.get_device_queue(family, 0);
         let swapchain_loader = ash::khr::swapchain::Device::new(&instance, &device);
+        let dmabuf_fd = if dmabuf_capable {
+            Some(ash::khr::external_memory_fd::Device::new(&instance, &device))
+        } else {
+            None
+        };
 
         let caps = surface_loader
             .get_physical_device_surface_capabilities(pd, surface)
@@ -439,6 +570,13 @@ impl Renderer {
             in_flight,
             device_name,
             vsync,
+            dmabuf_capable,
+            dmabuf_fd,
+            dmabuf: None,
+            dmabuf_disabled: false,
+            dmabuf_logged: false,
+            desc_dmabuf: false,
+            frame_size: (tw, th),
         })
     }
 
@@ -446,8 +584,12 @@ impl Renderer {
         &self.device_name
     }
 
+    /// True when this device can import the decoder's dma-buf planes.
+    /// `LGX_NO_DMABUF=1` forces the CPU upload path without touching the rest
+    /// of the renderer, which is the escape hatch if an import ever renders
+    /// incorrectly on a driver.
     pub fn can_import_dmabuf(&self) -> bool {
-        false
+        self.dmabuf_capable && std::env::var_os("LGX_NO_DMABUF").is_none()
     }
 
     pub fn size(&self) -> (u32, u32) {
@@ -467,29 +609,80 @@ impl Renderer {
     }
 
     pub fn draw(&mut self, frame: &crate::dec::Frame, win: (u32, u32)) -> bool {
-        let crate::dec::Pixels::Nv12(nv) = &frame.pixels else {
-            return false;
-        };
-        unsafe {
-            if frame.width != self.tex_y.width || frame.height != self.tex_y.height {
-                if let Err(e) = self.resize_textures(frame.width, frame.height) {
-                    eprintln!("lgx-client: Vulkan textures: {e}");
-                    return false;
+        self.frame_size = (frame.width, frame.height);
+        match &frame.pixels {
+            crate::dec::Pixels::Nv12(nv) => unsafe { self.draw_nv12(frame, nv, win) },
+            crate::dec::Pixels::Dmabuf(d) => unsafe {
+                if self.dmabuf_disabled || self.dmabuf_fd.is_none() {
+                    return self.draw_downloaded(frame, win);
                 }
+                if let Err(e) = self.import_dmabuf(frame, d) {
+                    // A failed import must never leave a black window: log the
+                    // reason once and keep presenting this and every later
+                    // dma-buf frame through the CPU upload path.
+                    eprintln!("lgx-client: dma-buf import failed: {e}");
+                    eprintln!(
+                        "lgx-client: falling back to CPU NV12 uploads (set LGX_NO_DMABUF=1 to skip import attempts)"
+                    );
+                    self.dmabuf_disabled = true;
+                    self.drop_import();
+                    return self.draw_downloaded(frame, win);
+                }
+                match self.present(win, false) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        eprintln!("lgx-client: Vulkan present: {e}");
+                        false
+                    }
+                }
+            },
+        }
+    }
+
+    /// Last-resort path for a frame the GPU cannot import: transfer it to CPU
+    /// NV12 and present it like a software-decoded frame.
+    unsafe fn draw_downloaded(&mut self, frame: &crate::dec::Frame, win: (u32, u32)) -> bool {
+        match frame.download() {
+            Ok(cpu) => match &cpu.pixels {
+                crate::dec::Pixels::Nv12(nv) => self.draw_nv12(&cpu, nv, win),
+                crate::dec::Pixels::Dmabuf(_) => false,
+            },
+            Err(e) => {
+                eprintln!("lgx-client: cannot download the dma-buf frame: {e}");
+                false
             }
-            if nv.y_stride != self.stage_y.pitch || nv.uv_stride / 2 != self.stage_uv.pitch {
-                if let Err(e) = self.resize_staging(frame.width, frame.height, nv.y_stride, nv.uv_stride) {
-                    eprintln!("lgx-client: Vulkan staging: {e}");
-                    return false;
-                }
+        }
+    }
+
+    unsafe fn draw_nv12(
+        &mut self,
+        frame: &crate::dec::Frame,
+        nv: &crate::dec::Nv12,
+        win: (u32, u32),
+    ) -> bool {
+        self.frame_size = (frame.width, frame.height);
+        // A frame that came back as NV12 after an import (or on a CPU-only
+        // device) uses the texture path; release an older imported frame and
+        // point the descriptors back at the upload images.
+        self.drop_import();
+        if frame.width != self.tex_y.width || frame.height != self.tex_y.height {
+            if let Err(e) = self.resize_textures(frame.width, frame.height) {
+                eprintln!("lgx-client: Vulkan textures: {e}");
+                return false;
             }
-            self.upload(frame.height, nv.y, nv.uv);
-            match self.present(win) {
-                Ok(()) => true,
-                Err(e) => {
-                    eprintln!("lgx-client: Vulkan present: {e}");
-                    false
-                }
+        }
+        if nv.y_stride != self.stage_y.pitch || nv.uv_stride / 2 != self.stage_uv.pitch {
+            if let Err(e) = self.resize_staging(frame.width, frame.height, nv.y_stride, nv.uv_stride) {
+                eprintln!("lgx-client: Vulkan staging: {e}");
+                return false;
+            }
+        }
+        self.upload(frame.height, nv.y, nv.uv);
+        match self.present(win, true) {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!("lgx-client: Vulkan present: {e}");
+                false
             }
         }
     }
@@ -549,7 +742,537 @@ impl Renderer {
         self.stage_y = sy;
         self.stage_uv = su;
         write_descriptors(&self.device, self.desc_set, &self.tex_y, &self.tex_uv, self.sampler);
+        self.desc_dmabuf = false;
         Ok(())
+    }
+
+    /// Copies the staged NV12 planes into the two upload images and makes them
+    /// readable by the fragment shader.
+    unsafe fn blit_nv12(&self, cmd: vk::CommandBuffer) {
+        let range = vk::ImageSubresourceRange::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .base_mip_level(0)
+            .level_count(1)
+            .base_array_layer(0)
+            .layer_count(1);
+        let barriers = [
+            vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(self.tex_y.image)
+                .subresource_range(range)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE),
+            vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(self.tex_uv.image)
+                .subresource_range(range)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE),
+        ];
+        self.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &barriers,
+        );
+        let y_region = [vk::BufferImageCopy::default()
+            .buffer_offset(0)
+            .buffer_row_length(self.stage_y.pitch)
+            .buffer_image_height(0)
+            .image_subresource(
+                vk::ImageSubresourceLayers::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .mip_level(0)
+                    .base_array_layer(0)
+                    .layer_count(1),
+            )
+            .image_extent(vk::Extent3D { width: self.tex_y.width, height: self.tex_y.height, depth: 1 })];
+        self.device.cmd_copy_buffer_to_image(
+            cmd,
+            self.stage_y.buffer,
+            self.tex_y.image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &y_region,
+        );
+        let uv_region = [vk::BufferImageCopy::default()
+            .buffer_offset(0)
+            .buffer_row_length(self.stage_uv.pitch)
+            .buffer_image_height(0)
+            .image_subresource(
+                vk::ImageSubresourceLayers::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .mip_level(0)
+                    .base_array_layer(0)
+                    .layer_count(1),
+            )
+            .image_extent(vk::Extent3D {
+                width: self.tex_uv.width,
+                height: self.tex_uv.height,
+                depth: 1,
+            })];
+        self.device.cmd_copy_buffer_to_image(
+            cmd,
+            self.stage_uv.buffer,
+            self.tex_uv.image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &uv_region,
+        );
+        let read_barriers = [
+            vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(self.tex_y.image)
+                .subresource_range(range)
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ),
+            vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(self.tex_uv.image)
+                .subresource_range(range)
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ),
+        ];
+        self.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &read_barriers,
+        );
+    }
+
+    /// Transitions the imported dma-buf planes for sampling. A fresh image is
+    /// created for every frame, so this is the only transition it needs.
+    unsafe fn prepare_dmabuf(&self, cmd: vk::CommandBuffer) -> Result<(), String> {
+        let Some(frame) = &self.dmabuf else {
+            return Err("no imported dma-buf frame to present".into());
+        };
+        let barriers: Vec<vk::ImageMemoryBarrier> = frame
+            .planes
+            .iter()
+            .map(|&(image, aspect)| {
+                vk::ImageMemoryBarrier::default()
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(image)
+                    .subresource_range(
+                        vk::ImageSubresourceRange::default()
+                            .aspect_mask(aspect)
+                            .base_mip_level(0)
+                            .level_count(1)
+                            .base_array_layer(0)
+                            .layer_count(1),
+                    )
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
+            })
+            .collect();
+        self.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &barriers,
+        );
+        Ok(())
+    }
+
+    /// Releases the imported frame and points the descriptors back at the
+    /// upload textures. Safe to call when nothing is imported.
+    unsafe fn drop_import(&mut self) {
+        if self.dmabuf.is_none() && !self.desc_dmabuf {
+            return;
+        }
+        // The last submission may still sample the imported images and the
+        // descriptor set may still point at their views, so wait before
+        // touching either.
+        let _ = self
+            .device
+            .wait_for_fences(&[self.in_flight], true, 1_000_000_000);
+        if self.desc_dmabuf {
+            write_descriptors(&self.device, self.desc_set, &self.tex_y, &self.tex_uv, self.sampler);
+            self.desc_dmabuf = false;
+        }
+        if let Some(old) = self.dmabuf.take() {
+            destroy_imported(&self.device, old);
+        }
+    }
+
+    /// Imports one dma-buf frame. On error nothing is left bound, and the
+    /// caller can still present the frame through the CPU path.
+    unsafe fn import_dmabuf(
+        &mut self,
+        frame: &crate::dec::Frame,
+        d: &crate::dec::Dmabuf,
+    ) -> Result<(), String> {
+        let layers = dmabuf_layers(frame, d)?;
+        if !self.dmabuf_logged {
+            self.dmabuf_logged = true;
+            eprintln!(
+                "lgx-client: dma-buf frame {}x{}, modifier {:#018x}, {} layer(s), offsets {}/{}, pitches {}/{}",
+                frame.width,
+                frame.height,
+                d.modifier,
+                layers.len(),
+                d.offsets[0],
+                d.offsets[1],
+                d.pitches[0],
+                d.pitches[1]
+            );
+        }
+        // The previous imported image may still be in flight.
+        self.device
+            .wait_for_fences(&[self.in_flight], true, 1_000_000_000)
+            .map_err(|e| format!("wait for the previous frame: {e:?}"))?;
+        if let Some(old) = self.dmabuf.take() {
+            destroy_imported(&self.device, old);
+        }
+
+        let imported = self.build_import(&layers, d.modifier)?;
+        write_view_descriptors(
+            &self.device,
+            self.desc_set,
+            imported.views[0],
+            imported.views[1],
+            self.sampler,
+        );
+        self.desc_dmabuf = true;
+        self.dmabuf = Some(imported);
+        Ok(())
+    }
+
+    unsafe fn build_import(
+        &self,
+        layers: &[Layer],
+        modifier: u64,
+    ) -> Result<ImportedFrame, String> {
+        let mut out = ImportedFrame {
+            images: Vec::with_capacity(layers.len()),
+            memories: Vec::with_capacity(layers.len()),
+            views: [vk::ImageView::null(); 2],
+            planes: [(vk::Image::null(), vk::ImageAspectFlags::empty()); 2],
+        };
+        if let Err(e) = self.fill_import(&mut out, layers, modifier) {
+            destroy_imported(&self.device, out);
+            return Err(e);
+        }
+        Ok(out)
+    }
+
+    unsafe fn fill_import(
+        &self,
+        out: &mut ImportedFrame,
+        layers: &[Layer],
+        modifier: u64,
+    ) -> Result<(), String> {
+        for layer in layers {
+            let planes = self.modifier_plane_count(layer, modifier)?;
+            if planes as usize != layer.layouts.len() {
+                return Err(format!(
+                    "{} with modifier {:#018x} has {} memory planes, the decoder exported {}",
+                    layer.name,
+                    modifier,
+                    planes,
+                    layer.layouts.len()
+                ));
+            }
+            let (image, memory) = self.import_layer(layer, modifier)?;
+            out.images.push(image);
+            out.memories.push(memory);
+        }
+
+        // The NV12 form is one two-plane image; the split form is two
+        // single-plane images. Both are sampled as an R8 and an R8G8 view.
+        let aspects = if layers.len() == 1 {
+            [
+                vk::ImageAspectFlags::PLANE_0,
+                vk::ImageAspectFlags::PLANE_1,
+            ]
+        } else {
+            [vk::ImageAspectFlags::COLOR, vk::ImageAspectFlags::COLOR]
+        };
+        let formats = [vk::Format::R8_UNORM, vk::Format::R8G8_UNORM];
+        let images = if layers.len() == 1 {
+            [out.images[0], out.images[0]]
+        } else {
+            [out.images[0], out.images[1]]
+        };
+        for i in 0..2 {
+            let view = self
+                .device
+                .create_image_view(
+                    &vk::ImageViewCreateInfo::default()
+                        .image(images[i])
+                        .view_type(vk::ImageViewType::TYPE_2D)
+                        .format(formats[i])
+                        .subresource_range(
+                            vk::ImageSubresourceRange::default()
+                                .aspect_mask(aspects[i])
+                                .base_mip_level(0)
+                                .level_count(1)
+                                .base_array_layer(0)
+                                .layer_count(1),
+                        ),
+                    None,
+                )
+                .map_err(|e| format!("plane {i} image view: {e:?}"))?;
+            out.views[i] = view;
+            out.planes[i] = (images[i], aspects[i]);
+        }
+        Ok(())
+    }
+
+    /// Creates one VkImage for a decoder layer and binds an import of its
+    /// dma-buf. A two-plane NV12 image shares one memory, so it is bound with
+    /// a single `vkBindImageMemory`; the per-plane offsets live in the
+    /// explicit modifier description.
+    unsafe fn import_layer(
+        &self,
+        layer: &Layer,
+        modifier: u64,
+    ) -> Result<(vk::Image, vk::DeviceMemory), String> {
+        let mut drm = vk::PhysicalDeviceImageDrmFormatModifierInfoEXT::default()
+            .drm_format_modifier(modifier)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let mut external = vk::PhysicalDeviceExternalImageFormatInfo::default()
+            .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+        let mut external_props = vk::ExternalImageFormatProperties::default();
+        let mut props = vk::ImageFormatProperties2::default().push_next(&mut external_props);
+        self.instance
+            .get_physical_device_image_format_properties2(
+                self.physical,
+                &vk::PhysicalDeviceImageFormatInfo2::default()
+                    .format(layer.format)
+                    .ty(vk::ImageType::TYPE_2D)
+                    .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+                    .usage(vk::ImageUsageFlags::SAMPLED)
+                    .push_next(&mut drm)
+                    .push_next(&mut external),
+                &mut props,
+            )
+            .map_err(|e| {
+                format!(
+                    "{} {}x{} with modifier {modifier:#018x} cannot be imported: {e:?}",
+                    layer.name, layer.extent.width, layer.extent.height
+                )
+            })?;
+        if !external_props
+            .external_memory_properties
+            .compatible_handle_types
+            .contains(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
+        {
+            return Err(format!(
+                "{} with modifier {modifier:#018x} does not accept dma-buf handles",
+                layer.name
+            ));
+        }
+
+        let view_formats = [
+            layer.format,
+            vk::Format::R8_UNORM,
+            vk::Format::R8G8_UNORM,
+        ];
+        let mut format_list = vk::ImageFormatListCreateInfo::default().view_formats(&view_formats);
+        let plane_layouts = layer.layouts.clone();
+        let mut modifier_info = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
+            .drm_format_modifier(modifier)
+            .plane_layouts(&plane_layouts);
+        let mut external_image = vk::ExternalMemoryImageCreateInfo::default()
+            .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+        let separate_planes = layer.layouts.len() > 1;
+        let mut info = vk::ImageCreateInfo::default()
+            .flags(if separate_planes {
+                // Sampling the two planes of one NV12 image through R8/R8G8
+                // views requires a mutable-format image and a format list.
+                vk::ImageCreateFlags::MUTABLE_FORMAT
+            } else {
+                vk::ImageCreateFlags::empty()
+            })
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(layer.format)
+            .extent(vk::Extent3D {
+                width: layer.extent.width,
+                height: layer.extent.height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+            .usage(vk::ImageUsageFlags::SAMPLED)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .push_next(&mut modifier_info)
+            .push_next(&mut external_image);
+        if separate_planes {
+            info = info.push_next(&mut format_list);
+        }
+        let image = self.device.create_image(&info, None).map_err(|e| {
+            format!(
+                "vkCreateImage({} {}x{}, modifier {modifier:#018x}, {} plane(s)): {e:?}",
+                layer.name,
+                layer.extent.width,
+                layer.extent.height,
+                layer.layouts.len()
+            )
+        })?;
+
+        let memory = match self.import_memory(image, layer.fd) {
+            Ok(memory) => memory,
+            Err(e) => {
+                self.device.destroy_image(image, None);
+                return Err(e);
+            }
+        };
+        if let Err(e) = self.device.bind_image_memory(image, memory, 0) {
+            self.device.free_memory(memory, None);
+            self.device.destroy_image(image, None);
+            return Err(format!("vkBindImageMemory: {e:?}"));
+        }
+        Ok((image, memory))
+    }
+
+    /// Duplicates the decoder's fd and imports it as dedicated image memory.
+    /// The duplicate is closed on failure; on success Vulkan owns it.
+    unsafe fn import_memory(&self, image: vk::Image, raw_fd: i32) -> Result<vk::DeviceMemory, String> {
+        let Some(loader) = &self.dmabuf_fd else {
+            return Err("external memory fd support is not enabled".into());
+        };
+        let mut dedicated_req = vk::MemoryDedicatedRequirements::default();
+        let mut req2 = vk::MemoryRequirements2::default().push_next(&mut dedicated_req);
+        self.device.get_image_memory_requirements2(
+            &vk::ImageMemoryRequirementsInfo2::default().image(image),
+            &mut req2,
+        );
+        let req = req2.memory_requirements;
+
+        let fd = libc::dup(raw_fd);
+        if fd < 0 {
+            return Err(format!(
+                "cannot duplicate the dma-buf fd: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let mut fd_props = vk::MemoryFdPropertiesKHR::default();
+        if let Err(e) = loader.get_memory_fd_properties(
+            vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
+            fd,
+            &mut fd_props,
+        ) {
+            libc::close(fd);
+            return Err(format!("vkGetMemoryFdPropertiesKHR: {e:?}"));
+        }
+        // Both the image and the imported file descriptor restrict the memory
+        // types; the allocation has to satisfy the intersection.
+        let bits = req.memory_type_bits & fd_props.memory_type_bits;
+        if bits == 0 {
+            libc::close(fd);
+            return Err(format!(
+                "the dma-buf memory types ({:#x}) do not match the image requirements ({:#x})",
+                fd_props.memory_type_bits, req.memory_type_bits
+            ));
+        }
+        let mem_type = match find_memory(
+            &self.instance,
+            self.physical,
+            bits,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        ) {
+            Ok(t) => t,
+            Err(e) => match find_memory(
+                &self.instance,
+                self.physical,
+                bits,
+                vk::MemoryPropertyFlags::empty(),
+            ) {
+                Ok(t) => t,
+                Err(_) => {
+                    libc::close(fd);
+                    return Err(e);
+                }
+            },
+        };
+
+        let dedicated = dedicated_req.requires_dedicated_allocation != 0
+            || dedicated_req.prefers_dedicated_allocation != 0;
+        let mut import = vk::ImportMemoryFdInfoKHR::default()
+            .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
+            .fd(fd);
+        let memory = if dedicated {
+            let mut dedicated_info = vk::MemoryDedicatedAllocateInfo::default().image(image);
+            let alloc = vk::MemoryAllocateInfo::default()
+                .allocation_size(req.size)
+                .memory_type_index(mem_type)
+                .push_next(&mut dedicated_info)
+                .push_next(&mut import);
+            self.device.allocate_memory(&alloc, None)
+        } else {
+            let alloc = vk::MemoryAllocateInfo::default()
+                .allocation_size(req.size)
+                .memory_type_index(mem_type)
+                .push_next(&mut import);
+            self.device.allocate_memory(&alloc, None)
+        };
+        match memory {
+            Ok(memory) => Ok(memory),
+            Err(e) => {
+                libc::close(fd);
+                Err(format!("vkAllocateMemory (imported dma-buf): {e:?}"))
+            }
+        }
+    }
+
+    /// The plane count the device associates with `format` + `modifier`.
+    /// A mismatch with the decoded layout must fail before `vkCreateImage`.
+    unsafe fn modifier_plane_count(&self, layer: &Layer, modifier: u64) -> Result<u32, String> {
+        let mut list = vk::DrmFormatModifierPropertiesListEXT::default();
+        let mut props = vk::FormatProperties2::default().push_next(&mut list);
+        self.instance
+            .get_physical_device_format_properties2(self.physical, layer.format, &mut props);
+        let count = list.drm_format_modifier_count as usize;
+        if count == 0 {
+            return Err(format!(
+                "{}: the device reports no DRM format modifiers",
+                layer.name
+            ));
+        }
+        let mut entries = vec![vk::DrmFormatModifierPropertiesEXT::default(); count];
+        let mut list = vk::DrmFormatModifierPropertiesListEXT::default()
+            .drm_format_modifier_properties(&mut entries);
+        let mut props = vk::FormatProperties2::default().push_next(&mut list);
+        self.instance
+            .get_physical_device_format_properties2(self.physical, layer.format, &mut props);
+        if let Some(entry) = entries.iter().find(|e| e.drm_format_modifier == modifier) {
+            return Ok(entry.drm_format_modifier_plane_count);
+        }
+        let supported: Vec<String> = entries
+            .iter()
+            .take(6)
+            .map(|e| format!("{:#018x}", e.drm_format_modifier))
+            .collect();
+        Err(format!(
+            "{}: modifier {modifier:#018x} is not supported (device supports {}{})",
+            layer.name,
+            supported.join(", "),
+            if entries.len() > supported.len() { ", ..." } else { "" }
+        ))
     }
 
     unsafe fn upload_osd(&mut self, cmd: vk::CommandBuffer) -> Result<(), String> {
@@ -688,7 +1411,7 @@ impl Renderer {
         self.device.cmd_draw(cmd, 4, 1, 0, 0);
     }
 
-    unsafe fn present(&mut self, win: (u32, u32)) -> Result<(), String> {
+    unsafe fn present(&mut self, win: (u32, u32), upload: bool) -> Result<(), String> {
         // A fullscreen transition can briefly report a zero-sized window.
         // Do not touch the swapchain until SDL has a real size again.
         if win.0 == 0 || win.1 == 0 {
@@ -739,110 +1462,11 @@ impl Renderer {
             self.upload_osd(cmd)?;
         }
 
-        let range = vk::ImageSubresourceRange::default()
-            .aspect_mask(vk::ImageAspectFlags::COLOR)
-            .base_mip_level(0)
-            .level_count(1)
-            .base_array_layer(0)
-            .layer_count(1);
-        let barriers = [
-            vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::UNDEFINED)
-                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(self.tex_y.image)
-                .subresource_range(range)
-                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE),
-            vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::UNDEFINED)
-                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(self.tex_uv.image)
-                .subresource_range(range)
-                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE),
-        ];
-        self.device.cmd_pipeline_barrier(
-            cmd,
-            vk::PipelineStageFlags::TOP_OF_PIPE,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::DependencyFlags::empty(),
-            &[],
-            &[],
-            &barriers,
-        );
-        let y_region = [vk::BufferImageCopy::default()
-            .buffer_offset(0)
-            .buffer_row_length(self.stage_y.pitch)
-            .buffer_image_height(0)
-            .image_subresource(
-                vk::ImageSubresourceLayers::default()
-                    .aspect_mask(vk::ImageAspectFlags::COLOR)
-                    .mip_level(0)
-                    .base_array_layer(0)
-                    .layer_count(1),
-            )
-            .image_extent(vk::Extent3D { width: self.tex_y.width, height: self.tex_y.height, depth: 1 })];
-        self.device.cmd_copy_buffer_to_image(
-            cmd,
-            self.stage_y.buffer,
-            self.tex_y.image,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            &y_region,
-        );
-        let uv_region = [vk::BufferImageCopy::default()
-            .buffer_offset(0)
-            .buffer_row_length(self.stage_uv.pitch)
-            .buffer_image_height(0)
-            .image_subresource(
-                vk::ImageSubresourceLayers::default()
-                    .aspect_mask(vk::ImageAspectFlags::COLOR)
-                    .mip_level(0)
-                    .base_array_layer(0)
-                    .layer_count(1),
-            )
-            .image_extent(vk::Extent3D {
-                width: self.tex_uv.width,
-                height: self.tex_uv.height,
-                depth: 1,
-            })];
-        self.device.cmd_copy_buffer_to_image(
-            cmd,
-            self.stage_uv.buffer,
-            self.tex_uv.image,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            &uv_region,
-        );
-        let read_barriers = [
-            vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(self.tex_y.image)
-                .subresource_range(range)
-                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::SHADER_READ),
-            vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(self.tex_uv.image)
-                .subresource_range(range)
-                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::SHADER_READ),
-        ];
-        self.device.cmd_pipeline_barrier(
-            cmd,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::PipelineStageFlags::FRAGMENT_SHADER,
-            vk::DependencyFlags::empty(),
-            &[],
-            &[],
-            &read_barriers,
-        );
+        if upload {
+            self.blit_nv12(cmd);
+        } else {
+            self.prepare_dmabuf(cmd)?;
+        }
 
         let clear = [vk::ClearValue {
             color: vk::ClearColorValue { float32: [0.0, 0.0, 0.0, 1.0] },
@@ -857,7 +1481,7 @@ impl Renderer {
             &rp_begin,
             vk::SubpassContents::INLINE,
         );
-        let rect = fit_rect(self.tex_y.width, self.tex_y.height, sw, sh);
+        let rect = fit_rect(self.frame_size.0, self.frame_size.1, sw, sh);
         let viewport = [vk::Viewport {
             x: rect.x as f32,
             y: rect.y as f32,
@@ -1035,6 +1659,9 @@ impl Drop for Renderer {
     fn drop(&mut self) {
         unsafe {
             let _ = self.device.device_wait_idle();
+            if let Some(imported) = self.dmabuf.take() {
+                destroy_imported(&self.device, imported);
+            }
             self.device.destroy_sampler(self.sampler, None);
             self.device.destroy_sampler(self.osd_sampler, None);
             self.device.destroy_descriptor_pool(self.desc_pool, None);
@@ -1467,6 +2094,98 @@ fn write_descriptors(
     }
 }
 
+fn write_view_descriptors(
+    device: &ash::Device,
+    set: vk::DescriptorSet,
+    y: vk::ImageView,
+    uv: vk::ImageView,
+    sampler: vk::Sampler,
+) {
+    unsafe {
+        let y_info = [vk::DescriptorImageInfo::default()
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .image_view(y)
+            .sampler(sampler)];
+        let uv_info = [vk::DescriptorImageInfo::default()
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .image_view(uv)
+            .sampler(sampler)];
+        let writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&y_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&uv_info),
+        ];
+        device.update_descriptor_sets(&writes, &[]);
+    }
+}
+
+/// Translates the decoder's dma-buf description into the Vulkan images that
+/// have to be created for it. Fails for anything the renderer cannot sample.
+fn dmabuf_layers(frame: &crate::dec::Frame, d: &crate::dec::Dmabuf) -> Result<Vec<Layer>, String> {
+    const DRM_FORMAT_NV12: u32 = 0x3231_564e;
+    if d.fourcc != DRM_FORMAT_NV12 {
+        return Err(format!(
+            "decoder exported DRM fourcc {:#x}, only NV12 is supported",
+            d.fourcc
+        ));
+    }
+    if frame.width < 2 || frame.height < 2 || !frame.width.is_multiple_of(2) || !frame.height.is_multiple_of(2) {
+        return Err(format!(
+            "{}x{} is not a valid 4:2:0 frame size",
+            frame.width, frame.height
+        ));
+    }
+    let plane = |i: usize| {
+        vk::SubresourceLayout::default()
+            .offset(d.offsets[i] as u64)
+            .row_pitch(d.pitches[i] as u64)
+    };
+    let full = vk::Extent2D {
+        width: frame.width,
+        height: frame.height,
+    };
+    match d.layers {
+        // One NV12 layer: both planes live in one dma-buf object at different
+        // offsets, which becomes a single two-plane VkImage.
+        1 if d.fds[0] == d.fds[1] => Ok(vec![Layer {
+            name: "NV12",
+            format: vk::Format::G8_B8R8_2PLANE_420_UNORM,
+            extent: full,
+            layouts: vec![plane(0), plane(1)],
+            fd: d.fds[0],
+        }]),
+        1 => Err("a single NV12 layer must export both planes from one dma-buf object".into()),
+        // Two layers: separate R8 and R8G8 images.
+        2 => Ok(vec![
+            Layer {
+                name: "R8",
+                format: vk::Format::R8_UNORM,
+                extent: full,
+                layouts: vec![plane(0)],
+                fd: d.fds[0],
+            },
+            Layer {
+                name: "R8G8",
+                format: vk::Format::R8G8_UNORM,
+                extent: vk::Extent2D {
+                    width: frame.width / 2,
+                    height: frame.height / 2,
+                },
+                layouts: vec![plane(1)],
+                fd: d.fds[1],
+            },
+        ]),
+        n => Err(format!("decoder exported {n} dma-buf layers")),
+    }
+}
+
 fn create_texture(
     device: &ash::Device,
     instance: &ash::Instance,
@@ -1652,6 +2371,22 @@ unsafe fn destroy_texture(device: &ash::Device, t: &mut Texture) {
     device.destroy_image(t.image, None);
     device.free_memory(t.memory, None);
     *t = Texture { image: vk::Image::null(), view: vk::ImageView::null(), memory: vk::DeviceMemory::null(), width: 0, height: 0 };
+}
+
+/// Releases an imported dma-buf frame: views first, then the images, then
+/// the imported memory (which drops Vulkan's reference to the dma-buf).
+unsafe fn destroy_imported(device: &ash::Device, f: ImportedFrame) {
+    for view in f.views {
+        if view != vk::ImageView::null() {
+            device.destroy_image_view(view, None);
+        }
+    }
+    for image in f.images {
+        device.destroy_image(image, None);
+    }
+    for memory in f.memories {
+        device.free_memory(memory, None);
+    }
 }
 
 unsafe fn destroy_staging(device: &ash::Device, s: &mut Staging) {
