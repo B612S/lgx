@@ -25,10 +25,11 @@ mkdir -p "$ROOT/target/macos-helper"
 swiftc -O -o "$ROOT/target/macos-helper/lgx-vtenc" "$ROOT/helper/lgx-vtenc.swift" \
   -framework ScreenCaptureKit -framework VideoToolbox -framework CoreMedia \
   -framework CoreVideo -framework Foundation
-# Input injection is C with a one-line AppKit shim for the frontmost PID;
-# the Swift variant trapped (SIGTRAP) before reaching main.
+# Input injection is C with small AppKit shims for the frontmost PID and the
+# NX_SYSDEFINED media events; the Swift variant trapped (SIGTRAP) before main.
 clang -O2 -o "$ROOT/target/macos-helper/lgx-cginput" \
   "$ROOT/helper/lgx-cginput.c" "$ROOT/helper/lgx-frontmost.m" \
+  "$ROOT/helper/lgx-media.m" \
   -framework ApplicationServices -framework CoreGraphics -framework AppKit
 swiftc -O -o "$ROOT/target/macos-helper/lgx-launcher" "$ROOT/helper/lgx-launcher.swift" \
   -framework AppKit -framework ApplicationServices -framework ScreenCaptureKit

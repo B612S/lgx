@@ -19,6 +19,7 @@
 // Requires the Accessibility TCC grant for the responsible process.
 #include <ApplicationServices/ApplicationServices.h>
 #include <CoreGraphics/CoreGraphics.h>
+#include <IOKit/hidsystem/ev_keymap.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <sys/types.h>
@@ -83,9 +84,47 @@ static const KeyMap KEYMAP[] = {
 };
 static const size_t KEYMAP_LEN = sizeof(KEYMAP) / sizeof(KEYMAP[0]);
 
+// Consumer/media keys are not keyboard keycodes on macOS: they are
+// NX_SYSDEFINED events with an NX_KEYTYPE_* code. Keep the Linux evdev codes
+// the client sends separate from KEYMAP.
+typedef struct {
+    unsigned short evdev;
+    int nx;
+} MediaMap;
+
+static const MediaMap MEDIA_MAP[] = {
+    {113, NX_KEYTYPE_MUTE},
+    {114, NX_KEYTYPE_SOUND_DOWN},
+    {115, NX_KEYTYPE_SOUND_UP},
+    {161, NX_KEYTYPE_EJECT},
+    {163, NX_KEYTYPE_NEXT},
+    {164, NX_KEYTYPE_PLAY},       // play/pause toggles
+    {165, NX_KEYTYPE_PREVIOUS},
+    {168, NX_KEYTYPE_REWIND},
+    {207, NX_KEYTYPE_PLAY},
+    {208, NX_KEYTYPE_FAST},
+    {224, NX_KEYTYPE_BRIGHTNESS_DOWN},
+    {225, NX_KEYTYPE_BRIGHTNESS_UP},
+    {228, NX_KEYTYPE_ILLUMINATION_TOGGLE},
+    {229, NX_KEYTYPE_ILLUMINATION_DOWN},
+    {230, NX_KEYTYPE_ILLUMINATION_UP},
+};
+static const size_t MEDIA_MAP_LEN = sizeof(MEDIA_MAP) / sizeof(MEDIA_MAP[0]);
+
+static int media_key(unsigned short evdev) {
+    for (size_t i = 0; i < MEDIA_MAP_LEN; i++) {
+        if (MEDIA_MAP[i].evdev == evdev) return MEDIA_MAP[i].nx;
+    }
+    return -1;
+}
+
 // Implemented in lgx-frontmost.m (AppKit). Used for function keys only; see
 // post_key().
 extern pid_t lgx_frontmost_pid(void);
+
+// Implemented in lgx-media.m (AppKit). Media keys are NX_SYSDEFINED events,
+// not keyboard keycodes.
+extern void lgx_post_media_key(int key, int down);
 
 static FILE *dbg = NULL;
 
@@ -144,6 +183,11 @@ static int is_function_key(CGKeyCode code) {
 }
 
 static void post_key(unsigned short evdev, int down) {
+    int nx = media_key(evdev);
+    if (nx >= 0) {
+        lgx_post_media_key(nx, down != 0);
+        return;
+    }
     int found = 0;
     CGKeyCode code = map_key(evdev, &found);
     if (!found) return;

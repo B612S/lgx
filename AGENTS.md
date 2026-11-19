@@ -23,6 +23,7 @@ helper/lgx-vaenc.c   VAAPI HEVC encoder that exports dma-buf surfaces
 helper/lgx-uinput.c  root helper that creates the uinput devices
 helper/lgx-cginput.c macOS CGEvent input injection
 helper/lgx-frontmost.m frontmost-application PID for function keys
+helper/lgx-media.m   NX_SYSDEFINED media keys for the macOS helper
 scripts/             fake-server.py
 ```
 
@@ -225,6 +226,13 @@ the Vulkan shader converts full-range BT.709, and the HEVC VUI says
   as Show Desktop, so the focused app never sees it. This applies only to
   F1-F12; every other key stays on the HID tap so Cmd+Tab and Mission
   Control's Ctrl+Left/Right keep working.
+- macOS media keys (mute, volume, play/pause, next/previous, brightness) are
+  `NX_SYSDEFINED` events, not keyboard keycodes; `helper/lgx-media.m` builds
+  them and `lgx-cginput` maps the Linux evdev consumer codes to
+  `NX_KEYTYPE_*`. The client maps SDL media scancodes 262..=272 to those evdev
+  codes; mute/volume already come from the HID table. SDL3 exposes no
+  brightness scancode, so the helper's brightness mapping waits for a client
+  that can produce evdev 224/225.
 - **Rich text only, event-driven.** Both sides use
   `wl-clipboard_rs::watch::Watcher`; no 300 ms polling and no `wl-paste`
   subprocess. The server skips the watcher's initial event so an old guest
