@@ -29,6 +29,11 @@ of this is a promise.
       `display N` command to `lgx-vtenc` that recreates the `SCStream`, plus a
       fresh `HELLO` and a client swapchain rebuild, would allow switching
       monitors mid-session.
+- [ ] **Saturate the wired link.** The bitrate ceiling is now 200 Mbit/s at
+      1200p120 (about 0.7 bit/pixel). Verify what VideoToolbox actually emits
+      under motion, whether its auto level clamps the rate, and benchmark text
+      sharpness against 80 Mbit/s. Add a `--quality`/CQ mode only if VT exposes
+      one that beats CBR.
 - [ ] **Power policy.** On battery: 60 fps and a lower bitrate ceiling; on AC:
       full rate. Pause capture when the lid closes. `lgx-vtenc` already accepts
       `bitrate N`; a matching `fps N` command is the missing piece.
@@ -40,11 +45,12 @@ of this is a promise.
 - [ ] **HEVC Main10 / HDR.** ScreenCaptureKit can deliver EDR, VideoToolbox
       encodes Main10; the client would need R16/R10G10B10 views, a PQ/HLG
       shader and colour management. HDR is currently unsupported end to end.
-- [ ] **Opus audio.** Would cut ~187 KiB/s to ~24 kbit/s and help on Wi-Fi, but
-      AGENTS.md fixes raw PCM as a deliberate low-latency choice — this needs a
-      decision before any code.
 
 ## Not planned
+
+- Opus audio: the transport is a wired 1 GbE link, so 187 KiB/s of raw PCM is
+  noise next to the video. Raw PCM stays the deliberate low-latency choice;
+  revisit only if a Wi-Fi client ever shows up.
 
 - H.264 output, tile streaming and shared-memory transport (removed on
   purpose).
