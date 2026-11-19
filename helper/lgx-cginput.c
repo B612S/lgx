@@ -1,8 +1,9 @@
 // lgx-cginput: evdev codes from the lgx client -> CGEvent, no kernel driver.
 //
 // C on purpose: input injection is a plain C API, and the Swift variant tripped
-// over the Swift runtime (SIGTRAP before the first line). Mirrors the shape of
-// helper/lgx-uinput.c on Linux.
+// over the Swift runtime (SIGTRAP before the first line). One AppKit call in
+// lgx-frontmost.m names the frontmost application, which function keys need
+// for direct delivery. Mirrors the shape of helper/lgx-uinput.c on Linux.
 //
 // One command per line on stdin:
 //   key <evdev> <0|1>      key down/up
@@ -20,6 +21,7 @@
 #include <CoreGraphics/CoreGraphics.h>
 #include <pthread.h>
 #include <stdarg.h>
+#include <sys/types.h>
 #include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -81,6 +83,10 @@ static const KeyMap KEYMAP[] = {
 };
 static const size_t KEYMAP_LEN = sizeof(KEYMAP) / sizeof(KEYMAP[0]);
 
+// Implemented in lgx-frontmost.m (AppKit). Used for function keys only; see
+// post_key().
+extern pid_t lgx_frontmost_pid(void);
+
 static FILE *dbg = NULL;
 
 static void logf_(const char *fmt, ...) {
@@ -122,6 +128,21 @@ static CGEventFlags modifier_flag(CGKeyCode code) {
     }
 }
 
+// F1-F12 carry the kCGEventFlagMaskSecondaryFn flag, but posting them at the
+// HID tap still lets macOS consume some of them as system shortcuts: F11 opens
+// Show Desktop and never reaches the focused app. Post function keys directly
+// to the frontmost PID instead. Other keys stay on the HID tap so shortcuts
+// such as Cmd+Tab and Mission Control's Ctrl+Left/Right keep working.
+static int is_function_key(CGKeyCode code) {
+    switch (code) {
+        case 0x7A: case 0x78: case 0x63: case 0x76: case 0x60: case 0x61:
+        case 0x62: case 0x64: case 0x65: case 0x6D: case 0x67: case 0x6F:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
 static void post_key(unsigned short evdev, int down) {
     int found = 0;
     CGKeyCode code = map_key(evdev, &found);
@@ -142,7 +163,12 @@ static void post_key(unsigned short evdev, int down) {
         // carry their own), and overwriting it makes Mission Control's
         // Ctrl+Left/Right stop matching.
         CGEventSetFlags(ev, CGEventGetFlags(ev) | g_flags);
-        CGEventPost(kCGHIDEventTap, ev);
+        pid_t pid = is_function_key(code) ? lgx_frontmost_pid() : 0;
+        if (pid > 0) {
+            CGEventPostToPid(pid, ev);
+        } else {
+            CGEventPost(kCGHIDEventTap, ev);
+        }
         CFRelease(ev);
     }
     if (src) CFRelease(src);

@@ -18,8 +18,11 @@ crates/lgx-proto/    wire protocol (messages, auth)
 crates/lgx-server/   capture, VPP/GL NV12 conversion, VAAPI helper client, input
 crates/lgx-client/   in-process HEVC decoder, Vulkan renderer, input
 crates/lgx-client/src/dec_shim.c   libavcodec C shim (built by build.rs)
+crates/lgx-server-macos/  ScreenCaptureKit/VideoToolbox server for macOS
 helper/lgx-vaenc.c   VAAPI HEVC encoder that exports dma-buf surfaces
 helper/lgx-uinput.c  root helper that creates the uinput devices
+helper/lgx-cginput.c macOS CGEvent input injection
+helper/lgx-frontmost.m frontmost-application PID for function keys
 scripts/             fake-server.py
 ```
 
@@ -217,6 +220,11 @@ the Vulkan shader converts full-range BT.709, and the HEVC VUI says
 - Client scancodes must be masked with `& 0x1ff`.
 - `MODS` is sent before every `KEY`; the virtual keyboard needs explicit
   modifiers.
+- macOS function keys must be posted with `CGEventPostToPid(frontmost)`
+  (`helper/lgx-cginput.c`), not at `kCGHIDEventTap`: macOS consumes F11 there
+  as Show Desktop, so the focused app never sees it. This applies only to
+  F1-F12; every other key stays on the HID tap so Cmd+Tab and Mission
+  Control's Ctrl+Left/Right keep working.
 - **Rich text only, event-driven.** Both sides use
   `wl-clipboard_rs::watch::Watcher`; no 300 ms polling and no `wl-paste`
   subprocess. The server skips the watcher's initial event so an old guest

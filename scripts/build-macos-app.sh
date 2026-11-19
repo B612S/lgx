@@ -25,9 +25,11 @@ mkdir -p "$ROOT/target/macos-helper"
 swiftc -O -o "$ROOT/target/macos-helper/lgx-vtenc" "$ROOT/helper/lgx-vtenc.swift" \
   -framework ScreenCaptureKit -framework VideoToolbox -framework CoreMedia \
   -framework CoreVideo -framework Foundation
-# Input injection is C: the Swift build trapped (SIGTRAP) before reaching main.
-clang -O2 -o "$ROOT/target/macos-helper/lgx-cginput" "$ROOT/helper/lgx-cginput.c" \
-  -framework ApplicationServices -framework CoreGraphics
+# Input injection is C with a one-line AppKit shim for the frontmost PID;
+# the Swift variant trapped (SIGTRAP) before reaching main.
+clang -O2 -o "$ROOT/target/macos-helper/lgx-cginput" \
+  "$ROOT/helper/lgx-cginput.c" "$ROOT/helper/lgx-frontmost.m" \
+  -framework ApplicationServices -framework CoreGraphics -framework AppKit
 swiftc -O -o "$ROOT/target/macos-helper/lgx-launcher" "$ROOT/helper/lgx-launcher.swift" \
   -framework AppKit -framework ApplicationServices -framework ScreenCaptureKit
 # Audio capture is Swift: CATapDescription is an Objective-C class, so the C

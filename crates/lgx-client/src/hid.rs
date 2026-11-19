@@ -50,6 +50,9 @@ mod tests {
         assert_eq!(evdev_from_scancode(226), Some(56)); // left alt
         assert_eq!(evdev_from_scancode(227), Some(125)); // left meta
         assert_eq!(evdev_from_scancode(41), Some(1)); // escape
+        assert_eq!(evdev_from_scancode(58), Some(59)); // F1
+        assert_eq!(evdev_from_scancode(68), Some(87)); // F11
+        assert_eq!(evdev_from_scancode(69), Some(88)); // F12
     }
 
     #[test]
