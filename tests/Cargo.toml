@@ -1,0 +1,37 @@
+[package]
+name = "lgx-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+# Test files live in the top-level `tests/` directory (the folder the project
+# documents), not in a nested tests/tests tree, so each target is explicit.
+autotests = false
+
+[lib]
+path = "src/lib.rs"
+
+[[test]]
+name = "protocol"
+path = "protocol.rs"
+
+[[test]]
+name = "secure"
+path = "secure.rs"
+
+[[test]]
+name = "server"
+path = "server.rs"
+
+[[test]]
+name = "client"
+path = "client.rs"
+
+[[test]]
+name = "e2e"
+path = "e2e.rs"
+
+[dependencies]
+lgx-proto = { path = "../crates/lgx-proto" }
+lgx-server = { path = "../crates/lgx-server" }
+lgx-client = { path = "../crates/lgx-client" }

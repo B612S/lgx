@@ -68,6 +68,13 @@ impl Backend {
     }
 }
 
+// `build.rs` compiles the shim, but its `cargo:rustc-link-*` directives do not
+// reach the binary once the package also has a library target (the tests use
+// `config`/`hid` from that library). Declare the same links here so the
+// binary always pulls in the C objects and FFmpeg.
+#[link(name = "lgx_dec_shim", kind = "static")]
+#[link(name = "avcodec")]
+#[link(name = "avutil")]
 extern "C" {
     fn lgx_dec_open(
         backend: c_int,

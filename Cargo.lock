@@ -311,6 +311,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lgx-tests"
+version = "0.4.0"
+dependencies = [
+ "lgx-client",
+ "lgx-proto",
+ "lgx-server",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"

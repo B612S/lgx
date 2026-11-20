@@ -61,7 +61,7 @@ fn next_uniform(rng: &mut u64) -> f32 {
 /// Dither of 1 LSB peak-to-peak (the difference of two uniform values) turns
 /// the quantization error into noise instead of low-level distortion. The
 /// conversion is the only place where precision is lost in the whole path.
-fn f32_to_s16_dithered(
+pub fn f32_to_s16_dithered(
     input: &[u8],
     out: &mut Vec<u8>,
     rng: &mut u64,
@@ -187,7 +187,7 @@ struct VolumeWatch {
 }
 
 /// Extracts the sink name from the metadata value `{"name":"..."}`.
-fn metadata_sink_name(value: &str) -> Option<String> {
+pub fn metadata_sink_name(value: &str) -> Option<String> {
     let rest = value.get(value.find("\"name\"")? + 6..)?;
     let rest = rest.trim_start().strip_prefix(':')?.trim_start();
     let rest = rest.strip_prefix('"')?;
