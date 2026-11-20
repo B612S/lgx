@@ -327,8 +327,12 @@ impl Secure {
 fn send_plain_locked(st: &mut SendState, plain: &[u8]) -> io::Result<()> {
     let total = plain.len() as u32;
     if total == 0 {
+        // `recv_record` reads the record length and the first chunk length
+        // together. An empty record must still write both words (with a zero
+        // chunk length) or the next record's length is consumed as the chunk
+        // length and the stream desynchronizes.
         use std::io::Write;
-        return st.stream.write_all(&total.to_le_bytes());
+        return st.stream.write_all(&[0u8; 8]);
     }
     // The record length and the first chunk share one write.
     let SendState { stream, key, nonce, buf } = &mut *st;
