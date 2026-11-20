@@ -8,17 +8,21 @@
 //! authenticated client. Doing the conversion here keeps the single
 //! quantization step dithered instead of relying on PipeWire's plain rounding.
 
-use std::collections::HashSet;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::rc::Rc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use lgx_proto::secure::{self, Secure};
 use pipewire as pw;
-use pw::properties::properties;
+use pipewire::permissions::PermissionFlags;
+use pipewire::properties::properties;
+use pipewire::registry::GlobalObject;
 use pw::spa;
 use pw::spa::pod::Pod;
 
@@ -33,6 +37,13 @@ struct Capture {
     rng: u64,
     /// Chunks the fanout could not take because the client is behind.
     dropped: Arc<AtomicU64>,
+    /// Linear gain from the default sink's volume; 0 while it is muted.
+    /// PipeWire's monitor ports carry the sink's input, so the sink's own
+    /// volume is not in the signal and has to be applied here.
+    gain: Arc<AtomicU32>,
+    /// Gain applied to the previous chunk, so a volume/mute change ramps over
+    /// one chunk instead of stepping (an audible click).
+    last_gain: f32,
 }
 
 fn next_uniform(rng: &mut u64) -> f32 {
@@ -50,16 +61,296 @@ fn next_uniform(rng: &mut u64) -> f32 {
 /// Dither of 1 LSB peak-to-peak (the difference of two uniform values) turns
 /// the quantization error into noise instead of low-level distortion. The
 /// conversion is the only place where precision is lost in the whole path.
-fn f32_to_s16_dithered(input: &[u8], out: &mut Vec<u8>, rng: &mut u64) {
+fn f32_to_s16_dithered(
+    input: &[u8],
+    out: &mut Vec<u8>,
+    rng: &mut u64,
+    gain_from: f32,
+    gain_to: f32,
+) {
     out.clear();
     out.reserve(input.len() / 2);
+    let samples = input.len() / 4;
+    let step = if samples > 0 {
+        (gain_to - gain_from) / samples as f32
+    } else {
+        0.0
+    };
+    let mut gain = gain_from;
     for sample in input.as_chunks::<4>().0 {
         let v = f32::from_le_bytes([sample[0], sample[1], sample[2], sample[3]]);
         let d = next_uniform(rng) - next_uniform(rng);
         // Scale by 2^15 so -1.0 reaches -32768 exactly; +1.0 saturates.
-        let s = (v * 32768.0 + d).round().clamp(-32768.0, 32767.0) as i16;
+        let s = (v * gain * 32768.0 + d)
+            .round()
+            .clamp(-32768.0, 32767.0) as i16;
         out.extend_from_slice(&s.to_le_bytes());
+        gain += step;
     }
+}
+
+/// Linear gain derived from the default sink's volume and mute.
+///
+/// The capture stream is linked to the sink's monitor ports, which carry the
+/// sink's **input**: changing the sink volume (volume keys, `wpctl`, a mixer)
+/// happens after the monitor tap, so the captured signal would always be at
+/// 100%. Reading the sink node's `SPA_PARAM_Props` and scaling the samples
+/// here makes the client follow the guest's volume and mute.
+struct GainTracker {
+    gain: Arc<AtomicU32>,
+    volume: f32,
+    muted: bool,
+}
+
+impl GainTracker {
+    fn new(gain: Arc<AtomicU32>) -> Self {
+        Self {
+            gain,
+            volume: 1.0,
+            muted: false,
+        }
+    }
+
+    fn publish(&self) {
+        let g = if self.muted {
+            0.0
+        } else {
+            self.volume.clamp(0.0, 4.0)
+        };
+        self.gain.store(g.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Applies one `SPA_PARAM_Props` update. A pod may carry only some of the
+    /// volume/mute keys, so keep the previous values for the missing ones.
+    fn apply_props(&mut self, pod: &Pod) {
+        let Ok((_, value)) = pw::spa::pod::deserialize::PodDeserializer::deserialize_from::<
+            pw::spa::pod::Value,
+        >(pod.as_bytes()) else {
+            return;
+        };
+        let pw::spa::pod::Value::Object(object) = value else {
+            return;
+        };
+        let mut volume = None;
+        let mut channels = None;
+        let mut mute = None;
+        for prop in object.properties {
+            if prop.key == spa::sys::SPA_PROP_volume {
+                if let pw::spa::pod::Value::Float(v) = prop.value {
+                    volume = Some(v);
+                }
+            } else if prop.key == spa::sys::SPA_PROP_channelVolumes {
+                if let pw::spa::pod::Value::ValueArray(spa::pod::ValueArray::Float(v)) = prop.value {
+                    if !v.is_empty() {
+                        channels = Some(v);
+                    }
+                }
+            } else if prop.key == spa::sys::SPA_PROP_mute
+                || prop.key == spa::sys::SPA_PROP_softMute
+            {
+                if let pw::spa::pod::Value::Bool(b) = prop.value {
+                    mute = Some(b);
+                }
+            }
+        }
+        if let Some(v) = volume {
+            self.volume = v;
+        } else if let Some(v) = channels {
+            self.volume = v.iter().sum::<f32>() / v.len() as f32;
+        }
+        if let Some(m) = mute {
+            self.muted = m;
+        }
+        self.publish();
+    }
+}
+
+/// The default sink as reported by PipeWire's `default` metadata plus the
+/// bound node proxy that reports its volume.
+struct SinkWatch {
+    sink_name: Option<String>,
+    node_name: Option<String>,
+    node_id: Option<u32>,
+    /// `node.name` -> (global id, global version) for the sinks seen so far.
+    nodes: HashMap<String, (u32, u32)>,
+    metadata: Option<(pw::metadata::Metadata, pw::metadata::MetadataListener)>,
+    node: Option<(pw::node::Node, pw::node::NodeListener)>,
+}
+
+/// Keeps the registry, the metadata listener and the bound sink node alive for
+/// as long as the capture thread runs.
+struct VolumeWatch {
+    _registry: pw::registry::RegistryRc,
+    _listener: pw::registry::Listener,
+    _watch: Rc<RefCell<SinkWatch>>,
+    _tracker: Rc<RefCell<GainTracker>>,
+}
+
+/// Extracts the sink name from the metadata value `{"name":"..."}`.
+fn metadata_sink_name(value: &str) -> Option<String> {
+    let rest = value.get(value.find("\"name\"")? + 6..)?;
+    let rest = rest.trim_start().strip_prefix(':')?.trim_start();
+    let rest = rest.strip_prefix('"')?;
+    Some(rest.get(..rest.find('"')?)?.to_string())
+}
+
+fn bind_sink_node(
+    registry: &pw::registry::RegistryRc,
+    watch: &mut SinkWatch,
+    tracker: &Rc<RefCell<GainTracker>>,
+) {
+    let Some(name) = watch.sink_name.clone() else {
+        return;
+    };
+    if watch.node_name.as_deref() == Some(name.as_str()) {
+        return;
+    }
+    let Some(&(id, version)) = watch.nodes.get(&name) else {
+        return;
+    };
+    let global: GlobalObject<&spa::utils::dict::DictRef> = GlobalObject {
+        id,
+        permissions: PermissionFlags::empty(),
+        type_: pw::types::ObjectType::Node,
+        version,
+        props: None,
+    };
+    let Ok(node) = registry.bind::<pw::node::Node, _>(&global) else {
+        return;
+    };
+    let tracker = tracker.clone();
+    let listener = node
+        .add_listener_local()
+        .param(move |_seq, param, _index, _next, pod| {
+            if param == spa::param::ParamType::Props {
+                if let Some(pod) = pod {
+                    if let Ok(mut tracker) = tracker.try_borrow_mut() {
+                        tracker.apply_props(pod);
+                    }
+                }
+            }
+        })
+        .register();
+    node.subscribe_params(&[spa::param::ParamType::Props]);
+    node.enum_params(0, Some(spa::param::ParamType::Props), 0, 1);
+    watch.node = Some((node, listener));
+    watch.node_name = Some(name);
+    watch.node_id = Some(id);
+}
+
+fn watch_default_sink_volume(
+    core: &pw::core::CoreRc,
+    gain: Arc<AtomicU32>,
+) -> Result<VolumeWatch, String> {
+    let registry = core.get_registry_rc().map_err(|e| format!("registry: {e}"))?;
+    let watch = Rc::new(RefCell::new(SinkWatch {
+        sink_name: None,
+        node_name: None,
+        node_id: None,
+        nodes: HashMap::new(),
+        metadata: None,
+        node: None,
+    }));
+    let tracker = Rc::new(RefCell::new(GainTracker::new(gain)));
+    tracker.borrow().publish();
+
+    let listener = {
+        let registry = registry.clone();
+        let weak = Rc::downgrade(&watch);
+        let tracker = tracker.clone();
+        let remove_weak = weak.clone();
+        let global_registry = registry.clone();
+        let global_tracker = tracker.clone();
+        registry
+            .add_listener_local()
+            .global(move |global| {
+                let registry = &global_registry;
+                let tracker = global_tracker.clone();
+                let weak = &weak;
+                let Some(watch) = weak.upgrade() else {
+                    return;
+                };
+                match global.type_ {
+                    pw::types::ObjectType::Metadata => {
+                        let is_default = global
+                            .props
+                            .and_then(|p| p.get("metadata.name"))
+                            .is_some_and(|n| n == "default");
+                        if !is_default {
+                            return;
+                        }
+                        let mut w = watch.borrow_mut();
+                        if w.metadata.is_some() {
+                            return;
+                        }
+                        let Ok(metadata) = registry.bind::<pw::metadata::Metadata, _>(global)
+                        else {
+                            return;
+                        };
+                        let metadata_weak = Rc::downgrade(&watch);
+                        let metadata_tracker = tracker.clone();
+                        let metadata_registry = registry.clone();
+                        let listener = metadata
+                            .add_listener_local()
+                            .property(move |_subject, key, _type, value| {
+                                if key == Some("default.audio.sink") {
+                                    if let Some(name) = value.and_then(metadata_sink_name) {
+                                        if let Some(watches) = metadata_weak.upgrade() {
+                                            let mut w = watches.borrow_mut();
+                                            if w.sink_name.as_deref() != Some(name.as_str()) {
+                                                w.sink_name = Some(name);
+                                                w.node_name = None;
+                                                w.node = None;
+                                                w.node_id = None;
+                                                bind_sink_node(
+                                                    &metadata_registry,
+                                                    &mut w,
+                                                    &metadata_tracker,
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                                0
+                            })
+                            .register();
+                        w.metadata = Some((metadata, listener));
+                    }
+                    pw::types::ObjectType::Node => {
+                        let Some(name) = global.props.and_then(|p| p.get("node.name")) else {
+                            return;
+                        };
+                        let name = name.to_string();
+                        let mut w = watch.borrow_mut();
+                        w.nodes.insert(name.clone(), (global.id, global.version));
+                        if w.sink_name.as_deref() == Some(name.as_str()) {
+                            bind_sink_node(registry, &mut w, &tracker);
+                        }
+                    }
+                    _ => {}
+                }
+            })
+            .global_remove(move |id| {
+                let Some(watch) = remove_weak.upgrade() else {
+                    return;
+                };
+                let mut w = watch.borrow_mut();
+                w.nodes.retain(|_, (node_id, _)| *node_id != id);
+                if w.node_id == Some(id) {
+                    w.node = None;
+                    w.node_name = None;
+                    w.node_id = None;
+                }
+            })
+            .register()
+    };
+
+    Ok(VolumeWatch {
+        _registry: registry,
+        _listener: listener,
+        _watch: watch,
+        _tracker: tracker,
+    })
 }
 
 struct Client {
@@ -79,6 +370,9 @@ fn capture_thread(
         let context =
             pw::context::ContextRc::new(&mainloop, None).map_err(|e| format!("context: {e}"))?;
         let core = context.connect_rc(None).map_err(|e| format!("core: {e}"))?;
+        // Follow the default sink's volume/mute; the monitor tap is upstream
+        // of the sink's own volume stage.
+        let _volume_watch = watch_default_sink_volume(&core, capture.gain.clone())?;
 
         let mut props = properties! {
             *pw::keys::MEDIA_TYPE => "Audio",
@@ -125,7 +419,10 @@ fn capture_thread(
                     return;
                 };
                 let mut out = Vec::with_capacity(pcm_bytes.len() / 2);
-                f32_to_s16_dithered(pcm_bytes, &mut out, &mut cap.rng);
+                let target = f32::from_bits(cap.gain.load(Ordering::Relaxed));
+                let from = cap.last_gain;
+                cap.last_gain = target;
+                f32_to_s16_dithered(pcm_bytes, &mut out, &mut cap.rng, from, target);
                 if cap.pcm.try_send(out).is_err() {
                     cap.dropped.fetch_add(1, Ordering::Relaxed);
                 }
@@ -193,11 +490,14 @@ fn start_capture(clients: &Arc<Mutex<Vec<Client>>>) -> Result<CaptureHandle, Str
     let (pcm_tx, pcm_rx) = mpsc::sync_channel::<Vec<u8>>(4);
     let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), String>>(1);
     let dropped = Arc::new(AtomicU64::new(0));
+    let gain = Arc::new(AtomicU32::new(1.0f32.to_bits()));
     let (quit_tx, quit_rx) = pw::channel::channel::<()>();
     let capture = Capture {
         pcm: pcm_tx,
         rng: 0x9E37_79B9_7F4A_7C15,
         dropped: dropped.clone(),
+        gain,
+        last_gain: 1.0,
     };
     let join = std::thread::Builder::new()
         .name("lgx-pw-capture".into())
@@ -385,7 +685,7 @@ mod tests {
         let mut rng = 1;
         let input = f32_le(&[1.0, -1.0, 0.5, 0.0]);
         let mut out = Vec::new();
-        f32_to_s16_dithered(&input, &mut out, &mut rng);
+        f32_to_s16_dithered(&input, &mut out, &mut rng, 1.0, 1.0);
         assert_eq!(out.len(), 8);
         assert_eq!(s16_at(&out, 0), 32767);
         assert_eq!(s16_at(&out, 1), -32768);
@@ -398,7 +698,7 @@ mod tests {
         let mut rng = 42;
         let silence = vec![0u8; 4 * 20_000];
         let mut out = Vec::new();
-        f32_to_s16_dithered(&silence, &mut out, &mut rng);
+        f32_to_s16_dithered(&silence, &mut out, &mut rng, 1.0, 1.0);
         let sum: i64 = (0..20_000).map(|i| s16_at(&out, i) as i64).sum();
         // Silent input still toggles the LSBs, but must not drift DC.
         assert!(sum.abs() < 20_000 / 2, "dither DC offset {sum}");
@@ -407,11 +707,52 @@ mod tests {
     }
 
     #[test]
+    fn gain_scales_the_samples() {
+        let mut rng = 9;
+        let input = f32_le(&[1.0, -1.0, 0.5]);
+        let mut out = Vec::new();
+        f32_to_s16_dithered(&input, &mut out, &mut rng, 0.5, 0.5);
+        assert!((s16_at(&out, 0) as i32 - 16384).abs() <= 1);
+        assert!((s16_at(&out, 1) as i32 + 16384).abs() <= 1);
+        assert!((s16_at(&out, 2) as i32 - 8192).abs() <= 1);
+    }
+
+    #[test]
+    fn gain_ramps_across_one_chunk() {
+        let mut rng = 11;
+        let input = f32_le(&[1.0, 1.0, 1.0, 1.0]);
+        let mut out = Vec::new();
+        f32_to_s16_dithered(&input, &mut out, &mut rng, 1.0, 0.0);
+        // The first sample keeps the previous gain, then ramps to the target.
+        for (i, expected) in [32767, 24576, 16384, 8192].into_iter().enumerate() {
+            assert!(
+                (s16_at(&out, i) as i32 - expected).abs() <= 1,
+                "sample {i}: {} vs {expected}",
+                s16_at(&out, i)
+            );
+        }
+    }
+
+    #[test]
+    fn sink_name_is_read_from_metadata_json() {
+        assert_eq!(
+            metadata_sink_name(r#"{"name":"alsa_output.pci.analog-stereo"}"#).as_deref(),
+            Some("alsa_output.pci.analog-stereo")
+        );
+        assert_eq!(
+            metadata_sink_name(r#"{ "name" : "easyeffects_sink" }"#).as_deref(),
+            Some("easyeffects_sink")
+        );
+        assert_eq!(metadata_sink_name("null"), None);
+        assert_eq!(metadata_sink_name(r#"{"id":5}"#), None);
+    }
+
+    #[test]
     fn clamps_out_of_range_float() {
         let mut rng = 7;
         let input = f32_le(&[2.0, -2.0, f32::NAN]);
         let mut out = Vec::new();
-        f32_to_s16_dithered(&input, &mut out, &mut rng);
+        f32_to_s16_dithered(&input, &mut out, &mut rng, 1.0, 1.0);
         assert_eq!(s16_at(&out, 0), 32767);
         assert_eq!(s16_at(&out, 1), -32768);
     }

@@ -339,6 +339,22 @@ the Vulkan shader converts full-range BT.709, and the HEVC VUI says
   and emits silence; no external process is stopped or left behind.
   Timestamped records use the `LGXA` framing described under A/V sync; the
   8 KiB cushion is unchanged by sync.
+  The sink monitor carries the sink's **input**, so the guest's own volume
+  (volume keys, `wpctl`, a mixer) is applied after the tap and the client would
+  always hear 100%. The server therefore follows the default sink's
+  `SPA_PARAM_Props` (`audio::watch_default_sink_volume`: the `default`
+  metadata gives the sink name, the bound sink node reports `volume`, `mute`
+  and `channelVolumes`) and scales the float samples by that gain before
+  quantizing. Do not drop this: without it changing the guest volume has no
+  effect on the stream. On macOS the same applies to the process tap, so
+  `lgx-macos-audio` reads the default output device's volume/mute and scales
+  the samples. When FineTune is running (it re-renders apps through its own
+  tap), LGX would capture both the raw app stream and FineTune's copy, which
+  is audible doubling: the helper then captures only the mixer's output and a
+  second mute-only tap silences the raw apps (see `mixerProcesses`). Both
+  topologies are rebuilt when the mixer appears or quits. `LGX_AUDIO_MIXERS`
+  overrides the comma-separated bundle-ID list and `LGX_AUDIO_TAP=global`
+  disables the mixer topology for debugging.
 
 ## A/V sync
 
