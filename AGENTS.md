@@ -354,7 +354,12 @@ the Vulkan shader converts full-range BT.709, and the HEVC VUI says
   second mute-only tap silences the raw apps (see `mixerProcesses`). Both
   topologies are rebuilt when the mixer appears or quits. `LGX_AUDIO_MIXERS`
   overrides the comma-separated bundle-ID list and `LGX_AUDIO_TAP=global`
-  disables the mixer topology for debugging.
+  disables the mixer topology for debugging. FineTune also lists the audio
+  helper itself as `server`: it is a Core Audio client with the app's bundle
+  ID (`dev.b612s.lgx.server`) but no `NSRunningApplication`, so FineTune falls
+  back to the last bundle-ID component. It produces no audible output; hide it
+  with FineTune's ignore (eye) button instead of changing the helper's signing
+  identifier, which TCC relies on.
 
 ## A/V sync
 
