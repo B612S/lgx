@@ -28,6 +28,8 @@ helper/lgx-frontmost.m frontmost-application PID/bundle ID for the macOS helper
 helper/lgx-media.m   NX_SYSDEFINED media keys for the macOS helper
 helper/lgx-macos-cursor.m  NSCursor shape helper for the local pointer
 scripts/             fake-server.py
+tests/               integration tests (wire protocol, secure transport,
+                     token registry, client config, end-to-end sessions)
 ```
 
 ## Language and commits
@@ -460,7 +462,7 @@ the Vulkan shader converts full-range BT.709, and the HEVC VUI says
 
 ```bash
 cargo build --release
-cargo test --workspace
+cargo test --workspace   # includes the `tests/` integration suite
 gcc -O2 -o lgx-vaenc helper/lgx-vaenc.c -lavcodec -lavutil -lva -lva-drm
 scripts/check.sh          # build + tests + both C helpers, run before pushing
 # CI runs the same script in an archlinux:latest container
