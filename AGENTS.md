@@ -580,7 +580,8 @@ the Vulkan shader converts full-range BT.709, and the HEVC VUI says
   included in the AEAD associated data. `Secure::close` shuts down a raw clone
   because the reader may hold the recv mutex while blocked in `read_exact`.
 - **Video can leave TCP.** `video.udp` (`--video-udp`) lets the client ask for
-  datagrams with `UDP_VIDEO`; the server then binds an ephemeral socket, sends
+  datagrams with `UDP_VIDEO`; the server then binds UDP on the same port
+  number as the TCP control stream (one firewall rule covers both), sends
   `VIDEO_UDP` with a random 32-byte key and splits each access unit into
   datagrams of at most 1200 bytes, each sealed on its own with AES-256-GCM
   (`lgx_proto::udp`: frame id, fragment index/count, capture timestamp and a
