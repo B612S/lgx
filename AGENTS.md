@@ -104,7 +104,9 @@ Commit format: `area: short imperative summary`, for example
   `global_quality` instead is not equivalent — iHD treats it as a raw QP and
   clamps the FF_QP2LAMBDA-scaled value to 51, which crushed the picture
   (24.5 dB). CQP has no bitrate ceiling, so VBR stays the default; the VM runs
-  `rc_mode = cqp, qp = 22`. NVENC maps `cqp` to `constqp` and otherwise keeps
+  `rc_mode = cqp, qp = 22`. Measured worst case: a full-screen 1080p60 noise
+  source costs 51 MiB/s (410 Mbit/s) at qp=22, against 0.3 MiB/s for a normal
+  desktop — only use CQP where the link can absorb that spike. NVENC maps `cqp` to `constqp` and otherwise keeps
   its `rc` option (VBR is unverified on NVIDIA hardware).
 - The helper is a separate process because it owns the VAAPI/VPP surfaces.
   With VPP the server only sends the captured frame fd and metadata; the GL
