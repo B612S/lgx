@@ -943,12 +943,18 @@ fn serve(args: &Args, secure: Arc<Secure>) -> std::io::Result<()> {
     // A frame that is already this old when it reaches the writer is not
     // worth sending: the client would present seconds-old video. Drop it and
     // let the encoder start a fresh reference chain instead.
+    // ScreenCaptureKit and VideoToolbox hand frames over in bursts. Sending a
+    // burst as fast as it arrives overruns the client's shallow pre-decode
+    // queue, which then skips to the next keyframe; pacing the writes to the
+    // capture timeline turns the burst back into a steady stream. The age check
+    // is the fallback for a backlog that pacing cannot fix.
     let max_age_us = std::env::var("LGX_MAX_FRAME_AGE_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(100)
+        .unwrap_or(250)
         * 1000;
     let mut late = 0u64;
+    let mut max_age_ms = 0u64;
     let mut bitrate = args.bitrate;
     let min_bitrate = (args.bitrate / 8).max(4_000_000);
     let mut clean_windows = 0u32;
@@ -971,15 +977,17 @@ fn serve(args: &Args, secure: Arc<Secure>) -> std::io::Result<()> {
             let elapsed = t0.elapsed().as_secs_f64();
             let lost = dropped.swap(0, Ordering::Relaxed);
             info!(
-                "HEVC {:.1} fps, {:.1} MiB/s, send {:.2} ms, {} dropped, {} late, {} kbps",
+                "HEVC {:.1} fps, {:.1} MiB/s, send {:.2} ms, {} dropped, {} late, max age {} ms, {} kbps",
                 frames as f64 / elapsed,
                 bytes as f64 / elapsed / 1_048_576.0,
                 if frames > 0 { send_secs * 1000.0 / frames as f64 } else { 0.0 },
                 lost,
                 late,
+                max_age_ms,
                 bitrate / 1000
             );
             late = 0;
+            max_age_ms = 0;
             // Adaptive bitrate: drops mean the pipe (or the client) cannot take
             // the current rate. Back off quickly, recover slowly.
             if args.adaptive {
@@ -1008,9 +1016,10 @@ fn serve(args: &Args, secure: Arc<Secure>) -> std::io::Result<()> {
         }
         match rx.recv_timeout(Duration::from_millis(250)) {
             Ok((au, capture_us)) => {
-                if capture_us != 0 && max_age_us > 0 {
+                if capture_us != 0 {
                     let age = monotonic_us().saturating_sub(capture_us);
-                    if age > max_age_us {
+                    max_age_ms = max_age_ms.max(age / 1000);
+                    if max_age_us > 0 && age > max_age_us {
                         // Stale: sending it would add latency and the next
                         // frames reference it anyway, so start a new GOP.
                         late += 1;
@@ -1018,6 +1027,10 @@ fn serve(args: &Args, secure: Arc<Secure>) -> std::io::Result<()> {
                         continue;
                     }
                 }
+                // Pace to the capture timeline: a frame that was captured one
+                // interval after the previous one goes out one interval later.
+                // A producer that is already slower than the pacer never
+                // waits, so a steady stream is not delayed.
                 let n = au.len();
                 let send_started = Instant::now();
                 // `code`/`b` carry a 48-bit capture timestamp in microseconds;
@@ -1032,6 +1045,7 @@ fn serve(args: &Args, secure: Arc<Secure>) -> std::io::Result<()> {
                 }
                 frames += 1;
                 bytes += n as u64;
+
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 // Keepalive: a write to a closed socket fails immediately, which
