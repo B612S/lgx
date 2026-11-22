@@ -159,7 +159,8 @@ int main(int argc, char **argv) {
     void *priv = enc->priv_data;
     set_opt(priv, "preset", opt_str("LGX_NVENC_PRESET", "p1"));
     set_opt(priv, "tune", opt_str("LGX_NVENC_TUNE", "ull"));
-    set_opt(priv, "rc", "cbr");
+    set_opt(priv, "rc", opt_str("LGX_NVENC_RC", "cbr"));
+    set_opt(priv, "qp", opt_str("LGX_QP", "24"));
     set_int(priv, "zerolatency", 1);
     set_int(priv, "delay", 0);
     set_int(priv, "rc-lookahead", 0);

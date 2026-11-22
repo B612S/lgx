@@ -38,6 +38,7 @@ fn read_packets(stream: &mut UnixStream) -> io::Result<Vec<Vec<u8>>> {
 }
 
 impl NvEnc {
+    #[allow(clippy::too_many_arguments)]
     pub fn start(
         socket: &str,
         helper: &str,
@@ -46,6 +47,8 @@ impl NvEnc {
         fps: u32,
         bitrate: u32,
         async_depth: u32,
+        rc_mode: &str,
+        qp: u32,
     ) -> io::Result<Self> {
         let _ = std::fs::remove_file(socket);
         let child = Command::new(helper)
@@ -55,6 +58,18 @@ impl NvEnc {
             .arg(fps.to_string())
             .arg(bitrate.to_string())
             .env("LGX_ASYNC_DEPTH", async_depth.to_string())
+            // NVENC spells constant quality "constqp"; the rest map straight
+            // through. VBR is unverified on NVIDIA hardware, so the default
+            // stays CBR until someone measures it.
+            .env(
+                "LGX_NVENC_RC",
+                match rc_mode {
+                    "vbr" => "vbr",
+                    "cqp" => "constqp",
+                    _ => "cbr",
+                },
+            )
+            .env("LGX_QP", qp.to_string())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())

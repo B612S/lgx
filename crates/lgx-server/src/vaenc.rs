@@ -89,9 +89,12 @@ impl VaEnc {
         bitrate: u32,
         low_power: bool,
         async_depth: u32,
+        rc_mode: u32,
+        qp: u32,
     ) -> io::Result<Self> {
         Self::start_with(
             socket, helper, false, false, width, height, fps, bitrate, low_power, async_depth,
+            rc_mode, qp,
         )
     }
 
@@ -104,9 +107,12 @@ impl VaEnc {
         bitrate: u32,
         low_power: bool,
         async_depth: u32,
+        rc_mode: u32,
+        qp: u32,
     ) -> io::Result<Self> {
         Self::start_with(
             socket, helper, false, true, width, height, fps, bitrate, low_power, async_depth,
+            rc_mode, qp,
         )
     }
 
@@ -119,6 +125,8 @@ impl VaEnc {
         bitrate: u32,
         low_power: bool,
         async_depth: u32,
+        rc_mode: u32,
+        qp: u32,
     ) -> io::Result<Self> {
         Self::start_with(
             socket,
@@ -131,6 +139,8 @@ impl VaEnc {
             bitrate,
             low_power,
             async_depth,
+            rc_mode,
+            qp,
         )
     }
 
@@ -146,6 +156,8 @@ impl VaEnc {
         bitrate: u32,
         low_power: bool,
         async_depth: u32,
+        rc_mode: u32,
+        qp: u32,
     ) -> io::Result<Self> {
         let _ = std::fs::remove_file(socket);
         let mut cmd = Command::new(helper);
@@ -161,6 +173,10 @@ impl VaEnc {
         // The helper must open the same render node as capture/GBM.
         cmd.env("LGX_DRM_NODE", lgx_server::gbm::drm_node());
         cmd.env("LGX_ASYNC_DEPTH", async_depth.to_string());
+        // Rate control is chosen by `video.rc_mode`/`video.qp`; the helper
+        // still reads the same variables when it is started by hand.
+        cmd.env("LGX_RC_MODE", rc_mode.to_string());
+        cmd.env("LGX_QP", qp.to_string());
         if vpp {
             cmd.env("LGX_VPP", "1");
         }

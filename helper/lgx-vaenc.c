@@ -319,7 +319,13 @@ int main(int argc, char **argv) {
         int qp = 24;
         const char *q = getenv("LGX_QP");
         if (q && atoi(q) > 0 && atoi(q) < 52) qp = atoi(q);
-        enc->global_quality = qp * 118;
+        /* qmin == qmax is the constant quantiser. Setting global_quality
+         * instead is not equivalent: iHD treats it as a raw QP and clamps
+         * the awkward FF_QP2LAMBDA-scaled value to 51, which crushed the
+         * picture (24.5 dB PSNR instead of 33.7 dB for the same bitrate). */
+        enc->qmin = qp;
+        enc->qmax = qp;
+        enc->global_quality = -1;
     }
     if (rc_mode >= 3) {
         enc->rc_max_rate = bitrate;

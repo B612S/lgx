@@ -93,18 +93,19 @@ Commit format: `area: short imperative summary`, for example
   `LGX_NO_DAMAGE_SKIP=1` disables the skip. The CPU mapping costs one 8 KiB
   memcpy worth of bandwidth per 1080p frame; if a compositor cannot map the
   buffer the server simply encodes every frame.
-- **VAAPI rate control is VBR by default** (`rc_mode=3`, `rc_max_rate` and
-  `rc_buffer_size` at the configured bitrate). CBR pads a static desktop up to
-  the target, so an idle 1080p160 session cost 4.7 MiB/s; VBR costs 1.2 MiB/s
-  with the same encode time and no fps loss. `LGX_RC_MODE` overrides the mode
-  (0 auto, 1 CQP, 2 CBR, 3 VBR, 4 ICQ) and `LGX_QP` sets the CQP quantiser
-  (default 24). Measured at 1080p160 on a desktop that changes every frame:
-  CBR 4.7 MiB/s, VBR 1.2-1.6 MiB/s, CQP qp=24 ~0.1 MiB/s. VBR spends its whole
-  VBV budget on a near-lossless keyframe (527 KiB every second at 1080p) and
-  VDENC ignores `qmin` in VBR, so the quality floor only works as CQP, whose
-  keyframes are ~8 KiB. CQP has no bitrate ceiling: full-screen video would
-  use as much as the link allows. NVENC still requests CBR until its VBR path
-  is verified on NVIDIA hardware.
+- **Rate control is `video.rc_mode` (`cbr`/`vbr`/`cqp`/`icq`, default `vbr`)
+  with `video.qp`** for the constant-quality mode (`--rc-mode`, `--qp`). CBR
+  pads a static desktop up to the target, so an idle 1080p160 session cost
+  4.7 MiB/s. VBR spends bits on the content and costs 1.2-1.6 MiB/s, but it
+  also spends its whole VBV budget on a near-lossless keyframe (527 KiB every
+  second) and VDENC ignores `qmin` in VBR. CQP (`qmin == qmax == qp`) is what
+  the driver actually honours: qp=22 cost ~2.5 Mbit/s on the same desktop
+  with 33.7 dB PSNR against 34.8 dB for VBR at 40 Mbit/s. Setting
+  `global_quality` instead is not equivalent — iHD treats it as a raw QP and
+  clamps the FF_QP2LAMBDA-scaled value to 51, which crushed the picture
+  (24.5 dB). CQP has no bitrate ceiling, so VBR stays the default; the VM runs
+  `rc_mode = cqp, qp = 22`. NVENC maps `cqp` to `constqp` and otherwise keeps
+  its `rc` option (VBR is unverified on NVIDIA hardware).
 - The helper is a separate process because it owns the VAAPI/VPP surfaces.
   With VPP the server only sends the captured frame fd and metadata; the GL
   fallback renders into the helper's dma-bufs.

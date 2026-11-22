@@ -26,7 +26,7 @@ fn canonical(key: &str) -> String {
             ("network", key)
         }
         "fps" | "bitrate" | "output" | "low_power" | "async_depth" | "vpp" | "drm_node"
-        | "capture" | "udp" => ("video", key),
+        | "capture" | "udp" | "rc_mode" | "qp" => ("video", key),
         "audio" => ("audio", "enabled"),
         "no_input" => ("input", "enabled"),
         _ => ("misc", key),
@@ -150,6 +150,10 @@ pub fn load_or_create() -> Config {
     // Video over UDP is opt-in until the loss handling has been measured on a
     // real link; `--video-udp` turns it on for one run.
     cfg.set("video.udp", "false");
+    // CBR pads a static desktop up to the target; VBR spends bits on the
+    // content. `cqp` (with `video.qp`) is the constant-quality mode.
+    cfg.set("video.rc_mode", "vbr");
+    cfg.set("video.qp", 24u32);
     cfg.set("video.output", "");
     cfg.set("video.low_power", "true");
     cfg.set("video.async_depth", 2u32);

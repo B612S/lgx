@@ -46,6 +46,10 @@ pub struct Options {
     pub async_depth: u32,
     /// Request dma-buf frames and encode them through VPP (Intel).
     pub dmabuf: bool,
+    /// `video.rc_mode` as the helper's VA_RC_* value.
+    pub rc_mode: u32,
+    /// CQP quantiser when `rc_mode` is CQP.
+    pub qp: u32,
 }
 
 /// Handles that must stay alive for as long as the portal session is used.
@@ -177,6 +181,8 @@ fn make_encoder(options: &Options, w: u32, h: u32, fps: u32) -> io::Result<Encod
                 fps,
                 options.bitrate,
                 options.async_depth,
+                "vbr",
+                options.qp,
             )?))
         }
         lgx_caps::EncoderBackend::Vaapi => {
@@ -196,6 +202,8 @@ fn make_encoder(options: &Options, w: u32, h: u32, fps: u32) -> io::Result<Encod
                 options.bitrate,
                 low_power,
                 options.async_depth,
+                options.rc_mode,
+                options.qp,
             )?))
         }
     }

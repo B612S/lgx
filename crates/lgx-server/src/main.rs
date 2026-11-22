@@ -43,6 +43,10 @@ struct Args {
     low_power: bool,
     /// Send HEVC access units over UDP instead of the TCP control stream.
     video_udp: bool,
+    /// `cbr`, `vbr` or `cqp` (`video.rc_mode`/`--rc-mode`).
+    rc_mode: String,
+    /// Quantiser for `cqp` (`video.qp`/`--qp`).
+    qp: u32,
     async_depth: u32,
     vpp: bool,
     /// Explicit DRM render node (`--drm-node`/`video.drm_node`); auto-detected
@@ -144,6 +148,12 @@ fn parse_args() -> Result<Args, String> {
         token: None,
         low_power: cfg.get_bool("video.low_power").unwrap_or(true),
         video_udp: cfg.get_bool("video.udp").unwrap_or(false),
+        rc_mode: cfg
+            .get("video.rc_mode")
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "vbr".into()),
+        qp: cfg.get_u32("video.qp").unwrap_or(24),
         async_depth: cfg.get_u32("video.async_depth").unwrap_or(2),
         vpp: cfg.get_bool("video.vpp").unwrap_or(true),
         capture: cfg.get("video.capture").unwrap_or("auto").to_string(),
@@ -175,6 +185,8 @@ fn parse_args() -> Result<Args, String> {
             "--no-input" => a.no_input = true,
             "--no-low-power" => a.low_power = false,
             "--video-udp" => a.video_udp = true,
+            "--rc-mode" => a.rc_mode = it.next().ok_or("--rc-mode")?.to_ascii_lowercase(),
+            "--qp" => a.qp = it.next().ok_or("--qp")?.parse().map_err(|_| "--qp")?,
             "--async-depth" => {
                 a.async_depth = it.next().ok_or("--async-depth")?.parse().map_err(|_| "--async-depth")?
             }
@@ -199,7 +211,8 @@ fn parse_args() -> Result<Args, String> {
                      \x20          [--no-low-power] [--async-depth N] [--no-input]\n\
                      \x20          [--token T] [--no-audio]\n\
                      \x20          [--audio-listen ADDR] [--vpp|--no-vpp] [--drm-node PATH]\n\
-                     \x20          [--capture auto|wlr|portal]\n\
+                     \x20          [--capture auto|wlr|portal] [--video-udp]\n\
+                     \x20          [--rc-mode cbr|vbr|cqp] [--qp N]\n\
                      \x20          [--pair] [--pair-listen ADDR] [--pair-name NAME]\n\
                      \x20          [--list] [--revoke ID|NAME] [--rotate ID|NAME]\n\
                      \x20          settings: ~/.config/lgx/server.conf"
@@ -213,6 +226,15 @@ fn parse_args() -> Result<Args, String> {
         if !(1..=1000).contains(&fps) {
             return Err("--fps must be within 1..1000".into());
         }
+    }
+    if !matches!(a.rc_mode.as_str(), "cbr" | "vbr" | "cqp" | "icq" | "auto") {
+        return Err(format!(
+            "unknown --rc-mode {} (cbr, vbr, cqp or icq)",
+            a.rc_mode
+        ));
+    }
+    if a.qp < 1 || a.qp > 51 {
+        return Err("--qp must be between 1 and 51".into());
     }
     if a.bitrate < 100_000 {
         return Err("--bitrate must be at least 100000 bit/s".into());
@@ -335,6 +357,14 @@ impl Stream {
             if hz > 0 { hz } else { 160 }
         });
 
+        // `video.rc_mode`/`--rc-mode` to the helper's VA_RC_* value.
+        let rc_mode_num = match args.rc_mode.as_str() {
+            "cbr" => 2,
+            "cqp" => 1,
+            "icq" => 4,
+            "auto" => 0,
+            _ => 3,
+        };
         let helper =
             std::env::var("LGX_VAENC").unwrap_or_else(|_| "/usr/lib/lgx/lgx-vaenc".to_string());
         let mut target = None;
@@ -352,6 +382,8 @@ impl Stream {
                     fps,
                     args.bitrate,
                     args.async_depth,
+                    &args.rc_mode,
+                    args.qp,
                 )
                 .map_err(|e| format!("nvenc: {e}"))?,
             )
@@ -366,6 +398,8 @@ impl Stream {
                     args.bitrate,
                     low_power,
                     args.async_depth,
+                    rc_mode_num,
+                    args.qp,
                 )
                 .map_err(|e| format!("vaenc: {e}"))?,
             )
@@ -380,6 +414,8 @@ impl Stream {
                     args.bitrate,
                     low_power,
                     args.async_depth,
+                    rc_mode_num,
+                    args.qp,
                 )
                 .map_err(|e| format!("vaenc: {e}"))?,
             )
@@ -409,6 +445,8 @@ impl Stream {
                 args.bitrate,
                 args.low_power,
                 args.async_depth,
+                rc_mode_num,
+                args.qp,
             )
             .map_err(|e| format!("vaenc: {e}"))?;
             if !e
@@ -946,6 +984,14 @@ fn main() {
             low_power: args.low_power,
             async_depth: args.async_depth,
             dmabuf: false,
+            rc_mode: match args.rc_mode.as_str() {
+                "cbr" => 2,
+                "cqp" => 1,
+                "icq" => 4,
+                "auto" => 0,
+                _ => 3,
+            },
+            qp: args.qp,
         };
         if let Err(e) = portal::serve(hub, options) {
             if e.kind() == std::io::ErrorKind::Interrupted {
