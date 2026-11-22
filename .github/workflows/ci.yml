@@ -19,7 +19,7 @@ jobs:
             nodejs git rust gcc pkgconf clang \
             ffmpeg sdl3 vulkan-headers vulkan-icd-loader mesa \
             libxkbcommon pipewire libva libpulse wl-clipboard \
-            qt6-base freetype2
+            qt6-base freetype2 ttf-dejavu
       - uses: actions/checkout@v4
       - name: Build and test
         run: ./scripts/check.sh

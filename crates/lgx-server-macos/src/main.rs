@@ -940,6 +940,15 @@ fn serve(args: &Args, secure: Arc<Secure>) -> std::io::Result<()> {
     let mut last_idr: Option<Instant> = None;
     let (mut frames, mut bytes) = (0u64, 0u64);
     let mut send_secs = 0.0f64;
+    // A frame that is already this old when it reaches the writer is not
+    // worth sending: the client would present seconds-old video. Drop it and
+    // let the encoder start a fresh reference chain instead.
+    let max_age_us = std::env::var("LGX_MAX_FRAME_AGE_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(100)
+        * 1000;
+    let mut late = 0u64;
     let mut bitrate = args.bitrate;
     let min_bitrate = (args.bitrate / 8).max(4_000_000);
     let mut clean_windows = 0u32;
@@ -962,13 +971,15 @@ fn serve(args: &Args, secure: Arc<Secure>) -> std::io::Result<()> {
             let elapsed = t0.elapsed().as_secs_f64();
             let lost = dropped.swap(0, Ordering::Relaxed);
             info!(
-                "HEVC {:.1} fps, {:.1} MiB/s, send {:.2} ms, {} dropped, {} kbps",
+                "HEVC {:.1} fps, {:.1} MiB/s, send {:.2} ms, {} dropped, {} late, {} kbps",
                 frames as f64 / elapsed,
                 bytes as f64 / elapsed / 1_048_576.0,
                 if frames > 0 { send_secs * 1000.0 / frames as f64 } else { 0.0 },
                 lost,
+                late,
                 bitrate / 1000
             );
+            late = 0;
             // Adaptive bitrate: drops mean the pipe (or the client) cannot take
             // the current rate. Back off quickly, recover slowly.
             if args.adaptive {
@@ -997,6 +1008,16 @@ fn serve(args: &Args, secure: Arc<Secure>) -> std::io::Result<()> {
         }
         match rx.recv_timeout(Duration::from_millis(250)) {
             Ok((au, capture_us)) => {
+                if capture_us != 0 && max_age_us > 0 {
+                    let age = monotonic_us().saturating_sub(capture_us);
+                    if age > max_age_us {
+                        // Stale: sending it would add latency and the next
+                        // frames reference it anyway, so start a new GOP.
+                        late += 1;
+                        need_idr.store(true, Ordering::Relaxed);
+                        continue;
+                    }
+                }
                 let n = au.len();
                 let send_started = Instant::now();
                 // `code`/`b` carry a 48-bit capture timestamp in microseconds;

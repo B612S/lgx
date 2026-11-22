@@ -526,7 +526,12 @@ the Vulkan shader converts full-range BT.709, and the HEVC VUI says
   VideoToolbox queues deliver frames in bursts (log shows `in-flight 1/4`),
   so on an active screen the client decoded only ~20 of the 33 encoded frames
   and `capture->present` p99 reached ~220 ms while p50 stayed at 19 ms. The
-  macOS pipeline needs output pacing, not just a lower bitrate.
+  macOS pipeline needs output pacing, not just a lower bitrate. Frames whose
+  capture timestamp is older than `LGX_MAX_FRAME_AGE_MS` (default 100) when
+  they reach the writer are dropped and an IDR is requested; the client's
+  pre-decode queue is deliberately shallow (`LGX_VIDEO_QUEUE` overrides it for
+  experiments: 6 slots decode ~14 fps of a bursty macOS stream, 64 slots decode
+  all of it but at p99 ~240 ms).
 - `lgx-vtenc` logs `SCK x fps, encoded y fps, encode errors n` every 5 s and
   whether VideoToolbox chose the hardware encoder. A low HEVC fps with a much
   higher SCK rate means the encoder is dropping input; both equal means the
@@ -640,7 +645,12 @@ cargo test --workspace   # includes the `tests/` integration suite
 gcc -O2 -o lgx-vaenc helper/lgx-vaenc.c -lavcodec -lavutil -lva -lva-drm
 gcc -O2 -o lgx-nvenc helper/lgx-nvenc.c -lavcodec -lavutil
 scripts/check.sh          # build + tests + both C helpers, run before pushing
-# CI runs the same script in an archlinux:latest container
+scripts/check-container.sh  # the same check inside archlinux:latest
+# CI (.github/workflows/ci.yml) runs check.sh in archlinux:latest. On a host
+# without podman/docker, check-container.sh fetches that image through the
+# registry HTTP API, unpacks it under target/archimg and boots it with
+# bubblewrap. Package signatures are disabled there: gpg cannot initialise a
+# keyring inside the user namespace, and the image is throwaway.
 ./packaging/build.sh
 ```
 

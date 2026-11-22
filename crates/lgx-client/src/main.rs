@@ -635,7 +635,16 @@ fn main() {
     let mut connect_attempt = reconnect_attempt();
     let mut dialog: Option<reconnect_ui::Dialog> = None;
     let (conn, hello, video_rx) = loop {
-        let (video_tx, video_rx) = std::sync::mpsc::sync_channel::<dec::Chunk>(net::VIDEO_QUEUE);
+        // A bursty source (macOS ScreenCaptureKit) can deliver several access
+        // units back to back; the default queue is deliberately shallow so a
+        // slow decoder drops instead of building latency. The override exists
+        // to tell a burst problem from a decode problem.
+        let queue = std::env::var("LGX_VIDEO_QUEUE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v >= 2)
+            .unwrap_or(net::VIDEO_QUEUE);
+        let (video_tx, video_rx) = std::sync::mpsc::sync_channel::<dec::Chunk>(queue);
         let clip_policy = net::ClipPolicy {
             enabled: s.clipboard,
             rich: s.clipboard_rich,
