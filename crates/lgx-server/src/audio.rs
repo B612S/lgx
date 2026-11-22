@@ -676,11 +676,20 @@ fn handle(
             .ok();
     }
     let mut framer: Option<FlacFramer> = None;
+    let mut logged_flac = false;
     while let Ok((ts_us, chunk)) = rx.recv() {
         let framed;
         let bytes: &[u8] = if flac_wanted.load(Ordering::Relaxed) {
             if framer.is_none() {
                 framer = FlacFramer::new();
+            }
+            if !logged_flac {
+                logged_flac = true;
+                eprintln!(
+                    "lgx-server: audio: FLAC records (framer {}), chunk {} bytes",
+                    if framer.is_some() { "ready" } else { "unavailable" },
+                    chunk.len()
+                );
             }
             match framer.as_mut().and_then(|f| f.frame(&chunk)) {
                 Some(frame) if frame.len() < chunk.len() => {
