@@ -137,6 +137,12 @@ impl Conn {
             return;
         };
         let rtt = now.saturating_sub(sent);
+        if std::env::var_os("LGX_DEBUG_CLOCK").is_some() {
+            eprintln!(
+                "lgx-client: clock rtt {rtt} us, offset {} us",
+                server_us as i64 - sent as i64 - rtt as i64 / 2
+            );
+        }
         if c.offset_us.is_none() || rtt <= c.best_rtt_us {
             c.best_rtt_us = rtt;
             c.offset_us = Some(server_us as i64 - sent as i64 - rtt as i64 / 2);
