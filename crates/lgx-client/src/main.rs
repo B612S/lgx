@@ -790,6 +790,7 @@ fn main() {
             detect_decoders(None)
         };
         let decoder = dec::spawn(chosen, None, false, false, None, video_rx, sink.clone(), None);
+        conn.ask_video_udp();
         run_headless(sink, &conn, args.screenshot.take(), deadline, max_frames);
         conn.close();
         let _ = decoder.join();
@@ -904,6 +905,7 @@ fn main() {
         sink.clone(),
         wake,
     );
+    conn.ask_video_udp();
 
     let gamepad_subsystem = if s.gamepads {
         sdl.gamepad().ok()

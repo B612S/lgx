@@ -96,6 +96,16 @@ impl Conn {
         self.secure.send_msg(m, payload)
     }
 
+    /// Ask for UDP video. Called once the decoder exists: datagrams that
+    /// arrive while the decoder is still initialising would fill the small
+    /// pre-decode queue and make the client skip until the next keyframe.
+    /// Old servers ignore the message and keep video on TCP.
+    pub fn ask_video_udp(&self) {
+        if std::env::var_os("LGX_NO_UDP").is_none() {
+            let _ = self.send(Msg::new(msg::UDP_VIDEO, 0, 0, 0), &[]);
+        }
+    }
+
     /// Consumes a display-mode change announced by the server.
     pub fn take_resize(&self) -> Option<(u32, u32, u32)> {
         self.resize.lock().unwrap().take()
@@ -161,11 +171,6 @@ pub fn connect(
     // server can keep sending them only a video stream with no unknown
     // CURSOR_IMAGE payloads.
     secure.send_msg(Msg::new(msg::CURSOR_SHAPE, 0, 0, 0), &[])?;
-    // Ask for UDP video; the server answers with VIDEO_UDP only when it has
-    // `--video-udp` and only after this message, so old servers ignore it.
-    if std::env::var_os("LGX_NO_UDP").is_none() {
-        secure.send_msg(Msg::new(msg::UDP_VIDEO, 0, 0, 0), &[])?;
-    }
     let last_remote: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
     let lr = last_remote.clone();
     let conn = Arc::new(Conn {
