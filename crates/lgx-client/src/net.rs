@@ -201,6 +201,7 @@ pub fn connect(
     client_id: &str,
     token: &str,
     video: Arc<ChunkQueue>,
+    decoder_ready: Arc<std::sync::atomic::AtomicBool>,
     clipboard: ClipPolicy,
 ) -> std::io::Result<(Arc<Conn>, Hello)> {
     let stream = TcpStream::connect(addr)?;
@@ -254,7 +255,7 @@ pub fn connect(
     let conn_for_reader = conn.clone();
     std::thread::Builder::new()
         .name("lgx-reader".into())
-        .spawn(move || reader(secure, conn_for_reader, lr, video, clipboard, peer))
+        .spawn(move || reader(secure, conn_for_reader, lr, video, decoder_ready, clipboard, peer))
         .expect("reader thread");
     Ok((conn, hello))
 }
@@ -514,6 +515,7 @@ fn reader(
     conn: Arc<Conn>,
     last_remote: Arc<Mutex<String>>,
     video: Arc<ChunkQueue>,
+    decoder_ready: Arc<std::sync::atomic::AtomicBool>,
     clipboard: ClipPolicy,
     peer: std::net::SocketAddr,
 ) {
@@ -556,6 +558,14 @@ fn reader(
                 }
                 conn.bytes.fetch_add(body.len() as u64, Ordering::Relaxed);
                 conn.videos.fetch_add(1, Ordering::Relaxed);
+                // The decoder takes a moment to open (NVDEC/Vulkan init). Do
+                // not queue the stream into it before that: the queue would
+                // overflow, evict, break the reference chain and make the
+                // client ask for a keyframe it does not need yet. The first
+                // access unit after readiness is an IDR anyway.
+                if !decoder_ready.load(Ordering::Relaxed) {
+                    continue;
+                }
                 // 48-bit capture timestamp in microseconds, 0 if the server
                 // does not timestamp video.
                 let capture_us = ((m.code as u64) << 32) | (m.b as u32 as u64);

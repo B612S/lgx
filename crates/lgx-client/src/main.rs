@@ -634,7 +634,7 @@ fn main() {
 
     let mut connect_attempt = reconnect_attempt();
     let mut dialog: Option<reconnect_ui::Dialog> = None;
-    let (conn, hello, video_rx) = loop {
+    let (conn, hello, video_rx, decoder_ready) = loop {
         // The queue is shallow on purpose: when the decoder falls behind the
         // oldest access unit is evicted (newest wins) instead of growing a
         // backlog. The override tells a burst problem from a decode problem.
@@ -645,17 +645,27 @@ fn main() {
             .unwrap_or(net::VIDEO_QUEUE);
         let video_tx = std::sync::Arc::new(net::ChunkQueue::new(queue));
         let video_rx = video_tx.clone();
+        // Set once the decoder is open; the reader drops video until then.
+        let decoder_ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let clip_policy = net::ClipPolicy {
             enabled: s.clipboard,
             rich: s.clipboard_rich,
             max_bytes: s.clipboard_max_bytes,
         };
-        match net::connect(&server, &keymap, &s.client_id, &token, video_tx, clip_policy) {
+        match net::connect(
+            &server,
+            &keymap,
+            &s.client_id,
+            &token,
+            video_tx,
+            decoder_ready.clone(),
+            clip_policy,
+        ) {
             Ok((conn, hello)) => {
                 if let Some(d) = dialog.take() {
                     d.close();
                 }
-                break (conn, hello, video_rx);
+                break (conn, hello, video_rx, decoder_ready);
             }
             Err(e) => {
                 if !s.reconnect || connect_attempt >= MAX_RECONNECT_ATTEMPTS {
@@ -798,7 +808,17 @@ fn main() {
         } else {
             detect_decoders(None)
         };
-        let decoder = dec::spawn(chosen, None, false, false, None, video_rx, sink.clone(), None);
+        let decoder = dec::spawn(
+            chosen,
+            None,
+            false,
+            false,
+            None,
+            video_rx,
+            decoder_ready.clone(),
+            sink.clone(),
+            None,
+        );
         conn.ask_video_udp();
         run_headless(sink, &conn, args.screenshot.take(), deadline, max_frames);
         conn.close();
@@ -911,6 +931,7 @@ fn main() {
         native_ok,
         request_idr,
         video_rx,
+        decoder_ready.clone(),
         sink.clone(),
         wake,
     );

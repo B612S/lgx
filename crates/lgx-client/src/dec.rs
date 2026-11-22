@@ -437,6 +437,7 @@ enum NativeResult {
 /// returns the current chunk so the FFmpeg path can take over.
 fn run_native(
     rx: &crate::net::ChunkQueue,
+    ready: &std::sync::atomic::AtomicBool,
     sink: &Arc<Sink>,
     wake: &Option<Box<dyn Fn() + Send>>,
     request_idr: &Option<Box<dyn Fn() + Send>>,
@@ -456,6 +457,7 @@ fn run_native(
     };
     eprintln!("lgx-client: HEVC decoder ready (Vulkan Video native)");
     sink.hw.store(true, Ordering::Relaxed);
+    ready.store(true, Ordering::Relaxed);
     let mut vps: Option<VpsInfo> = None;
     let mut sps: Option<SpsInfo> = None;
     let mut pps: Option<PpsInfo> = None;
@@ -594,6 +596,7 @@ pub fn spawn(
     native: bool,
     request_idr: Option<Box<dyn Fn() + Send>>,
     rx: Arc<crate::net::ChunkQueue>,
+    ready: Arc<std::sync::atomic::AtomicBool>,
     sink: Arc<Sink>,
     wake: Option<Box<dyn Fn() + Send>>,
 ) -> std::thread::JoinHandle<()> {
@@ -607,7 +610,7 @@ pub fn spawn(
                 _ => native,
             };
             if native {
-                match run_native(&rx, &sink, &wake, &request_idr) {
+                match run_native(&rx, &ready, &sink, &wake, &request_idr) {
                     NativeResult::Done => return,
                     NativeResult::Fallback(chunk) => pending = chunk,
                 }
@@ -631,6 +634,7 @@ pub fn spawn(
                 }
             };
             sink.hw.store(dec.hardware(), Ordering::Relaxed);
+            ready.store(true, Ordering::Relaxed);
             eprintln!(
                 "lgx-client: HEVC decoder ready ({})",
                 if dec.hardware() { dec.backend.name() } else { "software" }
