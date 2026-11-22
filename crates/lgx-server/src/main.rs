@@ -462,6 +462,11 @@ impl Stream {
         let mut idle = true;
         let mut last_progress = Instant::now();
         let mut capture_errors = 0u32;
+        let mut skipped = 0u64;
+        // A static desktop is the common case; skipping its frames is the
+        // difference between the CBR rate and ~0 bytes/s. The escape hatch
+        // exists for bisecting compositors that misreport damage.
+        let skip_idle = std::env::var_os("LGX_NO_DAMAGE_SKIP").is_none();
         // Test hook: drop the VPP stream's packets so the watchdog exercises
         // the GL fallback. The GL stream (vpp == false) is unaffected.
         let drop_packets = std::env::var_os("LGX_TEST_NO_PACKETS").is_some() && self.vpp;
@@ -478,17 +483,21 @@ impl Stream {
                 t0 = Instant::now();
                 frames = 0;
                 bytes = 0;
+                skipped = 0;
                 wait_samples.clear();
                 render_samples.clear();
                 encode_samples.clear();
                 last_progress = Instant::now();
                 capture_errors = 0;
             }
-            if hub.take_keyframe() {
+            let force_send = if hub.take_keyframe() {
                 if let Err(e) = self.enc.force_keyframe() {
                     eprintln!("lgx-server: vaenc keyframe: {e}");
                 }
-            }
+                true
+            } else {
+                false
+            };
             self.cap.state.overlay_cursor = hub.cursor_overlay();
 
             let t_wait = Instant::now();
@@ -512,6 +521,18 @@ impl Stream {
                     );
                     return RunOutcome::Resize;
                 }
+            }
+            // The compositor copied the same picture again: the client already
+            // has it, so skip the VPP import and the encode. A forced keyframe
+            // overrides this, otherwise a client that connects while the
+            // desktop is idle would never receive its first IDR.
+            if skip_idle && !force_send && self.cap.state.frame_changed == Some(false) {
+                skipped += 1;
+                // The encoder is not stuck, the picture just did not change;
+                // the no-packet watchdog must not fire.
+                last_progress = Instant::now();
+                capture::throttle(loop_start, self.fps);
+                continue;
             }
             let capture_us = time::monotonic_us();
             let wait_ms = t_wait.elapsed().as_secs_f64() * 1000.0;
@@ -628,7 +649,7 @@ impl Stream {
                 let fps = frames as f64 / t0.elapsed().as_secs_f64();
                 let mib_s = bytes as f64 / t0.elapsed().as_secs_f64() / 1_048_576.0;
                 eprintln!(
-                    "lgx-server: HEVC {fps:.1} fps, {mib_s:.1} MiB/s, wait p50/p99 {wait_p50:.2}/{wait_p99:.2} ms, render {render_p50:.2}/{render_p99:.2} ms, encode {encode_p50:.2}/{encode_p99:.2} ms, {clients} clients, {dropped} dropped"
+                    "lgx-server: HEVC {fps:.1} fps, {mib_s:.1} MiB/s, wait p50/p99 {wait_p50:.2}/{wait_p99:.2} ms, render {render_p50:.2}/{render_p99:.2} ms, encode {encode_p50:.2}/{encode_p99:.2} ms, {clients} clients, {dropped} dropped, {skipped} skipped"
                 );
                 let status = format!(
                     concat!(
@@ -636,7 +657,7 @@ impl Stream {
                         "\"wait_p50_ms\":{:.2},\"wait_p99_ms\":{:.2},",
                         "\"render_p50_ms\":{:.2},\"render_p99_ms\":{:.2},",
                         "\"encode_p50_ms\":{:.2},\"encode_p99_ms\":{:.2},",
-                        "\"dropped\":{},\"clients\":{},\"width\":{},\"height\":{},",
+                        "\"dropped\":{},\"skipped\":{},\"clients\":{},\"width\":{},\"height\":{},",
                         "\"target_fps\":{},\"bitrate\":{}}}\n"
                     ),
                     std::time::SystemTime::now()
@@ -652,6 +673,7 @@ impl Stream {
                     encode_p50,
                     encode_p99,
                     dropped,
+                    skipped,
                     clients,
                     self.w,
                     self.h,
@@ -662,6 +684,7 @@ impl Stream {
                 t0 = Instant::now();
                 frames = 0;
                 bytes = 0;
+                skipped = 0;
                 wait_samples.clear();
                 render_samples.clear();
                 encode_samples.clear();

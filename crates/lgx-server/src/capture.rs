@@ -69,7 +69,14 @@ pub struct CapState {
     /// after `ready`; just dropping the proxy leaks the compositor resource.
     pending: Option<FrameProxy>,
     pub pending_copy: bool,
-    pub damage_only: bool,
+    /// Result for the frame that `next_frame` just completed: `Some(true)`
+    /// when the compositor reported damage, `Some(false)` when it copied the
+    /// same picture again, `None` when it did not tell us (screencopy v1 or a
+    /// failed copy).
+    pub frame_changed: Option<bool>,
+    /// Damage seen so far for the frame currently in flight.
+    damage_seen: bool,
+    ready_damage: Option<bool>,
     pub logged_format: bool,
     pub done: bool,
     pub failed: bool,
@@ -179,7 +186,9 @@ impl Capture {
             overlay_cursor: true,
             pending: None,
             pending_copy: false,
-            damage_only: false,
+            frame_changed: None,
+            damage_seen: false,
+            ready_damage: None,
             logged_format: false,
             done: false,
             failed: false,
@@ -251,6 +260,8 @@ impl Capture {
             &self.queue.handle(),
             (),
         );
+        self.state.damage_seen = false;
+        self.state.ready_damage = None;
         let cur = self.state.cur;
         let buffer = if self.state.use_gbm {
             self.state.gbm_bufs[cur].as_ref().map(|(b, _)| b)
@@ -260,13 +271,7 @@ impl Capture {
             self.state.shm_bufs[cur].as_ref().map(|(b, _)| b)
         };
         match buffer {
-            Some(b) => {
-                if self.state.damage_only {
-                    frame.copy_with_damage(b)
-                } else {
-                    frame.copy(b)
-                }
-            }
+            Some(b) => copy_frame(&frame, b),
             None => self.state.pending_copy = true,
         }
         self.state.pending = Some(frame);
@@ -303,8 +308,12 @@ impl Capture {
                 self.state.gbm_linear = true;
                 self.state.gbm_bufs = [None, None];
             }
+            self.state.frame_changed = None;
             return Err(io::Error::other("frame was not copied"));
         }
+        // The damage belongs to the frame that just completed; `request` below
+        // starts tracking the next one.
+        self.state.frame_changed = self.state.ready_damage.take();
 
         let info = self.state.info.as_ref().expect("frame info");
         let need = (info.stride * info.height) as usize;
@@ -690,11 +699,7 @@ impl Dispatch<screencopy::client::zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV
                 if state.pending_copy {
                     state.pending_copy = false;
                     if let Some((b, _)) = state.shm_bufs[cur].as_ref() {
-                        if state.damage_only {
-                            proxy.copy_with_damage(b);
-                        } else {
-                            proxy.copy(b);
-                        }
+                        copy_frame(proxy, b);
                     }
                 }
             }
@@ -782,16 +787,18 @@ impl Dispatch<screencopy::client::zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV
                 if state.pending_copy {
                     state.pending_copy = false;
                     if let Some((b, _)) = state.dma_bufs[cur].as_ref() {
-                        if state.damage_only {
-                            proxy.copy_with_damage(b);
-                        } else {
-                            proxy.copy(b);
-                        }
+                        copy_frame(proxy, b);
                     }
+                }
+            }
+            Event::Damage { width, height, .. } => {
+                if width > 0 && height > 0 {
+                    state.damage_seen = true;
                 }
             }
             Event::Flags { .. } => {}
             Event::Ready { .. } => {
+                state.ready_damage = Some(state.damage_seen);
                 state.done = true;
             }
             Event::Failed => {
@@ -801,6 +808,17 @@ impl Dispatch<screencopy::client::zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV
             }
             _ => {}
         }
+    }
+}
+
+/// Ask for the copy and, on screencopy v2+, for the damage report. The
+/// damage tells the capture loop whether the picture changed at all, so an
+/// idle desktop does not have to be encoded and sent again.
+fn copy_frame(proxy: &FrameProxy, buffer: &wl_buffer::WlBuffer) {
+    if proxy.version() >= 2 {
+        proxy.copy_with_damage(buffer);
+    } else {
+        proxy.copy(buffer);
     }
 }
 
