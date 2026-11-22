@@ -405,6 +405,28 @@ fn write_parts(stream: &mut TcpStream, parts: &[&[u8]]) -> io::Result<()> {
     Ok(())
 }
 
+/// Bound the kernel's unsent queue: a slow receiver must not accumulate
+/// hundreds of milliseconds of video before the userspace drop policy sees it.
+/// Linux-only; a no-op elsewhere.
+pub fn set_low_latency(stream: &TcpStream) {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        use std::os::fd::AsRawFd;
+        // libc does not expose TCP_NOTSENT_LOWAT on every target.
+        const TCP_NOTSENT_LOWAT: libc::c_int = 25;
+        let bytes: libc::c_int = 32 * 1024;
+        libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            TCP_NOTSENT_LOWAT,
+            &bytes as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of_val(&bytes) as libc::socklen_t,
+        );
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = stream;
+}
+
 fn start_handshake(stream: &TcpStream) -> io::Result<()> {
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;

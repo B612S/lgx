@@ -50,6 +50,9 @@ pub mod msg {
     /// Client asks the server to send cursor shapes. Clients that do not send
     /// this never receive CURSOR_IMAGE, so older clients keep working.
     pub const CURSOR_SHAPE: u8 = 25;
+    /// The capture geometry changed mid-session: `code` = refresh rate (Hz),
+    /// `a` = width, `b` = height. The client asks the user whether to resize.
+    pub const RESIZE: u8 = 28;
     /// Server-side cursor is hidden (for example a video player hides it).
     /// The client must hide its locally drawn pointer until the next
     /// CURSOR_IMAGE.

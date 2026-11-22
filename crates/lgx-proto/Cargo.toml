@@ -6,4 +6,5 @@ license.workspace = true
 description = "Shared wire protocol for lgx"
 
 [dependencies]
+libc = "0.2"
 ring = "0.17"
