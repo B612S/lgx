@@ -87,11 +87,24 @@ pub struct Conn {
     pub cursor: Arc<Mutex<Option<CursorShape>>>,
     /// The guest hid its pointer (for example over a video); hide the local one.
     pub cursor_hidden: std::sync::atomic::AtomicBool,
+    /// Latest `RESIZE` from the server: (width, height, refresh Hz).
+    pub resize: Mutex<Option<(u32, u32, u32)>>,
 }
 
 impl Conn {
     pub fn send(&self, m: Msg, payload: &[u8]) -> std::io::Result<()> {
         self.secure.send_msg(m, payload)
+    }
+
+    /// Consumes a display-mode change announced by the server.
+    pub fn take_resize(&self) -> Option<(u32, u32, u32)> {
+        self.resize.lock().unwrap().take()
+    }
+
+    /// Test hook (`LGX_FAKE_RESIZE`) that exercises the display dialog without
+    /// a real compositor mode change.
+    pub fn inject_resize(&self, w: u32, h: u32, fps: u32) {
+        *self.resize.lock().unwrap() = Some((w, h, fps));
     }
 
     pub fn take_bytes(&self) -> u64 {
@@ -157,6 +170,7 @@ pub fn connect(
         local_cursor: std::sync::atomic::AtomicBool::new(false),
         cursor: Arc::new(Mutex::new(None)),
         cursor_hidden: std::sync::atomic::AtomicBool::new(false),
+        resize: Mutex::new(None),
     });
     let conn_for_reader = conn.clone();
     std::thread::Builder::new()
@@ -182,10 +196,27 @@ fn reader(
     let mut last_idr_request: Option<std::time::Instant> = None;
     // Incoming file clipboard transfer.
     let mut incoming_file: Option<(String, u64, Vec<u8>)> = None;
+    // Test hook: write the received Annex-B access units to a file.
+    let mut dump = std::env::var_os("LGX_DUMP_BITSTREAM").map(|path| {
+        eprintln!("lgx-client: dumping the bitstream to {}", path.to_string_lossy());
+        std::fs::File::create(path)
+    });
     while let Ok((m, payload)) = secure.recv_msg_raw() {
         let body = &payload[secure::MSG_HEADER..];
         match m.typ {
+            msg::RESIZE => {
+                // The encoder was rebuilt for a new display mode; the user
+                // decides whether the window follows it.
+                let w = m.a.max(0) as u32;
+                let h = m.b.max(0) as u32;
+                if w > 0 && h > 0 {
+                    *conn.resize.lock().unwrap() = Some((w, h, m.code as u32));
+                }
+            }
             msg::VIDEO => {
+                if let Some(Ok(file)) = dump.as_mut() {
+                    let _ = std::io::Write::write_all(file, body);
+                }
                 conn.bytes.fetch_add(body.len() as u64, Ordering::Relaxed);
                 if skipping {
                     if !is_idr(body) {

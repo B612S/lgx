@@ -19,6 +19,7 @@ mod pair;
 mod osd;
 mod protocols;
 mod reconnect_ui;
+mod resize_ui;
 
 use std::io::Write;
 use std::os::unix::process::CommandExt;
@@ -166,7 +167,7 @@ fn parse_args() -> Result<Args, String> {
                 println!(
                     "lgx-client [NAME] [--connect HOST:PORT] [--token T] [--size WxH]\n\
                      \x20          NAME selects the [NAME] section in client.conf\n\
-                     \x20          [--decoder auto|cuda|vaapi|software]\n\
+                     \x20          [--decoder auto|cuda|vaapi|vulkan|software]\n\
                      \x20          [--cursor-grab|--no-cursor-grab] [--fullscreen|--windowed]\n\
                      \x20          [--vsync] [--audio] [--audio-connect ADDR]\n\
                      \x20          [--gamepads|--no-gamepads] [--no-reconnect]\n\
@@ -261,19 +262,102 @@ fn write_ppm_nv12(
 }
 
 
-fn backends(spec: &str, gl_renderer: &str) -> Vec<Backend> {
+fn backends(spec: &str, gl_renderer: &str, video: bool) -> Vec<Backend> {
     match spec {
         "software" | "none" | "sw" => vec![Backend::Software],
         "vaapi" => vec![Backend::Vaapi, Backend::Software],
         "cuda" | "nvidia" | "nvdec" => vec![Backend::Cuda, Backend::Software],
+        "vulkan" | "vkvideo" => vec![Backend::Vulkan, Backend::Software],
         _ => {
-            if gl_renderer.to_ascii_lowercase().contains("nvidia") {
-                vec![Backend::Cuda, Backend::Vaapi, Backend::Software]
-            } else {
-                vec![Backend::Vaapi, Backend::Cuda, Backend::Software]
+            let mut list = Vec::new();
+            if video {
+                list.push(Backend::Vulkan);
             }
+            if gl_renderer.to_ascii_lowercase().contains("nvidia") {
+                list.extend([Backend::Cuda, Backend::Vaapi, Backend::Software]);
+            } else {
+                list.extend([Backend::Vaapi, Backend::Cuda, Backend::Software]);
+            }
+            list
         }
     }
+}
+
+/// A `--decoder` (or profile) value names one backend explicitly; everything
+/// else, including `auto` and unknown strings, goes through detection.
+fn explicit_decoder(spec: &str) -> bool {
+    matches!(
+        spec,
+        "software" | "none" | "sw" | "vaapi" | "cuda" | "nvidia" | "nvdec" | "vulkan" | "vkvideo"
+    )
+}
+
+fn map_decoder(b: lgx_caps::DecodeBackend) -> Backend {
+    match b {
+        lgx_caps::DecodeBackend::Vulkan => Backend::Vulkan,
+        lgx_caps::DecodeBackend::Vaapi => Backend::Vaapi,
+        lgx_caps::DecodeBackend::Cuda => Backend::Cuda,
+        lgx_caps::DecodeBackend::Software => Backend::Software,
+    }
+}
+
+/// Capability-driven decoder order. `renderer_name` is `None` in headless mode,
+/// where there is no Vulkan device to match against the DRM nodes.
+fn detect_decoders(renderer_name: Option<&str>) -> Vec<Backend> {
+    let nodes = lgx_caps::drm_nodes();
+    let va: Vec<lgx_caps::VaCaps> = nodes
+        .iter()
+        .filter(|n| n.render)
+        .filter_map(lgx_caps::probe_vaapi)
+        .collect();
+    let cuda = lgx_caps::cuda::available();
+    let devices = lgx_caps::vulkan_devices().unwrap_or_default();
+    let info = renderer_name.and_then(|n| devices.iter().find(|d| d.name == n));
+    let plan: Vec<lgx_caps::DecodeBackend> = match info {
+        Some(info) => {
+            eprintln!(
+                "lgx-client: GPU {} ({}, render {}, video decode {})",
+                info.name,
+                if info.driver.is_empty() { "unknown" } else { &info.driver },
+                info.render
+                    .map(|(a, b)| format!("{a}:{b}"))
+                    .unwrap_or_else(|| "unreported".into()),
+                if info.video_decode_h265 { "yes" } else { "no" },
+            );
+            lgx_caps::decode_plan(info, &nodes, &va, cuda)
+        }
+        None => {
+            // No Vulkan device: prefer NVDEC on an NVIDIA node (VAAPI there is
+            // NVDEC behind libva, CUDA is the native path), VAAPI elsewhere.
+            let nvidia = nodes.iter().any(|n| n.render && n.is_nvidia());
+            let vaapi = va.iter().any(|c| c.hevc_decode);
+            let mut p = Vec::new();
+            if nvidia && cuda {
+                p.push(lgx_caps::DecodeBackend::Cuda);
+            }
+            if vaapi {
+                p.push(lgx_caps::DecodeBackend::Vaapi);
+            }
+            if cuda && !p.contains(&lgx_caps::DecodeBackend::Cuda) {
+                p.push(lgx_caps::DecodeBackend::Cuda);
+            }
+            p.push(lgx_caps::DecodeBackend::Software);
+            p
+        }
+    };
+    let mut order: Vec<Backend> = Vec::new();
+    for b in plan {
+        let b = map_decoder(b);
+        if !order.contains(&b) {
+            order.push(b);
+        }
+    }
+    if order.is_empty() {
+        order.push(Backend::Software);
+    }
+    let names: Vec<&str> = order.iter().map(|b| b.name()).collect();
+    eprintln!("lgx-client: decoder plan: {}", names.join(" -> "));
+    order
 }
 
 fn cursor_from_shape(shape: net::CursorShape) -> Option<Cursor> {
@@ -299,6 +383,18 @@ fn cursor_from_shape(shape: net::CursorShape) -> Option<Cursor> {
             None
         }
     }
+}
+
+fn draw_percentiles(samples: &mut [f32]) -> (f32, f32) {
+    if samples.is_empty() {
+        return (0.0, 0.0);
+    }
+    samples.sort_by(f32::total_cmp);
+    let at = |p: f32| {
+        let idx = ((samples.len() - 1) as f32 * p).round() as usize;
+        samples[idx.min(samples.len() - 1)]
+    };
+    (at(0.5), at(0.99))
 }
 
 fn main() {
@@ -401,7 +497,7 @@ fn main() {
         .or_else(|| std::env::var("LGX_TOKEN").ok())
         .or_else(|| cfg.instance_get(&args.name, "token").map(str::to_string))
         .unwrap_or_default();
-    let client_id = args.name.clone();
+    let client_id = args.client_id.clone().unwrap_or_else(|| args.name.clone());
     let s = Settings {
         name: args.name.clone(),
         server: {
@@ -688,14 +784,12 @@ fn main() {
 
     if args.no_window {
         let sink = dec::Sink::new();
-        let chosen = {
-            let mut b = backends(&s.decoder, "");
-            if b.is_empty() {
-                b.push(Backend::Software);
-            }
-            b
+        let chosen = if explicit_decoder(&s.decoder) {
+            backends(&s.decoder, "", false)
+        } else {
+            detect_decoders(None)
         };
-        let decoder = dec::spawn(chosen, None, false, video_rx, sink.clone(), None);
+        let decoder = dec::spawn(chosen, None, false, false, None, video_rx, sink.clone(), None);
         run_headless(sink, &conn, args.screenshot.take(), deadline, max_frames);
         conn.close();
         let _ = decoder.join();
@@ -718,7 +812,6 @@ fn main() {
             if hello.height > 1 { hello.height } else { 720 },
         ),
     };
-    let auto_size = s.width.is_none() || s.height.is_none();
     let mut window = video
         .window("lgx", win_w, win_h)
         .vulkan()
@@ -751,7 +844,30 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let chosen = backends(&s.decoder, renderer.device_name());
+    if let Some((family, _)) = renderer.video_decode_queue() {
+        eprintln!("lgx-client: native Vulkan Video decode queue available (family {family})");
+    }
+    let chosen = if explicit_decoder(&s.decoder) {
+        backends(&s.decoder, renderer.device_name(), renderer.video_decode_supported())
+    } else {
+        detect_decoders(Some(renderer.device_name()))
+    };
+    let native_ok = renderer.video_decode_queue().is_some()
+        && renderer.can_import_dmabuf()
+        && (s.decoder.is_empty() || s.decoder == "default" || s.decoder == "vulkan")
+        && args.screenshot.is_none()
+        && !matches!(
+            std::env::var("LGX_VULKAN_VIDEO").as_deref(),
+            Ok("ffmpeg") | Ok("0")
+        );
+    eprintln!(
+        "lgx-client: native Vulkan Video path {}",
+        if native_ok {
+            "enabled by default (LGX_VULKAN_VIDEO=ffmpeg forces FFmpeg)"
+        } else {
+            "disabled"
+        }
+    );
     let want_dmabuf = renderer.can_import_dmabuf();
     if want_dmabuf {
         eprintln!("lgx-client: decoder frames will be imported as dma-buf (LGX_NO_DMABUF=1 forces NV12 uploads)");
@@ -774,7 +890,20 @@ fn main() {
             }) as Box<dyn Fn() + Send>
         })
     });
-    let decoder = dec::spawn(chosen, None, want_dmabuf, video_rx, sink.clone(), wake);
+    let idr_conn = conn.clone();
+    let request_idr: Option<Box<dyn Fn() + Send>> = Some(Box::new(move || {
+        let _ = idr_conn.send(Msg::new(msg::IDR, 0, 0, 0), &[]);
+    }));
+    let decoder = dec::spawn(
+        chosen,
+        None,
+        want_dmabuf,
+        native_ok,
+        request_idr,
+        video_rx,
+        sink.clone(),
+        wake,
+    );
 
     let gamepad_subsystem = if s.gamepads {
         sdl.gamepad().ok()
@@ -838,6 +967,23 @@ fn main() {
     };
 
     let mut img_size = (hello.width, hello.height);
+    // The size the window was sized for; a RESIZE compares against this, not
+    // against `img_size` (which follows every decoded frame).
+    let mut display_size = (hello.width, hello.height);
+    let mut resize_dialog: Option<(resize_ui::Dialog, u32, u32)> = None;
+    // Test hook: answer the display prompt without a real dialog.
+    let mut test_answer: Option<(i32, u32, u32)> = None;
+    // `LGX_FAKE_RESIZE=1280x800@60` injects one display change for testing.
+    let mut fake_resize = std::env::var("LGX_FAKE_RESIZE").ok().and_then(|value| {
+        let (size, hz) = value.split_once('@').unwrap_or((&value, "0"));
+        let (w, h) = size.split_once('x')?;
+        Some((
+            Instant::now() + Duration::from_secs(3),
+            w.parse().ok()?,
+            h.parse().ok()?,
+            hz.parse().ok()?,
+        ))
+    });
     let mut last_frame: Option<dec::Frame> = None;
     let mut last_present: Option<Instant> = None;
     let mut last_cpu: Option<(u64, Instant)> = None;
@@ -847,9 +993,7 @@ fn main() {
     let mut last_stat_shown = 0u64;
     let mut last_stat_decoded = sink.decoded.load(std::sync::atomic::Ordering::Relaxed);
     let mut last_stat_dropped = sink.dropped.load(std::sync::atomic::Ordering::Relaxed);
-    let mut draw_ms_sum = 0.0f64;
-    let mut draw_ms_max = 0.0f64;
-    let mut draw_count = 0u64;
+    let mut draw_samples: Vec<f32> = Vec::new();
     let started = Instant::now();
     let mut quit = false;
     let mut connection_lost = false;
@@ -857,6 +1001,10 @@ fn main() {
     let mut swallow_f_keyup = false;
     let mut swallow_m_keyup = false;
     let mut swallow_g_keyup = false;
+    let mut swallow_s_keyup = false;
+    // `LGX_STATS_OSD=1` keeps the statistics card visible (tests, demos).
+    let mut stats_osd_until: Option<Instant> = std::env::var_os("LGX_STATS_OSD")
+        .map(|_| Instant::now() + Duration::from_secs(3600));
     let mut osd_until: Option<Instant> = None;
     let mut osd_card = osd::AUDIO_ON;
     let mut fullscreen = s.fullscreen;
@@ -866,7 +1014,6 @@ fn main() {
     }
     let mut fullscreen_hold: Option<(Instant, (u32, u32))> = None;
     let mut dst = vk::fit_rect(win_w, win_h, win_w, win_h);
-    let mut config_saved = s.width.is_some() && s.height.is_some();
     // Cursor visibility: hidden while the server composites the pointer into
     // the video, shown when the server asked for a local cursor (it captures
     // at the frame rate; the local pointer follows the host at its own rate).
@@ -912,6 +1059,59 @@ fn main() {
 
     while !quit {
         heartbeat.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some((at, w, h, hz)) = fake_resize {
+            if Instant::now() >= at {
+                fake_resize = None;
+                conn.inject_resize(w, h, hz);
+            }
+        }
+        if let Some((w, h, _hz)) = conn.take_resize() {
+            if (w, h) != display_size && resize_dialog.is_none() {
+                if let Some(code) = std::env::var("LGX_TEST_RESIZE_ANSWER")
+                    .ok()
+                    .and_then(|v| v.parse::<i32>().ok())
+                {
+                    test_answer = Some((code, w, h));
+                } else {
+                    let old = format!("{}x{}", display_size.0, display_size.1);
+                    let new = format!("{w}x{h}");
+                    match resize_ui::Dialog::spawn(&s.name, &old, &new) {
+                        Some(d) => resize_dialog = Some((d, w, h)),
+                        None => {
+                            // No helper available: never fight the stream, but do
+                            // not prompt again for this mode either.
+                            display_size = (w, h);
+                        }
+                    }
+                }
+            }
+        }
+        let mut answer = resize_dialog
+            .as_mut()
+            .and_then(|(d, w, h)| d.poll().map(|code| (code, *w, *h)));
+        if answer.is_none() {
+            answer = test_answer.take();
+        }
+        if let Some((code, w, h)) = answer {
+            resize_dialog = None;
+            display_size = (w, h);
+            eprintln!("lgx-client: display answer {code} -> {w}x{h}");
+            if code != 2 {
+                window.set_size(w, h).ok();
+                eprintln!("lgx-client: window now {:?}", window.size());
+                if code == 1 {
+                    let mut cfg = config::Config::load();
+                    cfg.set("width", w);
+                    cfg.set("height", h);
+                    if let Err(e) = cfg.save() {
+                        eprintln!("lgx-client: cannot save the display size: {e}");
+                    } else {
+                        eprintln!("lgx-client: saved display size {w}x{h}");
+                    }
+                }
+            }
+            redraw = true;
+        }
         if let Some(shape) = conn.cursor.lock().unwrap().take() {
             if let Some(cursor) = cursor_from_shape(shape) {
                 if window_focused && !conn.cursor_hidden.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1089,6 +1289,28 @@ fn main() {
                     eprintln!("lgx-client: fullscreen toggled (Ctrl+Shift+Alt+F)");
                 }
                 Event::KeyDown {
+                    keycode: Some(sdl3::keyboard::Keycode::S),
+                    keymod,
+                    repeat,
+                    ..
+                } if !repeat
+                    && keymod.intersects(sdl3::keyboard::Mod::LCTRLMOD | sdl3::keyboard::Mod::RCTRLMOD)
+                    && keymod.intersects(sdl3::keyboard::Mod::LSHIFTMOD | sdl3::keyboard::Mod::RSHIFTMOD)
+                    && keymod.intersects(sdl3::keyboard::Mod::LALTMOD | sdl3::keyboard::Mod::RALTMOD) =>
+                {
+                    for code in [29u16, 42, 56, 97, 100, 54] {
+                        send_key(&conn, keyboard.as_mut(), code, false);
+                    }
+                    swallow_s_keyup = true;
+                    let until = Instant::now() + Duration::from_secs(5);
+                    stats_osd_until = Some(until);
+                    osd_card = osd::STATS_CARD;
+                    osd_until = Some(until);
+                    renderer.set_osd_text("statistics...");
+                    redraw = true;
+                    eprintln!("lgx-client: statistics OSD (Ctrl+Shift+Alt+S)");
+                }
+                Event::KeyDown {
                     keycode: Some(sdl3::keyboard::Keycode::M),
                     keymod,
                     repeat,
@@ -1217,6 +1439,11 @@ fn main() {
                 {
                     swallow_m_keyup = false;
                 }
+                Event::KeyUp { keycode: Some(sdl3::keyboard::Keycode::S), .. }
+                    if swallow_s_keyup =>
+                {
+                    swallow_s_keyup = false;
+                }
                 Event::KeyUp { keycode: Some(sdl3::keyboard::Keycode::G), .. }
                     if swallow_g_keyup =>
                 {
@@ -1286,25 +1513,13 @@ fn main() {
         renderer.set_osd(osd);
         if let Some(frame) = frame {
             let (w, h) = (frame.width, frame.height);
-            if auto_size && (w, h) != img_size {
-                window.set_size(w, h).ok();
-            }
-            if auto_size && !config_saved && w > 1 {
-                config_saved = true;
-                let mut cfg = config::Config::load();
-                cfg.set("width", w);
-                cfg.set("height", h);
-                let _ = cfg.save();
-            }
             let draw_started = Instant::now();
             let drawn_ok = renderer.draw(&frame, win_px);
             let draw_ms = draw_started.elapsed().as_secs_f64() * 1000.0;
             if drawn_ok {
                 last_present = Some(Instant::now());
                 shown += 1;
-                draw_ms_sum += draw_ms;
-                draw_ms_max = draw_ms_max.max(draw_ms);
-                draw_count += 1;
+                draw_samples.push(draw_ms as f32);
                 img_size = (w, h);
                 if let Some(path) = screenshot.take() {
                     save_frame(&path, &frame);
@@ -1343,7 +1558,20 @@ fn main() {
             let d_drop = dropped.saturating_sub(last_stat_dropped);
             last_stat_decoded = decoded;
             last_stat_dropped = dropped;
-            let avg_draw = if draw_count > 0 { draw_ms_sum / draw_count as f64 } else { 0.0 };
+            let (draw_p50, draw_p99) = draw_percentiles(&mut draw_samples);
+            if let Some(until) = stats_osd_until {
+                if Instant::now() < until {
+                    let line = format!(
+                        "{df} fps  {draw_p50:.1}/{draw_p99:.1} ms  dec {d_dec}  drop {d_drop}"
+                    );
+                    renderer.set_osd_text(&line);
+                    osd_card = osd::STATS_CARD;
+                    osd_until = Some(until);
+                    redraw = true;
+                } else {
+                    stats_osd_until = None;
+                }
+            }
             if std::env::var_os("LGX_DEBUG_FPS").is_some() {
                 let cpu = match (last_cpu, cpu_ticks()) {
                     (Some((before, since)), Some(now)) => {
@@ -1355,18 +1583,16 @@ fn main() {
                 last_cpu = cpu_ticks().map(|now| (now, Instant::now()));
                 match cpu {
                     Some(cpu) => eprintln!(
-                        "lgx-client: fps {df}, decoded {d_dec}, overwritten {d_drop}, draw {avg_draw:.2}/{draw_ms_max:.2} ms, cpu {cpu:.0}%, {:.1} MiB/s",
+                        "lgx-client: fps {df}, decoded {d_dec}, overwritten {d_drop}, draw p50/p99 {draw_p50:.2}/{draw_p99:.2} ms, cpu {cpu:.0}%, {:.1} MiB/s",
                         bytes as f64 / 1_048_576.0
                     ),
                     None => eprintln!(
-                        "lgx-client: fps {df}, decoded {d_dec}, overwritten {d_drop}, draw {avg_draw:.2}/{draw_ms_max:.2} ms, {:.1} MiB/s",
+                        "lgx-client: fps {df}, decoded {d_dec}, overwritten {d_drop}, draw p50/p99 {draw_p50:.2}/{draw_p99:.2} ms, {:.1} MiB/s",
                         bytes as f64 / 1_048_576.0
                     ),
                 }
             }
-            draw_ms_sum = 0.0;
-            draw_ms_max = 0.0;
-            draw_count = 0;
+            draw_samples.clear();
             next_stats = Instant::now() + Duration::from_secs(1);
         }
         if let Some(err) = sink.error() {

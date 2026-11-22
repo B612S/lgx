@@ -18,6 +18,9 @@ use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
+use lgx_vkvideo::bitstream::{annexb_nals, nal_type, PpsInfo, SpsInfo, VpsInfo};
+use lgx_vkvideo::decoder::NativeDecoder;
+
 #[repr(C)]
 struct LgxDec {
     _private: [u8; 0],
@@ -48,6 +51,7 @@ pub enum Backend {
     Software,
     Vaapi,
     Cuda,
+    Vulkan,
 }
 
 impl Backend {
@@ -56,6 +60,7 @@ impl Backend {
             Backend::Software => 0,
             Backend::Vaapi => 1,
             Backend::Cuda => 2,
+            Backend::Vulkan => 3,
         }
     }
 
@@ -64,6 +69,7 @@ impl Backend {
             Backend::Software => "software",
             Backend::Vaapi => "VAAPI",
             Backend::Cuda => "CUDA/NVDEC",
+            Backend::Vulkan => "Vulkan Video",
         }
     }
 }
@@ -123,6 +129,10 @@ pub struct Dmabuf {
     /// R8 luma and R8G8 chroma layers.
     pub layers: u32,
     handle: *mut c_void,
+    /// Fds owned by a native dma-buf frame (closed in Drop).
+    native_fds: Vec<c_int>,
+    /// Stable key for renderer-side import caching (0 = import per frame).
+    pub cache_key: u64,
 }
 
 /// CPU-visible NV12 planes.
@@ -132,6 +142,10 @@ pub struct Nv12 {
     pub y_stride: u32,
     pub uv_stride: u32,
     handle: *mut c_void,
+    /// Native decoder frames own their NV12 pixels; FFmpeg frames keep them
+    /// behind `handle`.
+    #[allow(dead_code)]
+    owned: Option<Box<[u8]>>,
 }
 
 #[allow(dead_code)]
@@ -160,13 +174,22 @@ unsafe impl Send for Nv12 {}
 
 impl Drop for Dmabuf {
     fn drop(&mut self) {
-        unsafe { lgx_dec_free_frame(self.handle) };
+        if !self.handle.is_null() {
+            unsafe { lgx_dec_free_frame(self.handle) };
+        }
+        for fd in &self.native_fds {
+            if *fd >= 0 {
+                unsafe { libc::close(*fd) };
+            }
+        }
     }
 }
 
 impl Drop for Nv12 {
     fn drop(&mut self) {
-        unsafe { lgx_dec_free_frame(self.handle) };
+        if !self.handle.is_null() {
+            unsafe { lgx_dec_free_frame(self.handle) };
+        }
     }
 }
 
@@ -312,6 +335,8 @@ fn frame_from_info(
             fourcc: info.fourcc,
             layers: info.layers,
             handle,
+            native_fds: Vec::new(),
+            cache_key: 0,
         };
         if d.planes != 2 || !(1..=2).contains(&d.layers) {
             unsafe { lgx_dec_free_frame(handle) };
@@ -331,6 +356,7 @@ fn frame_from_info(
             y_stride: info.y_stride as u32,
             uv_stride: info.uv_stride as u32,
             handle,
+            owned: None,
         })
     } else {
         unsafe { lgx_dec_free_frame(handle) };
@@ -395,12 +421,172 @@ impl Sink {
     }
 }
 
+enum NativeResult {
+    Done,
+    /// The native path stopped; process this chunk (if any) with FFmpeg.
+    Fallback(Option<Chunk>),
+}
+
+/// Decode with the native Vulkan Video implementation. On any failure it
+/// returns the current chunk so the FFmpeg path can take over.
+fn run_native(
+    rx: &Receiver<Chunk>,
+    sink: &Arc<Sink>,
+    wake: &Option<Box<dyn Fn() + Send>>,
+    request_idr: &Option<Box<dyn Fn() + Send>>,
+) -> NativeResult {
+    let ask_idr = || {
+        if let Some(f) = request_idr {
+            f();
+        }
+    };
+    let mut decoder = match NativeDecoder::new() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("lgx-client: native Vulkan Video unavailable: {e}");
+            ask_idr();
+            return NativeResult::Fallback(None);
+        }
+    };
+    eprintln!("lgx-client: HEVC decoder ready (Vulkan Video native)");
+    sink.hw.store(true, Ordering::Relaxed);
+    let mut vps: Option<VpsInfo> = None;
+    let mut sps: Option<SpsInfo> = None;
+    let mut pps: Option<PpsInfo> = None;
+    let mut configured: Option<SpsInfo> = None;
+    let fail_after: Option<u64> = std::env::var("LGX_TEST_NATIVE_FAIL")
+        .ok()
+        .and_then(|v| v.parse().ok());
+    let mut frames = 0u64;
+    loop {
+        let chunk = match rx.recv() {
+            Ok(c) => c,
+            Err(_) => {
+                sink.stopped.store(true, Ordering::Relaxed);
+                return NativeResult::Done;
+            }
+        };
+        for nal in annexb_nals(&chunk.data[chunk.off..]) {
+            match nal_type(nal) {
+                32 => match VpsInfo::parse(nal) {
+                    Ok(v) => vps = Some(v),
+                    Err(e) => eprintln!("lgx-client: native VPS parse: {e}"),
+                },
+                33 => match SpsInfo::parse(nal) {
+                    Ok(s) => sps = Some(s),
+                    Err(e) => eprintln!("lgx-client: native SPS parse: {e}"),
+                },
+                34 => match PpsInfo::parse(nal) {
+                    Ok(p) => pps = Some(p),
+                    Err(e) => eprintln!("lgx-client: native PPS parse: {e}"),
+                },
+                0..=31 => {
+                    let (Some(v), Some(s), Some(p)) = (vps.as_ref(), sps.as_ref(), pps.as_ref())
+                    else {
+                        eprintln!("lgx-client: native decode before VPS/SPS/PPS; falling back");
+                        ask_idr();
+                        return NativeResult::Fallback(Some(chunk));
+                    };
+                    let need_reconfigure = match configured.as_ref() {
+                        Some(c) => {
+                            c.width != s.width
+                                || c.height != s.height
+                                || c.sps_id != s.sps_id
+                        }
+                        None => true,
+                    };
+                    if s.width != s.display_width() || s.height != s.display_height() {
+                        eprintln!(
+                            "lgx-client: native decoder does not implement the conformance window ({}x{} coded, {}x{} display); falling back",
+                            s.width,
+                            s.height,
+                            s.display_width(),
+                            s.display_height()
+                        );
+                        ask_idr();
+                        return NativeResult::Fallback(Some(chunk));
+                    }
+                    if need_reconfigure {
+                        if let Err(e) = decoder.configure(v, s, p) {
+                            eprintln!("lgx-client: native session: {e}; falling back to FFmpeg");
+                            ask_idr();
+                            return NativeResult::Fallback(Some(chunk));
+                        }
+                        configured = Some(s.clone());
+                    }
+                    match decoder.decode(nal) {
+                        Ok(Some(f)) => {
+                            let pixels = if let Some(d) = f.dma {
+                                Pixels::Dmabuf(Dmabuf {
+                                    fds: [d.fd, d.fd, -1, -1],
+                                    offsets: [d.y_offset, d.uv_offset, 0, 0],
+                                    pitches: [d.y_pitch, d.uv_pitch, 0, 0],
+                                    planes: 2,
+                                    modifier: d.modifier,
+                                    fourcc: 0x3231_564e,
+                                    layers: 1,
+                                    handle: std::ptr::null_mut(),
+                                    native_fds: vec![d.fd],
+                                    cache_key: d.cache_key,
+                                })
+                            } else {
+                                let data = f.data.into_boxed_slice();
+                                let y_len = (f.width * f.height) as usize;
+                                let y = data.as_ptr();
+                                let uv = unsafe { data.as_ptr().add(y_len) };
+                                Pixels::Nv12(Nv12 {
+                                    y,
+                                    uv,
+                                    y_stride: f.width,
+                                    uv_stride: f.width,
+                                    handle: std::ptr::null_mut(),
+                                    owned: Some(data),
+                                })
+                            };
+                            let frame = Frame {
+                                width: f.width,
+                                height: f.height,
+                                pts: 0,
+                                arrival: chunk.at,
+                                capture_us: chunk.capture_us,
+                                pixels,
+                            };
+                            sink.decoded.fetch_add(1, Ordering::Relaxed);
+                            sink.publish(frame);
+                            if let Some(w) = wake {
+                                w();
+                            }
+                            frames += 1;
+                            if fail_after.is_some_and(|n| frames >= n) {
+                                eprintln!(
+                                    "lgx-client: test hook: native failure after {frames} frames; falling back to FFmpeg"
+                                );
+                                ask_idr();
+                                return NativeResult::Fallback(None);
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            eprintln!("lgx-client: native decode: {e}; falling back to FFmpeg");
+                            return NativeResult::Fallback(Some(chunk));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
 /// Decoder thread. `wake` is invoked for every published frame so the window
 /// loop can sleep in SDL_WaitEvent instead of spinning.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn(
     backends: Vec<Backend>,
     device: Option<String>,
     want_dmabuf: bool,
+    native: bool,
+    request_idr: Option<Box<dyn Fn() + Send>>,
     rx: Receiver<Chunk>,
     sink: Arc<Sink>,
     wake: Option<Box<dyn Fn() + Send>>,
@@ -408,6 +594,18 @@ pub fn spawn(
     std::thread::Builder::new()
         .name("lgx-decode".into())
         .spawn(move || {
+            let mut pending = None;
+            let native = match std::env::var("LGX_VULKAN_VIDEO").as_deref() {
+                Ok("native") | Ok("1") => true,
+                Ok("ffmpeg") | Ok("0") => false,
+                _ => native,
+            };
+            if native {
+                match run_native(&rx, &sink, &wake, &request_idr) {
+                    NativeResult::Done => return,
+                    NativeResult::Fallback(chunk) => pending = chunk,
+                }
+            }
             let mut opened = None;
             for backend in backends {
                 match Decoder::open(backend, device.as_deref(), want_dmabuf) {
@@ -433,7 +631,14 @@ pub fn spawn(
             );
 
             let mut pts = 0i64;
-            while let Ok(chunk) = rx.recv() {
+            loop {
+                let chunk = match pending.take() {
+                    Some(chunk) => chunk,
+                    None => match rx.recv() {
+                        Ok(chunk) => chunk,
+                        Err(_) => break,
+                    },
+                };
                 // A packet can be refused until pending frames are pulled.
                 loop {
                     match dec.push(&chunk.data[chunk.off..], pts) {

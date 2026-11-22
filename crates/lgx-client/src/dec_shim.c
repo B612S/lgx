@@ -1,4 +1,4 @@
-/* lgx-dec: in-process H.264 decoder used by the client.
+/* lgx-dec: in-process HEVC decoder used by the client.
  *
  * The shim exists so the Rust side never has to mirror libavcodec's private
  * struct layouts: it is compiled against the headers that are actually
@@ -61,7 +61,7 @@ typedef struct LgxDec LgxDec;
 void lgx_dec_close(LgxDec *d);
 void lgx_dec_free_frame(void *handle);
 
-/* backend: 0 = software, 1 = VAAPI, 2 = CUDA/NVDEC */
+/* backend: 0 = software, 1 = VAAPI, 2 = CUDA/NVDEC, 3 = Vulkan Video */
 struct LgxDec {
     AVCodecContext *ctx;
     AVBufferRef *hw;
@@ -90,6 +90,7 @@ static enum AVPixelFormat pick_format(AVCodecContext *ctx, const enum AVPixelFor
     enum AVPixelFormat want = AV_PIX_FMT_NONE;
     if (d && d->backend == 1) want = AV_PIX_FMT_VAAPI;
     if (d && d->backend == 2) want = AV_PIX_FMT_CUDA;
+    if (d && d->backend == 3) want = AV_PIX_FMT_VULKAN;
     if (want != AV_PIX_FMT_NONE) {
         for (const enum AVPixelFormat *p = fmts; *p != AV_PIX_FMT_NONE; p++) {
             if (*p == want) return want;
@@ -122,15 +123,18 @@ LgxDec *lgx_dec_open(int backend, const char *device, int want_dmabuf, int threa
     d->backend = backend;
     d->ctx->opaque = d;
 
-    if (backend == 1 || backend == 2) {
-        enum AVHWDeviceType type = backend == 1 ? AV_HWDEVICE_TYPE_VAAPI : AV_HWDEVICE_TYPE_CUDA;
+    if (backend == 1 || backend == 2 || backend == 3) {
+        enum AVHWDeviceType type = backend == 1 ? AV_HWDEVICE_TYPE_VAAPI
+                                  : backend == 2 ? AV_HWDEVICE_TYPE_CUDA
+                                                 : AV_HWDEVICE_TYPE_VULKAN;
+        const char *hw_name = backend == 1 ? "VAAPI" : backend == 2 ? "CUDA" : "Vulkan";
         const char *dev = (device && device[0]) ? device : NULL;
         if (av_hwdevice_ctx_create(&d->hw, type, dev, NULL, 0) < 0) {
             snprintf(
                 d->err,
                 sizeof(d->err),
                 "cannot open the %s device%s%s",
-                backend == 1 ? "VAAPI" : "CUDA",
+                hw_name,
                 dev ? " " : "",
                 dev ? dev : ""
             );

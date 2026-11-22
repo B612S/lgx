@@ -11,6 +11,7 @@
 //! The swapchain is created from SDL's Vulkan surface; presentation is
 //! immediate unless vsync is requested.
 
+use std::collections::HashMap;
 use std::ffi::{c_char, CStr, CString};
 
 use ash::vk;
@@ -101,6 +102,9 @@ pub struct Renderer {
     device: ash::Device,
     physical: vk::PhysicalDevice,
     queue: vk::Queue,
+    /// Video decode queue (family, queue) when the device was created with
+    /// `VK_KHR_video_queue`/`VK_KHR_video_decode_queue`/`VK_KHR_video_decode_h265`.
+    video_decode: Option<(u32, vk::Queue)>,
     swapchain_loader: ash::khr::swapchain::Device,
     swapchain: vk::SwapchainKHR,
     format: vk::Format,
@@ -126,6 +130,12 @@ pub struct Renderer {
     /// (offset, width) of every card in the OSD atlas, and atlas height.
     osd_cards: Vec<(u32, u32)>,
     osd_height: u32,
+    osd_scale: f32,
+    /// Index of the runtime statistics card in `osd_cards`.
+    osd_dynamic: usize,
+    /// The staging buffer holds a new statistics card waiting for the next
+    /// frame's command buffer.
+    osd_staged: bool,
     osd_draw: Option<(usize, f32)>,
     osd_desc_layout: vk::DescriptorSetLayout,
     osd_desc_pool: vk::DescriptorPool,
@@ -144,6 +154,11 @@ pub struct Renderer {
     dmabuf_fd: Option<ash::khr::external_memory_fd::Device>,
     /// Frame imported for the current dma-buf frame, if any.
     dmabuf: Option<ImportedFrame>,
+    /// Imported images kept per native DPB slot, so a native frame is
+    /// imported once per slot instead of every frame.
+    dmabuf_cache: HashMap<u64, ImportedFrame>,
+    /// Cache key of the imported frame currently in `dmabuf` (0 = ephemeral).
+    dmabuf_key: u64,
     /// Set after the first failed import: every later dma-buf frame is
     /// downloaded instead of retried, so a driver that cannot import this
     /// modifier still shows the picture.
@@ -293,10 +308,33 @@ impl Renderer {
             if dmabuf_capable { "available" } else { "unavailable" }
         );
 
+        let video_exts = [
+            ash::khr::video_queue::NAME,
+            ash::khr::video_decode_queue::NAME,
+            ash::khr::video_decode_h265::NAME,
+        ];
+        let video_available = video_exts.iter().all(|name| has(name));
+        let qfs = instance.get_physical_device_queue_family_properties(pd);
+        let video_family = if video_available {
+            qfs.iter()
+                .position(|q| q.queue_flags.contains(vk::QueueFlags::VIDEO_DECODE_KHR))
+                .map(|i| i as u32)
+        } else {
+            None
+        };
         let priority = [1.0f32];
-        let queue_info = [vk::DeviceQueueCreateInfo::default()
+        let mut queue_info = vec![vk::DeviceQueueCreateInfo::default()
             .queue_family_index(family)
             .queue_priorities(&priority)];
+        if let Some(vf) = video_family {
+            if vf != family {
+                queue_info.push(
+                    vk::DeviceQueueCreateInfo::default()
+                        .queue_family_index(vf)
+                        .queue_priorities(&priority),
+                );
+            }
+        }
         let mut device_exts = vec![ash::khr::swapchain::NAME.as_ptr()];
         if dmabuf_capable {
             device_exts.push(ash::khr::external_memory_fd::NAME.as_ptr());
@@ -304,6 +342,12 @@ impl Renderer {
             device_exts.push(ash::ext::image_drm_format_modifier::NAME.as_ptr());
         }
         let mut dmabuf_capable = dmabuf_capable;
+        let mut video_enabled = video_available && video_family.is_some();
+        if video_enabled {
+            for name in video_exts {
+                device_exts.push(name.as_ptr());
+            }
+        }
         let device = match instance.create_device(
             pd,
             &vk::DeviceCreateInfo::default()
@@ -312,11 +356,14 @@ impl Renderer {
             None,
         ) {
             Ok(device) => device,
-            // Enabling the import extensions must never cost the window: if
-            // the driver refuses them, recreate the device for the CPU path.
-            Err(e) if dmabuf_capable => {
-                eprintln!("lgx-client: dma-buf device extensions were rejected ({e:?}); using NV12 uploads");
+            // Enabling the optional extensions must never cost the window: if
+            // the driver refuses them, recreate the device without them.
+            Err(e) if video_enabled || dmabuf_capable => {
+                eprintln!(
+                    "lgx-client: optional device extensions were rejected ({e:?}); using the CPU path"
+                );
                 dmabuf_capable = false;
+                video_enabled = false;
                 let minimal = [ash::khr::swapchain::NAME.as_ptr()];
                 instance
                     .create_device(
@@ -331,6 +378,14 @@ impl Renderer {
             Err(e) => return Err(format!("vkCreateDevice: {e:?}")),
         };
         let queue = device.get_device_queue(family, 0);
+        let video_decode = if video_enabled {
+            video_family.map(|vf| (vf, device.get_device_queue(vf, 0)))
+        } else {
+            None
+        };
+        if let Some((vf, _)) = video_decode {
+            eprintln!("lgx-client: native Vulkan Video queue family {vf} available");
+        }
         let swapchain_loader = ash::khr::swapchain::Device::new(&instance, &device);
         let dmabuf_fd = if dmabuf_capable {
             Some(ash::khr::external_memory_fd::Device::new(&instance, &device))
@@ -533,6 +588,7 @@ impl Renderer {
             device,
             physical: pd,
             queue,
+            video_decode,
             swapchain_loader,
             swapchain,
             format: format.format,
@@ -557,6 +613,9 @@ impl Renderer {
             osd_ready: false,
             osd_cards,
             osd_height,
+            osd_scale: scale,
+            osd_dynamic: crate::osd::STATS_CARD,
+            osd_staged: false,
             osd_draw: None,
             osd_desc_layout,
             osd_desc_pool,
@@ -573,6 +632,8 @@ impl Renderer {
             dmabuf_capable,
             dmabuf_fd,
             dmabuf: None,
+            dmabuf_cache: HashMap::new(),
+            dmabuf_key: 0,
             dmabuf_disabled: false,
             dmabuf_logged: false,
             desc_dmabuf: false,
@@ -588,6 +649,36 @@ impl Renderer {
     /// `LGX_NO_DMABUF=1` forces the CPU upload path without touching the rest
     /// of the renderer, which is the escape hatch if an import ever renders
     /// incorrectly on a driver.
+    /// Whether this device advertises Vulkan Video H.265 decode. FFmpeg opens
+    /// its own decode device, so only the physical-device extensions matter
+    /// here; the decoder falls back when session creation fails.
+    /// Whether the client's Vulkan device was created with the native video
+    /// decode extensions and a video decode queue.
+    pub fn video_decode_queue(&self) -> Option<(u32, vk::Queue)> {
+        self.video_decode
+    }
+
+    pub fn video_decode_supported(&self) -> bool {
+        let available: Vec<String> = unsafe {
+            self.instance
+                .enumerate_device_extension_properties(self.physical)
+                .map(|v| {
+                    v.iter()
+                        .map(|e| {
+                            CStr::from_ptr(e.extension_name.as_ptr())
+                                .to_string_lossy()
+                                .into_owned()
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let has = |name: &std::ffi::CStr| available.iter().any(|e| e == &name.to_string_lossy());
+        has(ash::vk::KHR_VIDEO_QUEUE_NAME)
+            && has(ash::vk::KHR_VIDEO_DECODE_QUEUE_NAME)
+            && has(ash::vk::KHR_VIDEO_DECODE_H265_NAME)
+    }
+
     pub fn can_import_dmabuf(&self) -> bool {
         self.dmabuf_capable && std::env::var_os("LGX_NO_DMABUF").is_none()
     }
@@ -598,6 +689,108 @@ impl Renderer {
 
     pub fn set_osd(&mut self, osd: Option<(usize, f32)>) {
         self.osd_draw = osd;
+    }
+
+    /// Renders `text` into the reserved statistics card and stages an OSD
+    /// atlas upload for the next frame. Called at most once per second while
+    /// the card is visible.
+    pub fn set_osd_text(&mut self, text: &str) -> bool {
+        if !self.osd_ready {
+            return false;
+        }
+        let Some(&(offset, width)) = self.osd_cards.get(self.osd_dynamic) else {
+            return false;
+        };
+        let Some((w, h, rgba)) = crate::osd::render_card(text, self.osd_scale, width) else {
+            return false;
+        };
+        if w != width || h != self.osd_height {
+            return false;
+        }
+        unsafe {
+            let row = (self.osd_tex.width * 4) as usize;
+            let card_row = (w * 4) as usize;
+            for y in 0..h as usize {
+                let src = rgba.as_ptr().add(y * card_row);
+                let dst = self.osd_stage.ptr.add(y * row + offset as usize * 4);
+                std::ptr::copy_nonoverlapping(src, dst, card_row);
+            }
+        }
+        // The copy is recorded into the next frame's command buffer (`present`),
+        // so the presenter never has to wait for the queue.
+        self.osd_staged = true;
+        true
+    }
+
+    /// Records the staged OSD atlas update into the frame command buffer,
+    /// right after the in-flight fence was waited (so the previous frame's
+    /// sampling of the texture is complete).
+    unsafe fn upload_osd_update(&mut self, cmd: vk::CommandBuffer) {
+        let range = vk::ImageSubresourceRange::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .base_mip_level(0)
+            .level_count(1)
+            .base_array_layer(0)
+            .layer_count(1);
+        let to_dst = vk::ImageMemoryBarrier::default()
+            .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(self.osd_tex.image)
+            .subresource_range(range)
+            .src_access_mask(vk::AccessFlags::SHADER_READ)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+        let to_read = vk::ImageMemoryBarrier::default()
+            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(self.osd_tex.image)
+            .subresource_range(range)
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ);
+        let region = [vk::BufferImageCopy::default()
+            .buffer_offset(0)
+            .buffer_row_length(0)
+            .buffer_image_height(0)
+            .image_subresource(
+                vk::ImageSubresourceLayers::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .mip_level(0)
+                    .base_array_layer(0)
+                    .layer_count(1),
+            )
+            .image_extent(vk::Extent3D {
+                width: self.osd_tex.width,
+                height: self.osd_tex.height,
+                depth: 1,
+            })];
+        self.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[to_dst],
+        );
+        self.device.cmd_copy_buffer_to_image(
+            cmd,
+            self.osd_stage.buffer,
+            self.osd_tex.image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &region,
+        );
+        self.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[to_read],
+        );
     }
 
     /// Clears the window once so it never shows undefined memory.
@@ -616,7 +809,33 @@ impl Renderer {
                 if self.dmabuf_disabled || self.dmabuf_fd.is_none() {
                     return self.draw_downloaded(frame, win);
                 }
-                if let Err(e) = self.import_dmabuf(frame, d) {
+                if d.cache_key != 0 {
+                    if self.dmabuf_key != d.cache_key {
+                        self.drop_import();
+                        if let Some(imported) = self.dmabuf_cache.remove(&d.cache_key) {
+                            write_view_descriptors(
+                                &self.device,
+                                self.desc_set,
+                                imported.views[0],
+                                imported.views[1],
+                                self.sampler,
+                            );
+                            self.desc_dmabuf = true;
+                            self.dmabuf = Some(imported);
+                            self.dmabuf_key = d.cache_key;
+                        } else if let Err(e) = self.import_dmabuf(frame, d) {
+                            eprintln!("lgx-client: dma-buf import failed: {e}");
+                            eprintln!(
+                                "lgx-client: falling back to CPU NV12 uploads (set LGX_NO_DMABUF=1 to skip import attempts)"
+                            );
+                            self.dmabuf_disabled = true;
+                            self.drop_import();
+                            return self.draw_downloaded(frame, win);
+                        } else {
+                            self.dmabuf_key = d.cache_key;
+                        }
+                    }
+                } else if let Err(e) = self.import_dmabuf(frame, d) {
                     // A failed import must never leave a black window: log the
                     // reason once and keep presenting this and every later
                     // dma-buf frame through the CPU upload path.
@@ -911,7 +1130,19 @@ impl Renderer {
             self.desc_dmabuf = false;
         }
         if let Some(old) = self.dmabuf.take() {
-            destroy_imported(&self.device, old);
+            if self.dmabuf_key != 0 {
+                if self.dmabuf_cache.len() >= 4 {
+                    if let Some((&key, _)) = self.dmabuf_cache.iter().next() {
+                        if let Some(old) = self.dmabuf_cache.remove(&key) {
+                            destroy_imported(&self.device, old);
+                        }
+                    }
+                }
+                self.dmabuf_cache.insert(self.dmabuf_key, old);
+            } else {
+                destroy_imported(&self.device, old);
+            }
+            self.dmabuf_key = 0;
         }
     }
 
@@ -944,6 +1175,7 @@ impl Renderer {
         if let Some(old) = self.dmabuf.take() {
             destroy_imported(&self.device, old);
         }
+        self.dmabuf_key = 0;
 
         let imported = self.build_import(&layers, d.modifier)?;
         write_view_descriptors(
@@ -1460,6 +1692,9 @@ impl Renderer {
 
         if !self.osd_ready {
             self.upload_osd(cmd)?;
+        } else if self.osd_staged {
+            self.upload_osd_update(cmd);
+            self.osd_staged = false;
         }
 
         if upload {
@@ -1660,6 +1895,9 @@ impl Drop for Renderer {
         unsafe {
             let _ = self.device.device_wait_idle();
             if let Some(imported) = self.dmabuf.take() {
+                destroy_imported(&self.device, imported);
+            }
+            for (_, imported) in self.dmabuf_cache.drain() {
                 destroy_imported(&self.device, imported);
             }
             self.device.destroy_sampler(self.sampler, None);

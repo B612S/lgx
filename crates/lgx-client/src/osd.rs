@@ -7,6 +7,7 @@
 
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::OnceLock;
 
 use freetype::face::LoadFlag;
 use freetype::{Face, Library};
@@ -29,6 +30,9 @@ pub const POINTER_CAPTURED: usize = 2;
 pub const POINTER_RELEASED: usize = 3;
 pub const FULLSCREEN_ON: usize = 4;
 pub const FULLSCREEN_OFF: usize = 5;
+/// Reserved slot for a live statistics card; its pixels are uploaded at
+/// runtime (see `render_card`).
+pub const STATS_CARD: usize = 6;
 pub const CARDS: [&str; 6] = [
     "Background audio: On",
     "Background audio: Off",
@@ -130,10 +134,27 @@ fn xft_dpi() -> Option<f32> {
     None
 }
 
-fn system_font(scale: f32) -> Option<(SystemFont, String, f32)> {
+/// Everything needed to recreate the font without running fontconfig again.
+/// `fc-match`/`xrdb` subprocesses cost milliseconds; the live statistics card
+/// re-renders once per second and must not stall the presenter.
+struct FontSpec {
+    path: PathBuf,
+    family: String,
+    point: f32,
+    dpi: u32,
+    hint_flags: LoadFlag,
+}
+
+static FONT_SPEC: OnceLock<Option<FontSpec>> = OnceLock::new();
+
+fn font_spec(scale: f32) -> Option<&'static FontSpec> {
+    FONT_SPEC.get_or_init(|| resolve_font_spec(scale)).as_ref()
+}
+
+fn resolve_font_spec(scale: f32) -> Option<FontSpec> {
     let (family, point) = kdeglobals_font()
         .unwrap_or_else(|| ("sans-serif".to_string(), DEFAULT_POINT_SIZE));
-    let dpi = xft_dpi().unwrap_or(96.0 * scale.max(0.5));
+    let dpi = xft_dpi().unwrap_or(96.0 * scale.max(0.5)).round() as u32;
     let hint_style = fc_attr(&family, "%{hintstyle}")
         .and_then(|v| v.parse::<i32>().ok())
         .unwrap_or(1);
@@ -162,23 +183,32 @@ fn system_font(scale: f32) -> Option<(SystemFont, String, f32)> {
         };
         let char_height = (point * 64.0).round() as isize;
         if face
-            .set_char_size(0, char_height, dpi.round() as u32, dpi.round() as u32)
+            .set_char_size(0, char_height, dpi, dpi)
             .is_err()
         {
             continue;
         }
-        let pixels = face
-            .size_metrics()
-            .map(|m| m.x_ppem as f32)
-            .filter(|p| *p > 0.0)
-            .unwrap_or(point * dpi / 72.0);
-        return Some((
-            SystemFont { _library: library, face, pixels, hint_flags },
-            family,
-            point,
-        ));
+        return Some(FontSpec { path, family, point, dpi, hint_flags });
     }
     None
+}
+
+fn system_font(scale: f32) -> Option<(SystemFont, String, f32)> {
+    let spec = font_spec(scale)?;
+    let library = Library::init().ok()?;
+    let face = library.new_face(&spec.path, 0).ok()?;
+    face.set_char_size(0, (spec.point * 64.0).round() as isize, spec.dpi, spec.dpi)
+        .ok()?;
+    let pixels = face
+        .size_metrics()
+        .map(|m| m.x_ppem as f32)
+        .filter(|p| *p > 0.0)
+        .unwrap_or(spec.point * spec.dpi as f32 / 72.0);
+    Some((
+        SystemFont { _library: library, face, pixels, hint_flags: spec.hint_flags },
+        spec.family.clone(),
+        spec.point,
+    ))
 }
 
 fn glyph(font: &SystemFont, ch: char, render: bool) -> (i32, i32, i32, Vec<u8>) {
@@ -321,17 +351,35 @@ fn card_width(font: &SystemFont, text: &str) -> u32 {
     text_width(font, text).ceil() as u32 + PAD_X * 2
 }
 
+/// Width reserved for the live statistics card, scaled with the display.
+pub fn stats_card_width(scale: f32) -> u32 {
+    (420.0 * scale.max(0.5)).round().max(200.0) as u32
+}
+
+/// Render one card into a standalone RGBA buffer of exactly `width` pixels.
+/// Used for the runtime statistics card; the atlas reserves a slot of the same
+/// width so the renderer only has to re-upload that strip.
+pub fn render_card(text: &str, scale: f32, width: u32) -> Option<(u32, u32, Vec<u8>)> {
+    let (font, _, _) = system_font(scale)?;
+    let mut rgba = vec![0u8; (width * CARD_H * 4) as usize];
+    draw_card(&mut rgba, width, 0, width, text, &font);
+    Some((width, CARD_H, rgba))
+}
+
 pub fn atlas(scale: f32) -> Option<Atlas> {
     let (font, family, point) = system_font(scale)?;
     eprintln!("lgx-client: OSD font {family}, {point} pt ({} px)", font.pixels);
-    let widths: Vec<u32> = CARDS.iter().map(|t| card_width(&font, t)).collect();
+    let mut widths: Vec<u32> = CARDS.iter().map(|t| card_width(&font, t)).collect();
+    widths.push(stats_card_width(scale));
     let card_h = CARD_H;
     let width: u32 = widths.iter().sum();
     let mut rgba = vec![0u8; (width * card_h * 4) as usize];
-    let mut cards = Vec::with_capacity(CARDS.len());
+    let mut cards = Vec::with_capacity(widths.len());
     let mut offset = 0;
-    for (text, w) in CARDS.iter().zip(widths.iter()) {
-        draw_card(&mut rgba, width, offset, *w, text, &font);
+    for (i, w) in widths.iter().enumerate() {
+        if i < CARDS.len() {
+            draw_card(&mut rgba, width, offset, *w, CARDS[i], &font);
+        }
         cards.push((offset, *w));
         offset += *w;
     }
@@ -350,7 +398,8 @@ mod tests {
     #[test]
     fn atlas_uses_a_system_font() {
         let atlas = atlas(1.0).expect("OSD atlas");
-        assert_eq!(atlas.cards.len(), CARDS.len());
+        assert_eq!(atlas.cards.len(), CARDS.len() + 1);
+        assert_eq!(atlas.cards[STATS_CARD].1, stats_card_width(1.0));
         assert_eq!(atlas.width, atlas.cards.iter().map(|c| c.1).sum());
         assert_eq!(atlas.rgba.len(), (atlas.width * atlas.height * 4) as usize);
         assert!(atlas.cards.iter().all(|c| c.1 > 0));
