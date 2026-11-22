@@ -578,6 +578,17 @@ the Vulkan shader converts full-range BT.709, and the HEVC VUI says
   client against the Linux VM at 1080p160 decodes 155 fps at p50/p99 3.6/5.1
   ms. A deeper queue alone (64) also decodes everything but at p99 ~240 ms,
   so the eviction policy, not the depth, is what keeps latency down.
+- **Encoder quality without a display.** `lgx-vtenc --selftest --out FILE`
+  encodes 120 frames of a deterministic pattern (luma `(col/8 + frame*3) % 200
+  + 20`, chroma 128, frame index starting at 1) through the same VideoToolbox
+  session, so the quality knob can be checked on a headless Mac: demux the
+  `u32 BE length, u64 BE timestamp, AU` records, decode with
+  `ffmpeg -f hevc -i FILE -f rawvideo -pix_fmt yuv420p`, and compare against
+  the pattern. Measured at 1080x720: quality 0.7 gives 76 742 bytes for 120
+  frames at PSNR mean 33.8 dB (max 62.1), quality 0.3 gives 61 832 bytes at
+  32.8 dB (max 50.0) — the knob moves quality in the right direction, and the
+  transport changes (duplicate frames skipped, longer keyframe interval) never
+  alter the encoder's quality setting.
 - `lgx-vtenc` logs `SCK x fps (y unique), encoded z fps, encode errors n`
   every 5 s and whether VideoToolbox chose the hardware encoder. `unique`
   counts callbacks with a new presentation timestamp; `encoded` should equal
