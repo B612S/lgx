@@ -630,6 +630,9 @@ pub fn spawn(
             );
 
             let mut pts = 0i64;
+            let mut pushes = 0u64;
+            let mut refused = 0u64;
+            let mut dec_t0 = std::time::Instant::now();
             loop {
                 let chunk = match pending.take() {
                     Some(chunk) => chunk,
@@ -641,8 +644,12 @@ pub fn spawn(
                 // A packet can be refused until pending frames are pulled.
                 loop {
                     match dec.push(&chunk.data[chunk.off..], pts) {
-                        Ok(true) => break,
+                        Ok(true) => {
+                            pushes += 1;
+                            break;
+                        }
                         Ok(false) => {
+                            refused += 1;
                             if let Err(e) = drain(&mut dec, &sink, chunk.at, chunk.capture_us, &wake) {
                                 fail(&sink, e);
                                 return;
@@ -658,6 +665,17 @@ pub fn spawn(
                 if let Err(e) = drain(&mut dec, &sink, chunk.at, chunk.capture_us, &wake) {
                     fail(&sink, e);
                     return;
+                }
+                if std::env::var_os("LGX_DEBUG_DEC").is_some() && dec_t0.elapsed().as_secs() >= 2
+                {
+                    eprintln!(
+                        "lgx-client: dec push {pushes} refused {refused} published {} overwritten {}",
+                        sink.decoded.load(Ordering::Relaxed),
+                        sink.dropped.load(Ordering::Relaxed)
+                    );
+                    pushes = 0;
+                    refused = 0;
+                    dec_t0 = std::time::Instant::now();
                 }
             }
             sink.stopped.store(true, Ordering::Relaxed);

@@ -1034,7 +1034,23 @@ fn serve(args: &Args, secure: Arc<Secure>) -> std::io::Result<()> {
             send_secs = 0.0;
         }
         match rx.recv_timeout(Duration::from_millis(250)) {
-            Ok((au, capture_us)) => {
+            Ok((mut au, mut capture_us)) => {
+                // Coalesce a burst to its newest frame. VideoToolbox hands over
+                // several frames at once when it catches up; sending them all
+                // overruns the client's queue and every dropped frame poisons
+                // its decoder until the next keyframe. Keep the newest, ask for
+                // an IDR so the reference chain is fresh, and stay at the live
+                // edge.
+                let mut skipped = 0u64;
+                while let Ok((next_au, next_ts)) = rx.try_recv() {
+                    au = next_au;
+                    capture_us = next_ts;
+                    skipped += 1;
+                }
+                if skipped > 0 {
+                    late += skipped;
+                    need_idr.store(true, Ordering::Relaxed);
+                }
                 if capture_us != 0 {
                     let age = monotonic_us().saturating_sub(capture_us);
                     max_age_ms = max_age_ms.max(age / 1000);
