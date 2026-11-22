@@ -305,7 +305,18 @@ int main(int argc, char **argv) {
     const char *ad = getenv("LGX_ASYNC_DEPTH");
     if (ad && atoi(ad) >= 1) async_depth = atoi(ad);
     av_opt_set_int(enc->priv_data, "async_depth", async_depth, 0);
-    av_opt_set_int(enc->priv_data, "rc_mode", 2, 0);
+    /* VBR (3) spends bits only on the content that changed, while CBR pads a
+     * static desktop up to the target rate (measured 4.7 MiB/s vs 1.2 MiB/s
+     * at 1080p160). rc_max_rate keeps motion at the configured ceiling.
+     * LGX_RC_MODE overrides the mode: 0 auto, 1 CQP, 2 CBR, 3 VBR, 4 ICQ. */
+    int rc_mode = 3;
+    const char *rm = getenv("LGX_RC_MODE");
+    if (rm && atoi(rm) >= 0 && atoi(rm) <= 4) rc_mode = atoi(rm);
+    av_opt_set_int(enc->priv_data, "rc_mode", rc_mode, 0);
+    if (rc_mode >= 3) {
+        enc->rc_max_rate = bitrate;
+        enc->rc_buffer_size = bitrate;
+    }
     /* VDENC (low_power) is the fast path on Gen12+; it is a little less
      * flexible than the default encoder but much cheaper per frame. */
     int low_power = 1;

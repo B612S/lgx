@@ -463,6 +463,11 @@ impl Stream {
         let mut last_progress = Instant::now();
         let mut capture_errors = 0u32;
         let mut skipped = 0u64;
+        let mut damage_changed = 0u64;
+        let mut damage_unknown = 0u64;
+        // Digest of the picture the client currently has. Only a frame whose
+        // content differs from this one has to be encoded.
+        let mut sent_digest: Option<u64> = None;
         // A static desktop is the common case; skipping its frames is the
         // difference between the CBR rate and ~0 bytes/s. The escape hatch
         // exists for bisecting compositors that misreport damage.
@@ -526,13 +531,37 @@ impl Stream {
             // has it, so skip the VPP import and the encode. A forced keyframe
             // overrides this, otherwise a client that connects while the
             // desktop is idle would never receive its first IDR.
-            if skip_idle && !force_send && self.cap.state.frame_changed == Some(false) {
+            match self.cap.state.frame_changed {
+                Some(true) => damage_changed += 1,
+                None => damage_unknown += 1,
+                Some(false) => {}
+            }
+            if std::env::var_os("LGX_DEBUG_DAMAGE").is_some()
+                && (damage_changed + damage_unknown + skipped).is_multiple_of(160)
+            {
+                eprintln!(
+                    "lgx-server: damage changed={damage_changed} none={skipped} unknown={damage_unknown}"
+                );
+            }
+            let digest = if self.cap.state.frame_changed == Some(false) {
+                None
+            } else {
+                self.cap.frame_digest()
+            };
+            let unchanged = match digest {
+                Some(digest) => sent_digest == Some(digest),
+                None => self.cap.state.frame_changed == Some(false),
+            };
+            if skip_idle && !force_send && unchanged {
                 skipped += 1;
                 // The encoder is not stuck, the picture just did not change;
                 // the no-packet watchdog must not fire.
                 last_progress = Instant::now();
                 capture::throttle(loop_start, self.fps);
                 continue;
+            }
+            if digest.is_some() {
+                sent_digest = digest;
             }
             let capture_us = time::monotonic_us();
             let wait_ms = t_wait.elapsed().as_secs_f64() * 1000.0;

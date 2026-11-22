@@ -38,6 +38,45 @@ extern "C" {
     fn gbm_bo_get_fd_for_plane(bo: *mut c_void, plane: i32) -> i32;
 }
 
+/// `struct dma_buf_sync` from `linux/dma-buf.h`.
+#[repr(C)]
+struct DmaBufSync {
+    flags: u64,
+}
+
+const DMA_BUF_SYNC_READ: u64 = 1;
+const DMA_BUF_SYNC_END: u64 = 1 << 2;
+/// `_IOW('b', 0, struct dma_buf_sync)`
+const DMA_BUF_IOCTL_SYNC: libc::c_ulong = 0x4008_6200;
+
+/// Map a capture buffer for CPU reads. Tiled buffers are mapped too: the
+/// digest only needs stable bytes, and reading a Y-tiled plane sequentially
+/// covers the whole picture. A buffer the driver refuses to map yields `None`
+/// and the caller falls back to encoding every frame.
+fn map_dmabuf(fd: RawFd, stride: u32, height: u32) -> Option<&'static [u8]> {
+    let size = match unsafe { libc::lseek(fd, 0, libc::SEEK_END) } {
+        n if n > 0 => n as usize,
+        _ => (stride as usize) * (height as usize),
+    };
+    if size == 0 {
+        return None;
+    }
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            size,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            fd,
+            0,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        return None;
+    }
+    Some(unsafe { std::slice::from_raw_parts(ptr as *const u8, size) })
+}
+
 /// Unique per allocated buffer. The VPP helper caches imported surfaces by
 /// this id; an fd number would be reused by the kernel and could alias.
 static NEXT_BUFFER_ID: AtomicU32 = AtomicU32::new(1);
@@ -196,6 +235,25 @@ pub unsafe fn plane_stride(bo: *mut c_void, plane: i32) -> u32 {
 }
 
 impl GbmBuffer {
+    /// Acquire the producer's implicit fence and make the CPU mapping
+    /// coherent. Returns false on a device without dma-buf sync support.
+    pub fn begin_cpu_access(&self) -> bool {
+        let sync = DmaBufSync {
+            flags: DMA_BUF_SYNC_READ,
+        };
+        unsafe { libc::ioctl(self.fd, DMA_BUF_IOCTL_SYNC, &sync) == 0 }
+    }
+
+    /// Release the CPU mapping again (the kernel may need to migrate it).
+    pub fn end_cpu_access(&self) {
+        let sync = DmaBufSync {
+            flags: DMA_BUF_SYNC_READ | DMA_BUF_SYNC_END,
+        };
+        unsafe {
+            libc::ioctl(self.fd, DMA_BUF_IOCTL_SYNC, &sync);
+        }
+    }
+
     /// Raw gbm_device, needed to create an EGL display.
     pub fn device(&self) -> *mut c_void {
         self.dev
@@ -224,6 +282,7 @@ impl GbmBuffer {
         }
         let stride = unsafe { gbm_bo_get_stride(bo) };
         let modifier = unsafe { gbm_bo_get_modifier(bo) };
+        let map = map_dmabuf(dmabuf_fd, stride, height);
         Ok(Self {
             dev,
             bo,
@@ -233,7 +292,7 @@ impl GbmBuffer {
             modifier,
             width,
             height,
-            map: None,
+            map,
         })
     }
 

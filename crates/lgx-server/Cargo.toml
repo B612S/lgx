@@ -20,3 +20,4 @@ pipewire = { version = "0.10", features = ["v0_3_49"] }
 ashpd = { version = "0.14.3", default-features = false, features = ["screencast", "async-io"] }
 futures-lite = "2"
 ringbuf = "0.4"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }

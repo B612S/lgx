@@ -241,6 +241,23 @@ impl Capture {
         self.finish()
     }
 
+    /// Digest of the picture that `next_frame` just completed.
+    ///
+    /// Compositors that report the whole frame as damaged on every copy
+    /// (Hyprland does; its screencopy has a TODO for a real damage ring) make
+    /// the damage event useless for idle detection, so the capture buffer is
+    /// hashed instead. `None` when the buffer has no CPU mapping, in which
+    /// case every frame has to be encoded.
+    pub fn frame_digest(&self) -> Option<u64> {
+        let slot = 1 - self.state.cur;
+        let (_, gbm) = self.state.gbm_bufs[slot].as_ref()?;
+        let map = gbm.map?;
+        gbm.begin_cpu_access();
+        let digest = xxhash_rust::xxh3::xxh3_64(map);
+        gbm.end_cpu_access();
+        Some(digest)
+    }
+
     pub fn next_frame(&mut self) -> io::Result<()> {
         self.finish()?;
         self.request()?;

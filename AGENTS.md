@@ -80,6 +80,25 @@ Commit format: `area: short imperative summary`, for example
   `LGX_NO_VPP=1` falls back to the `glconv` RGB->NV12 path. AMD uses the GL
   path by default because its VPP RGB import is unverified; linear capture
   buffers are requested there, never the Intel Y-tiled modifier.
+- **Idle frames are not re-encoded.** A wlr session is captured continuously,
+  so a static desktop used to be encoded and resent forever. `capture.rs` asks
+  screencopy v2+ for the damage report and skips the encode when the
+  compositor saw no damage. Hyprland reports the whole frame as damaged on
+  every copy (its screencopy has a TODO for a real damage ring), so the
+  capture buffer is additionally hashed (xxh3 over the CPU mapping of the
+  dma-buf, wrapped in `DMA_BUF_IOCTL_SYNC`) and compared with the digest of
+  the frame that was actually sent. A pending keyframe always encodes, or a
+  client that connects while the desktop is idle would never get its IDR.
+  Skipped frames do not trip the 5 s no-packet watchdog.
+  `LGX_NO_DAMAGE_SKIP=1` disables the skip. The CPU mapping costs one 8 KiB
+  memcpy worth of bandwidth per 1080p frame; if a compositor cannot map the
+  buffer the server simply encodes every frame.
+- **VAAPI rate control is VBR by default** (`rc_mode=3`, `rc_max_rate` and
+  `rc_buffer_size` at the configured bitrate). CBR pads a static desktop up to
+  the target, so an idle 1080p160 session cost 4.7 MiB/s; VBR costs 1.2 MiB/s
+  with the same encode time and no fps loss. `LGX_RC_MODE` overrides the mode
+  (0 auto, 1 CQP, 2 CBR, 3 VBR, 4 ICQ). NVENC still requests CBR until its
+  VBR path is verified on NVIDIA hardware.
 - The helper is a separate process because it owns the VAAPI/VPP surfaces.
   With VPP the server only sends the captured frame fd and metadata; the GL
   fallback renders into the helper's dma-bufs.
