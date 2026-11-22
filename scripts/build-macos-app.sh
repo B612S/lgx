@@ -74,8 +74,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleIconFile</key><string>lgx.icns</string>
     <key>CFBundleIconName</key><string>AppIcon</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>0.2</string>
-    <key>CFBundleVersion</key><string>2</string>
+    <key>CFBundleShortVersionString</key><string>0.5.0</string>
+    <key>CFBundleVersion</key><string>5</string>
     <key>LSMinimumSystemVersion</key><string>14.2</string>
     <key>LSUIElement</key><true/>
     <key>NSHighResolutionCapable</key><true/>

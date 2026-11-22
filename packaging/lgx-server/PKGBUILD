@@ -1,14 +1,14 @@
 # Maintainer: B612S
 # Build with packaging/build.sh; bump pkgrel on every rebuild.
 pkgname=lgx-server
-pkgver=0.4.0
-pkgrel=18
+pkgver=0.5.0
+pkgrel=2
 pkgdesc='lgx: zero-copy HEVC streaming of a wlroots session (server)'
 arch=('x86_64')
 url='https://github.com/B612S/lgx'
 license=('MIT')
-depends=('gcc-libs' 'ffmpeg' 'libva' 'wl-clipboard' 'pipewire' 'libpulse')
-makedepends=('cargo' 'rust' 'ffmpeg' 'libva')
+depends=('gcc-libs' 'ffmpeg' 'libva' 'wl-clipboard' 'pipewire' 'mesa')
+makedepends=('cargo' 'rust' 'ffmpeg' 'libva' 'mesa' 'pipewire')
 source=("lgx-$pkgver.tar.gz")
 sha256sums=('SKIP')
 
@@ -20,6 +20,7 @@ build() {
   cargo build --release --locked -p lgx-server
   gcc -O2 -o lgx-uinput helper/lgx-uinput.c
   gcc -O2 -o lgx-vaenc helper/lgx-vaenc.c -lavcodec -lavutil -lva -lva-drm
+  gcc -O2 -o lgx-nvenc helper/lgx-nvenc.c -lavcodec -lavutil
 }
 
 package() {
@@ -27,6 +28,7 @@ package() {
   install -Dm755 target/release/lgx-server "$pkgdir/usr/bin/lgx-server"
   install -Dm755 lgx-uinput "$pkgdir/usr/lib/lgx/lgx-uinput"
   install -Dm755 lgx-vaenc "$pkgdir/usr/lib/lgx/lgx-vaenc"
+  install -Dm755 lgx-nvenc "$pkgdir/usr/lib/lgx/lgx-nvenc"
   install -Dm644 packaging/lgx-server/lgx-server.service \
     "$pkgdir/usr/lib/systemd/user/lgx-server.service"
   install -Dm644 packaging/lgx-server/lgx-input.service \

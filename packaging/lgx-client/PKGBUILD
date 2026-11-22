@@ -1,14 +1,14 @@
 # Maintainer: B612S
 # Build with packaging/build.sh; bump pkgrel on every rebuild.
 pkgname=lgx-client
-pkgver=0.4.0
-pkgrel=30
+pkgver=0.5.0
+pkgrel=2
 pkgdesc='lgx: zero-copy HEVC client (NVDEC/VAAPI decode)'
 arch=('x86_64')
 url='https://github.com/B612S/lgx'
 license=('MIT')
-depends=('gcc-libs' 'sdl3' 'ffmpeg' 'vulkan-icd-loader' 'mesa' 'libxkbcommon' 'wl-clipboard' 'pipewire' 'libpulse' 'qt6-base' 'freetype2')
-makedepends=('cargo' 'rust' 'ffmpeg' 'qt6-base' 'pkgconf' 'freetype2')
+depends=('gcc-libs' 'sdl3' 'ffmpeg' 'vulkan-icd-loader' 'mesa' 'libxkbcommon' 'wl-clipboard' 'pipewire' 'qt6-base' 'freetype2')
+makedepends=('cargo' 'rust' 'ffmpeg' 'sdl3' 'pipewire' 'qt6-base' 'pkgconf' 'freetype2')
 source=("lgx-$pkgver.tar.gz")
 sha256sums=('SKIP')
 
@@ -20,12 +20,15 @@ build() {
   cargo build --release --locked -p lgx-client
   g++ -std=c++17 -O2 -fPIC helper/lgx-reconnect-qt.cpp \
     -o lgx-reconnect-qt $(pkg-config --cflags --libs Qt6Widgets)
+  g++ -std=c++17 -O2 -fPIC helper/lgx-resize-qt.cpp \
+    -o lgx-resize-qt $(pkg-config --cflags --libs Qt6Widgets)
 }
 
 package() {
   cd "lgx-$pkgver"
   install -Dm755 target/release/lgx-client "$pkgdir/usr/bin/lgx-client"
   install -Dm755 lgx-reconnect-qt "$pkgdir/usr/bin/lgx-reconnect-qt"
+  install -Dm755 lgx-resize-qt "$pkgdir/usr/bin/lgx-resize-qt"
   install -Dm644 packaging/lgx-client/lgx-client.desktop \
     "$pkgdir/usr/share/applications/lgx-client.desktop"
   install -Dm644 assets/lgx.svg \
