@@ -41,6 +41,8 @@ struct Args {
     audio_listen: String,
     token: Option<String>,
     low_power: bool,
+    /// Skip frames whose content did not change (`video.skip_idle`).
+    skip_idle: bool,
     /// Send HEVC access units over UDP instead of the TCP control stream.
     video_udp: bool,
     /// `cbr`, `vbr` or `cqp` (`video.rc_mode`/`--rc-mode`).
@@ -147,6 +149,7 @@ fn parse_args() -> Result<Args, String> {
         audio_listen,
         token: None,
         low_power: cfg.get_bool("video.low_power").unwrap_or(true),
+        skip_idle: cfg.get_bool("video.skip_idle").unwrap_or(true),
         video_udp: cfg.get_bool("video.udp").unwrap_or(false),
         rc_mode: cfg
             .get("video.rc_mode")
@@ -286,6 +289,8 @@ struct Stream {
     cqp: bool,
     cpu: bool,
     vpp: bool,
+    /// Skip encoding a frame whose content matches the last one sent.
+    skip_idle: bool,
     _target: Option<FdGuard>,
 }
 
@@ -498,6 +503,7 @@ impl Stream {
             cqp: args.rc_mode == "cqp",
             cpu,
             vpp,
+            skip_idle: args.skip_idle,
             _target: target,
         })
     }
@@ -523,9 +529,12 @@ impl Stream {
         // content differs from this one has to be encoded.
         let mut sent_digest: Option<u64> = None;
         // A static desktop is the common case; skipping its frames is the
-        // difference between the CBR rate and ~0 bytes/s. The escape hatch
-        // exists for bisecting compositors that misreport damage.
-        let skip_idle = std::env::var_os("LGX_NO_DAMAGE_SKIP").is_none();
+        // difference between the CBR rate and ~0 bytes/s. The digest costs a
+        // full read of the capture buffer per frame, which is expensive on a
+        // slow CPU, so `video.skip_idle = false` turns both the hash and the
+        // skip off. The env var remains the escape hatch for bisecting.
+        let skip_idle = self.skip_idle
+            && std::env::var_os("LGX_NO_DAMAGE_SKIP").is_none();
         // Test hook: drop the VPP stream's packets so the watchdog exercises
         // the GL fallback. The GL stream (vpp == false) is unaffected.
         let drop_packets = std::env::var_os("LGX_TEST_NO_PACKETS").is_some() && self.vpp;
@@ -600,10 +609,10 @@ impl Stream {
                     "lgx-server: damage changed={damage_changed} none={skipped} unknown={damage_unknown}"
                 );
             }
-            let digest = if self.cap.state.frame_changed == Some(false) {
-                None
-            } else {
+            let digest = if skip_idle && self.cap.state.frame_changed != Some(false) {
                 self.cap.frame_digest()
+            } else {
+                None
             };
             let unchanged = match digest {
                 Some(digest) => sent_digest == Some(digest),
