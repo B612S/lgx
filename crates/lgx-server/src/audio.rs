@@ -13,11 +13,12 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{TcpListener, TcpStream};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use lgx_proto::msg;
 use lgx_proto::secure::{self, Secure};
 use pipewire as pw;
 use pipewire::permissions::PermissionFlags;
@@ -33,7 +34,7 @@ pub const CHANNELS: u32 = 2;
 
 /// Capture state owned by the PipeWire process callback.
 struct Capture {
-    pcm: SyncSender<Vec<u8>>,
+    pcm: SyncSender<(u64, Vec<u8>)>,
     rng: u64,
     /// Chunks the fanout could not take because the client is behind.
     dropped: Arc<AtomicU64>,
@@ -355,7 +356,7 @@ fn watch_default_sink_volume(
 
 struct Client {
     id: String,
-    tx: SyncSender<Vec<u8>>,
+    tx: SyncSender<(u64, Vec<u8>)>,
     secure: Arc<Secure>,
 }
 
@@ -423,7 +424,8 @@ fn capture_thread(
                 let from = cap.last_gain;
                 cap.last_gain = target;
                 f32_to_s16_dithered(pcm_bytes, &mut out, &mut cap.rng, from, target);
-                if cap.pcm.try_send(out).is_err() {
+                let ts_us = crate::time::monotonic_us();
+                if cap.pcm.try_send((ts_us, out)).is_err() {
                     cap.dropped.fetch_add(1, Ordering::Relaxed);
                 }
             })
@@ -487,7 +489,7 @@ struct CaptureHandle {
 }
 
 fn start_capture(clients: &Arc<Mutex<Vec<Client>>>) -> Result<CaptureHandle, String> {
-    let (pcm_tx, pcm_rx) = mpsc::sync_channel::<Vec<u8>>(4);
+    let (pcm_tx, pcm_rx) = mpsc::sync_channel::<(u64, Vec<u8>)>(4);
     let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), String>>(1);
     let dropped = Arc::new(AtomicU64::new(0));
     let gain = Arc::new(AtomicU32::new(1.0f32.to_bits()));
@@ -514,14 +516,14 @@ fn start_capture(clients: &Arc<Mutex<Vec<Client>>>) -> Result<CaptureHandle, Str
     let fanout = std::thread::Builder::new()
         .name("lgx-audio-fanout".into())
         .spawn(move || {
-            while let Ok(chunk) = pcm_rx.recv() {
+            while let Ok((ts_us, chunk)) = pcm_rx.recv() {
                 let lost = fanout_dropped.swap(0, Ordering::Relaxed);
                 if lost > 0 {
                     // Audible as a short gap; loud enough to notice in tests.
                     eprintln!("lgx-server: audio: dropped {lost} chunk(s), client behind");
                 }
                 let mut list = listeners.lock().unwrap();
-                list.retain(|c| match c.tx.try_send(chunk.clone()) {
+                list.retain(|c| match c.tx.try_send((ts_us, chunk.clone())) {
                     Ok(()) | Err(TrySendError::Full(_)) => true,
                     Err(TrySendError::Disconnected(_)) => false,
                 });
@@ -616,7 +618,7 @@ fn handle(
         return Ok(());
     }
 
-    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(4);
+    let (tx, rx) = std::sync::mpsc::sync_channel::<(u64, Vec<u8>)>(4);
     {
         // Start capturing only now: an idle server must not hold a PipeWire
         // stream (and the guest must not keep its sink awake for nobody).
@@ -647,8 +649,34 @@ fn handle(
             secure: secure.clone(),
         });
     }
-    while let Ok(chunk) = rx.recv() {
-        if secure.send_bytes(&chunk).is_err() {
+    // The client opts in to LGXA timestamps with one AUDIO_SYNC message right
+    // after the token. Reading it on a separate thread keeps the first PCM
+    // chunk from waiting; an old client sends nothing and the thread simply
+    // ends with the connection.
+    let timestamped = Arc::new(AtomicBool::new(false));
+    {
+        let reader = secure.clone();
+        let flag = timestamped.clone();
+        std::thread::Builder::new()
+            .name("lgx-audio-sync".into())
+            .spawn(move || {
+                if let Ok((m, _)) = reader.recv_msg() {
+                    if m.typ == msg::AUDIO_SYNC {
+                        flag.store(true, Ordering::Relaxed);
+                    }
+                }
+            })
+            .ok();
+    }
+    while let Ok((ts_us, chunk)) = rx.recv() {
+        let framed;
+        let bytes: &[u8] = if timestamped.load(Ordering::Relaxed) {
+            framed = lgxa_record(ts_us, &chunk);
+            &framed
+        } else {
+            &chunk
+        };
+        if secure.send_bytes(bytes).is_err() {
             break;
         }
     }
@@ -668,6 +696,17 @@ fn handle(
     Ok(())
 }
 
+/// `LGXA` + u64 LE timestamp + u32 LE PCM length + PCM, the framing the
+/// client's A/V sync parser already understands.
+fn lgxa_record(ts_us: u64, pcm: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(16 + pcm.len());
+    out.extend_from_slice(b"LGXA");
+    out.extend_from_slice(&ts_us.to_le_bytes());
+    out.extend_from_slice(&(pcm.len() as u32).to_le_bytes());
+    out.extend_from_slice(pcm);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -678,6 +717,19 @@ mod tests {
 
     fn s16_at(bytes: &[u8], i: usize) -> i16 {
         i16::from_le_bytes([bytes[i * 2], bytes[i * 2 + 1]])
+    }
+
+    #[test]
+    fn lgxa_framing_has_the_documented_layout() {
+        let pcm = [1u8, 2, 3, 4];
+        let rec = super::lgxa_record(0x0102_0304_0506, &pcm);
+        assert_eq!(&rec[..4], b"LGXA");
+        assert_eq!(
+            u64::from_le_bytes(rec[4..12].try_into().unwrap()),
+            0x0102_0304_0506
+        );
+        assert_eq!(u32::from_le_bytes(rec[12..16].try_into().unwrap()), 4);
+        assert_eq!(&rec[16..], &pcm);
     }
 
     #[test]

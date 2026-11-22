@@ -158,6 +158,8 @@ impl VaEnc {
             cmd.arg("import");
         }
         cmd.env("LGX_LOW_POWER", if low_power { "1" } else { "0" });
+        // The helper must open the same render node as capture/GBM.
+        cmd.env("LGX_DRM_NODE", lgx_server::gbm::drm_node());
         cmd.env("LGX_ASYNC_DEPTH", async_depth.to_string());
         if vpp {
             cmd.env("LGX_VPP", "1");
@@ -251,6 +253,7 @@ impl VaEnc {
         stride: u32,
         fourcc: u32,
         modifier: u64,
+        offset: u32,
         fd: RawFd,
     ) -> io::Result<Vec<Vec<u8>>> {
         self.stream.write_all(b"R")?;
@@ -262,7 +265,7 @@ impl VaEnc {
             id,
             modifier as u32,
             (modifier >> 32) as u32,
-            0,
+            offset,
         ];
         let mut iov = libc::iovec {
             iov_base: meta.as_ptr() as *mut libc::c_void,

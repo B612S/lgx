@@ -43,7 +43,17 @@ pub struct CapState {
     dmabuf: Option<linux_dmabuf::client::zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1>,
     pub use_dmabuf: bool,
     pub use_gbm: bool,
+    /// Allocate capture buffers with an explicit linear modifier instead of
+    /// letting GBM pick one.
     pub gbm_linear: bool,
+    /// Copy the captured frame into `staged` for the CPU converter. The VPP
+    /// and GL paths read the dma-buf directly and must not pay for this.
+    pub stage_cpu: bool,
+    /// Explicit DRM modifier candidates for capture buffers, preferred
+    /// first. Empty lets GBM pick one (which is not safe on Intel).
+    pub gbm_mods: Vec<u64>,
+    /// (format, modifier) pairs advertised by the compositor.
+    pub dmabuf_mods: Vec<(u32, u64)>,
     outputs: Vec<wl_output::WlOutput>,
     names: Vec<String>,
     sizes: Vec<(i32, i32)>,
@@ -66,6 +76,23 @@ pub struct CapState {
     pub info: Option<FrameInfo>,
     pub staged: Vec<u8>,
     pub in_flight: bool,
+}
+
+/// True when the compositor implements `zwlr_screencopy_manager_v1` (wlroots:
+/// Sway, Hyprland, river, ...). KDE and GNOME do not, so the server uses the
+/// desktop portal there instead.
+pub fn has_wlr_screencopy() -> bool {
+    let Ok(conn) = Connection::connect_to_env() else {
+        return false;
+    };
+    let Ok((globals, _queue)) = registry_queue_init::<CapState>(&conn) else {
+        return false;
+    };
+    globals
+        .contents()
+        .clone_list()
+        .iter()
+        .any(|g| g.interface == "zwlr_screencopy_manager_v1")
 }
 
 pub struct Capture {
@@ -136,6 +163,9 @@ impl Capture {
             use_dmabuf: dmabuf.is_some() && want_dmabuf,
             use_gbm: false,
             gbm_linear: false,
+            stage_cpu: false,
+            gbm_mods: Vec::new(),
+            dmabuf_mods: Vec::new(),
             outputs,
             names,
             sizes,
@@ -185,7 +215,13 @@ impl Capture {
         eprintln!(
             "lgx-server: capture path: {}",
             if self.state.use_gbm {
-                if self.state.gbm_linear { "gbm linear" } else { "gbm dmabuf" }
+                if self.state.gbm_linear {
+                    "gbm linear"
+                } else if !self.state.gbm_mods.is_empty() {
+                    "gbm tiled"
+                } else {
+                    "gbm dmabuf"
+                }
             } else if self.state.use_dmabuf {
                 "dmabuf"
             } else {
@@ -256,6 +292,17 @@ impl Capture {
         release_frame(self.state.pending.take());
         if self.state.failed {
             self.state.failed = false;
+            // The compositor refused the buffer (most likely a modifier it
+            // cannot import): fall back to linear, which is accepted
+            // everywhere, and drop the cached buffers.
+            if !self.state.gbm_mods.is_empty() {
+                if !self.state.stage_cpu {
+                    eprintln!("lgx-server: capture buffer rejected, using linear buffers");
+                }
+                self.state.gbm_mods.clear();
+                self.state.gbm_linear = true;
+                self.state.gbm_bufs = [None, None];
+            }
             return Err(io::Error::other("frame was not copied"));
         }
 
@@ -272,8 +319,8 @@ impl Capture {
             self.state.staged.resize(need, 0);
         }
         if self.state.use_gbm {
-            if self.state.gbm_linear {
-                // CPU-visible linear buffer: stage it like a shm frame
+            if self.state.stage_cpu {
+                // CPU conversion: copy the mapped linear frame like shm.
                 if let Some((_, gbm)) = self.state.gbm_bufs[done_slot].as_ref() {
                     match gbm.map {
                         Some(map) if map.len() >= need => {
@@ -314,8 +361,9 @@ impl Capture {
         let (w, h, stride, format) = (info.width, info.height, info.stride, info.format);
         if self.state.use_gbm {
             if self.state.gbm_bufs[slot].is_none() {
+                let mods = pick_capture_mods(&self.state, format);
                 let (buffer, gbm) =
-                    create_gbm_buffer(self.state.dmabuf.as_ref().unwrap(), &self.queue.handle(), w, h, format, self.state.gbm_linear)?;
+                    create_gbm_buffer(self.state.dmabuf.as_ref().unwrap(), &self.queue.handle(), w, h, format, self.state.gbm_linear, &mods)?;
                 if let Some(i) = self.state.info.as_mut() {
                     i.stride = gbm.stride;
                 }
@@ -392,6 +440,31 @@ fn create_shm_buffer(
     Ok((buffer, file, map))
 }
 
+/// Modifiers to try for a capture buffer, in preference order. Only
+/// advertised pairs are used so the compositor does not reject the wl_buffer;
+/// linear is the fallback when none of the preferred modifiers is offered.
+fn pick_capture_mods(state: &CapState, format: u32) -> Vec<u64> {
+    choose_capture_mods(&state.gbm_mods, &state.dmabuf_mods, format)
+}
+
+/// Pure part of the modifier choice, kept separate for unit tests.
+fn choose_capture_mods(preferred: &[u64], advertised: &[(u32, u64)], format: u32) -> Vec<u64> {
+    if preferred.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<u64> = preferred
+        .iter()
+        .copied()
+        .filter(|m| advertised.iter().any(|&(f, mm)| f == format && mm == *m))
+        .collect();
+    if out.is_empty() {
+        // Nothing the compositor advertised matches: linear is the only
+        // universally importable choice.
+        out.push(0);
+    }
+    out
+}
+
 fn create_gbm_buffer(
     mgr: &linux_dmabuf::client::zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
     qh: &QueueHandle<CapState>,
@@ -399,11 +472,21 @@ fn create_gbm_buffer(
     h: u32,
     format: u32,
     linear: bool,
+    mods: &[u64],
 ) -> io::Result<(wl_buffer::WlBuffer, GbmBuffer)> {
     let gbm = if linear {
         GbmBuffer::linear(w, h, format)?
-    } else {
+    } else if mods.is_empty() {
         GbmBuffer::new(w, h, format)?
+    } else {
+        let mut created = None;
+        for &modifier in mods {
+            if let Ok(g) = GbmBuffer::with_modifier(w, h, format, modifier) {
+                created = Some(g);
+                break;
+            }
+        }
+        created.ok_or_else(|| io::Error::other("no usable capture modifier"))?
     };
     let params = mgr.create_params(qh, ());
     let fd = unsafe { BorrowedFd::borrow_raw(gbm.fd) };
@@ -496,15 +579,26 @@ ignore!(
 
 impl Dispatch<linux_dmabuf::client::zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, ()> for CapState {
     fn event(
-        _: &mut Self,
+        state: &mut Self,
         _: &linux_dmabuf::client::zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
-        _: <linux_dmabuf::client::zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1 as Proxy>::Event,
+        event: <linux_dmabuf::client::zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1 as Proxy>::Event,
         _: &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        // format/modifier advertisements are not needed: a linear modifier is
-        // assumed and a rejection falls back to wl_shm
+        // v3+ advertises every (format, modifier) pair once, before the
+        // roundtrips in `connect`. Capture buffers may only use a modifier
+        // the compositor can import, so remember the list.
+        if let linux_dmabuf::client::zwp_linux_dmabuf_v1::Event::Modifier {
+            format,
+            modifier_hi,
+            modifier_lo,
+        } = event
+        {
+            state
+                .dmabuf_mods
+                .push((format, ((modifier_hi as u64) << 32) | modifier_lo as u64));
+        }
     }
 }
 
@@ -572,8 +666,14 @@ impl Dispatch<screencopy::client::zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV
                         "lgx-server: shm buffer {width}x{height} stride={stride} fmt={fmt:08x}"
                     );
                 }
-                state.info = Some(FrameInfo { width, height, stride, format: fmt });
                 let cur = state.cur;
+                if state.info.as_ref().is_some_and(|old| {
+                    old.width != width || old.height != height || old.stride != stride
+                }) {
+                    // Mode change: the cached wl_buffer is the wrong size.
+                    state.shm_bufs[cur] = None;
+                }
+                state.info = Some(FrameInfo { width, height, stride, format: fmt });
                 if state.shm_bufs[cur].is_none() {
                     match create_shm_buffer(&state.shm, qh, width, height, stride, fmt) {
                         Ok((buffer, file, map)) => {
@@ -607,8 +707,16 @@ impl Dispatch<screencopy::client::zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV
                 if !state.logged_format {
                     state.logged_format = true;
                     eprintln!(
-                        "lgx-server: dmabuf {width}x{height} fmt={format:08x}"
+                        "lgx-server: dmabuf {width}x{height} fmt={format:08x} modifiers={:?}",
+                        pick_capture_mods(state, format)
                     );
+                }
+                if state.gbm_bufs[cur]
+                    .as_ref()
+                    .is_some_and(|(_, g)| g.width != width || g.height != height)
+                {
+                    // Mode change: recreate the capture buffer at the new size.
+                    state.gbm_bufs[cur] = None;
                 }
                 state.info = Some(FrameInfo {
                     width,
@@ -617,7 +725,8 @@ impl Dispatch<screencopy::client::zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV
                     format,
                 });
                 if state.use_gbm && state.gbm_bufs[cur].is_none() {
-                    match create_gbm_buffer(state.dmabuf.as_ref().unwrap(), qh, width, height, format, state.gbm_linear) {
+                    let mods = pick_capture_mods(state, format);
+                    match create_gbm_buffer(state.dmabuf.as_ref().unwrap(), qh, width, height, format, state.gbm_linear, &mods) {
                         Ok((buffer, gbm)) => {
                             if state.gbm_linear && gbm.modifier != 0 {
                                 eprintln!(
@@ -704,5 +813,53 @@ pub fn throttle(start: Instant, fps: u32) {
     let elapsed = start.elapsed();
     if elapsed < target {
         std::thread::sleep(target - elapsed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::choose_capture_mods;
+    use lgx_server::gbm::I915_FORMAT_MOD_Y_TILED;
+
+    const FMT: u32 = 0x3432_5241; // DRM_FORMAT_ARGB8888
+
+    #[test]
+    fn prefers_y_tiled_when_advertised() {
+        let advertised = [(FMT, I915_FORMAT_MOD_Y_TILED), (FMT, 0)];
+        assert_eq!(
+            choose_capture_mods(&[I915_FORMAT_MOD_Y_TILED, 0], &advertised, FMT),
+            vec![I915_FORMAT_MOD_Y_TILED, 0]
+        );
+    }
+
+    #[test]
+    fn falls_back_to_linear_when_tiling_is_not_advertised() {
+        let advertised = [(FMT, 0)];
+        assert_eq!(
+            choose_capture_mods(&[I915_FORMAT_MOD_Y_TILED, 0], &advertised, FMT),
+            vec![0]
+        );
+    }
+
+    #[test]
+    fn falls_back_to_linear_without_any_feedback() {
+        assert_eq!(
+            choose_capture_mods(&[I915_FORMAT_MOD_Y_TILED, 0], &[], FMT),
+            vec![0]
+        );
+    }
+
+    #[test]
+    fn ignores_modifiers_advertised_for_other_formats() {
+        let advertised = [(FMT + 1, I915_FORMAT_MOD_Y_TILED)];
+        assert_eq!(
+            choose_capture_mods(&[I915_FORMAT_MOD_Y_TILED, 0], &advertised, FMT),
+            vec![0]
+        );
+    }
+
+    #[test]
+    fn empty_preference_keeps_gbm_choice() {
+        assert!(choose_capture_mods(&[], &[(FMT, 0)], FMT).is_empty());
     }
 }

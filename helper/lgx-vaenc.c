@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -56,9 +57,14 @@ struct VppInput {
     int w, h, stride;
     uint32_t fourcc;
     uint64_t modifier;
+    int offset;
 };
-static struct VppInput vpp_inputs[8];
+#define MAX_VPP_INPUTS 8
+static struct VppInput vpp_inputs[MAX_VPP_INPUTS];
 static int vpp_ninputs;
+/// Milliseconds are too fine for a failure that repeats every frame; one line
+/// per second is enough to diagnose without flooding the journal.
+static time_t last_import_error;
 
 static int vpp_init(VADisplay dpy, VASurfaceID out, int w, int h) {
     VAConfigAttrib ca = { VAConfigAttribRTFormat, VA_RT_FORMAT_YUV420 };
@@ -76,20 +82,29 @@ static int vpp_init(VADisplay dpy, VASurfaceID out, int w, int h) {
     return 0;
 }
 
+static void vpp_drop_input(VADisplay dpy, int i) {
+    vaDestroySurfaces(dpy, &vpp_inputs[i].surf, 1);
+    vpp_ninputs--;
+    memmove(&vpp_inputs[i], &vpp_inputs[i + 1],
+            (size_t)(vpp_ninputs - i) * sizeof(vpp_inputs[0]));
+}
+
 static VASurfaceID vpp_import(VADisplay dpy, uint32_t id, int w, int h, int stride,
-                              uint32_t fourcc, uint64_t modifier, int fd) {
+                              uint32_t fourcc, uint64_t modifier, int offset, int fd) {
     for (int i = 0; i < vpp_ninputs; i++) {
         if (vpp_inputs[i].id == id && vpp_inputs[i].w == w && vpp_inputs[i].h == h &&
             vpp_inputs[i].stride == stride && vpp_inputs[i].fourcc == fourcc &&
-            vpp_inputs[i].modifier == modifier) {
+            vpp_inputs[i].modifier == modifier && vpp_inputs[i].offset == offset) {
             close(fd);
-            return vpp_inputs[i].surf;
+            // LRU: the most recently used entry moves to the end.
+            struct VppInput hit = vpp_inputs[i];
+            memmove(&vpp_inputs[i], &vpp_inputs[i + 1],
+                    (size_t)(vpp_ninputs - i - 1) * sizeof(vpp_inputs[0]));
+            vpp_inputs[vpp_ninputs - 1] = hit;
+            return hit.surf;
         }
         if (vpp_inputs[i].id == id) {
-            vaDestroySurfaces(dpy, &vpp_inputs[i].surf, 1);
-            vpp_ninputs--;
-            memmove(&vpp_inputs[i], &vpp_inputs[i + 1],
-                    (size_t)(vpp_ninputs - i) * sizeof(vpp_inputs[0]));
+            vpp_drop_input(dpy, i);
             break;
         }
     }
@@ -100,13 +115,13 @@ static VASurfaceID vpp_import(VADisplay dpy, uint32_t id, int w, int h, int stri
     desc.height = (uint32_t)h;
     desc.num_objects = 1;
     desc.objects[0].fd = fd;
-    desc.objects[0].size = (uint64_t)stride * (uint64_t)h;
+    desc.objects[0].size = (uint64_t)offset + (uint64_t)stride * (uint64_t)h;
     desc.objects[0].drm_format_modifier = modifier;
     desc.num_layers = 1;
     desc.layers[0].drm_format = fourcc;
     desc.layers[0].num_planes = 1;
     desc.layers[0].object_index[0] = 0;
-    desc.layers[0].offset[0] = 0;
+    desc.layers[0].offset[0] = (uint32_t)offset;
     desc.layers[0].pitch[0] = (uint32_t)stride;
 
     VASurfaceAttrib attrs[3];
@@ -130,19 +145,27 @@ static VASurfaceID vpp_import(VADisplay dpy, uint32_t id, int w, int h, int stri
     VAStatus s = vaCreateSurfaces(dpy, VA_RT_FORMAT_RGB32, (unsigned)w, (unsigned)h, &surf, 1, attrs, 3);
     close(fd);
     if (s != VA_STATUS_SUCCESS) {
-        fprintf(stderr, "vaenc: vpp rgb surface failed: %s\n", vaErrorStr(s));
+        time_t now = time(NULL);
+        if (now != last_import_error) {
+            last_import_error = now;
+            fprintf(stderr, "vaenc: vpp rgb surface failed: %s\n", vaErrorStr(s));
+        }
         return VA_INVALID_SURFACE;
     }
-    if (vpp_ninputs < 8) {
-        vpp_inputs[vpp_ninputs].id = id;
-        vpp_inputs[vpp_ninputs].surf = surf;
-        vpp_inputs[vpp_ninputs].w = w;
-        vpp_inputs[vpp_ninputs].h = h;
-        vpp_inputs[vpp_ninputs].stride = stride;
-        vpp_inputs[vpp_ninputs].fourcc = fourcc;
-        vpp_inputs[vpp_ninputs].modifier = modifier;
-        vpp_ninputs++;
+    if (vpp_ninputs == MAX_VPP_INPUTS) {
+        // Evict the least recently used surface instead of leaking the new
+        // one, which is what happened once the fixed table filled up.
+        vpp_drop_input(dpy, 0);
     }
+    vpp_inputs[vpp_ninputs].id = id;
+    vpp_inputs[vpp_ninputs].surf = surf;
+    vpp_inputs[vpp_ninputs].w = w;
+    vpp_inputs[vpp_ninputs].h = h;
+    vpp_inputs[vpp_ninputs].stride = stride;
+    vpp_inputs[vpp_ninputs].fourcc = fourcc;
+    vpp_inputs[vpp_ninputs].modifier = modifier;
+    vpp_inputs[vpp_ninputs].offset = offset;
+    vpp_ninputs++;
     return surf;
 }
 
@@ -173,7 +196,16 @@ static int vpp_convert(VADisplay dpy, VASurfaceID in) {
         return -1;
     }
     s = vaSyncSurface(dpy, vpp_out);
-    return s == VA_STATUS_SUCCESS ? 0 : -1;
+    if (s != VA_STATUS_SUCCESS) {
+        static time_t last_sync_error;
+        time_t now = time(NULL);
+        if (now != last_sync_error) {
+            last_sync_error = now;
+            fprintf(stderr, "vaenc: vpp sync failed: %s\n", vaErrorStr(s));
+        }
+        return -1;
+    }
+    return 0;
 }
 
 static AVBufferRef *hw_dev, *frames_ref;
@@ -239,7 +271,9 @@ int main(int argc, char **argv) {
     }
     int import_mode = (argc > 6 && strcmp(argv[6], "import") == 0);
 
-    if (av_hwdevice_ctx_create(&hw_dev, AV_HWDEVICE_TYPE_VAAPI, "/dev/dri/renderD128", NULL, 0) < 0) {
+    const char *drm_node = getenv("LGX_DRM_NODE");
+    if (!drm_node || !*drm_node) drm_node = "/dev/dri/renderD128";
+    if (av_hwdevice_ctx_create(&hw_dev, AV_HWDEVICE_TYPE_VAAPI, drm_node, NULL, 0) < 0) {
         fprintf(stderr, "vaenc: hwdevice failed\n");
         return 1;
     }
@@ -285,7 +319,22 @@ int main(int argc, char **argv) {
     enc->color_primaries = AVCOL_PRI_BT709;
     enc->color_trc = AVCOL_TRC_BT709;
     enc->hw_frames_ctx = av_buffer_ref(frames_ref);
-    if (avcodec_open2(enc, codec, NULL) < 0) { fprintf(stderr, "vaenc: open failed\n"); return 1; }
+    if (avcodec_open2(enc, codec, NULL) < 0) {
+        /* VDENC (low_power) exists only on Intel Gen12+. Mesa's radeonsi
+         * rejects the option, and older Intel drivers have no low-power
+         * entry point at all; retry once with the regular encoder. */
+        if (low_power) {
+            fprintf(stderr, "vaenc: low_power open failed; retrying without VDENC\n");
+            av_opt_set_int(enc->priv_data, "low_power", 0, 0);
+            if (avcodec_open2(enc, codec, NULL) < 0) {
+                fprintf(stderr, "vaenc: open failed\n");
+                return 1;
+            }
+        } else {
+            fprintf(stderr, "vaenc: open failed\n");
+            return 1;
+        }
+    }
 
     for (int i = 0; i < MAX_FRAMES && !import_mode; i++) {
         frames[i] = av_frame_alloc();
@@ -438,11 +487,33 @@ int main(int argc, char **argv) {
             AVVAAPIDeviceContext *vactx = hdev->hwctx;
             uint64_t mod = (uint64_t)meta[5] | ((uint64_t)meta[6] << 32);
             VASurfaceID in = vpp_import(vactx->display, meta[4], (int)meta[0], (int)meta[1],
-                                        (int)meta[2], meta[3], mod, fds[0]);
+                                        (int)meta[2], meta[3], mod, (int)meta[7], fds[0]);
+            if (in == VA_INVALID_SURFACE) {
+                static time_t last_import_error2;
+                time_t now = time(NULL);
+                if (now != last_import_error2) {
+                    last_import_error2 = now;
+                    fprintf(stderr,
+                            "vaenc: import failed: %dx%d stride=%d fourcc=%x mod=%llx off=%d\n",
+                            (int)meta[0], (int)meta[1], (int)meta[2], meta[3],
+                            (unsigned long long)mod, (int)meta[7]);
+                }
+            }
             if (in == VA_INVALID_SURFACE || vpp_convert(vactx->display, in) < 0) {
                 uint32_t zero = 0;
                 send_all(cfd, &zero, 4);
                 continue;
+            }
+            {
+                static time_t last_ok;
+                time_t now = time(NULL);
+                if (now != last_ok) {
+                    last_ok = now;
+                    fprintf(stderr,
+                            "vaenc: vpp ok %dx%d stride=%d fourcc=%x mod=%llx off=%d\n",
+                            (int)meta[0], (int)meta[1], (int)meta[2], meta[3],
+                            (unsigned long long)mod, (int)meta[7]);
+                }
             }
         } else if (cmd == 'F') {
             uint32_t len;
@@ -531,6 +602,14 @@ int main(int argc, char **argv) {
         }
         av_packet_free(&pkt);
         uint32_t count = (uint32_t)np;
+        {
+            static time_t last_np;
+            time_t now = time(NULL);
+            if (now != last_np) {
+                last_np = now;
+                fprintf(stderr, "vaenc: packet count %d\n", np);
+            }
+        }
         if (send_all(cfd, &count, 4) < 0) goto done;
         for (int i = 0; i < np; i++) {
             uint32_t len = out[i]->size;

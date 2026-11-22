@@ -45,3 +45,10 @@ pub mod linux_dmabuf {
 pub mod xdg_output {
     protocol!("protocol/xdg-output-unstable-v1.xml");
 }
+
+// KDE's private screencast protocol. Used only by the `kde_probe` example to
+// verify KDE capture without the portal consent dialog; KWin does not offer
+// it as a stable API for regular clients.
+pub mod kde_screencast {
+    protocol!("protocol/zkde-screencast-unstable-v1.xml");
+}

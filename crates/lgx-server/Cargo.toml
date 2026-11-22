@@ -9,11 +9,14 @@ description = "lgx server: zero-copy HEVC streaming of a wlroots session"
 ring = "0.17"
 wl-clipboard-rs = "0.9.5"
 lgx-proto = { path = "../lgx-proto" }
+lgx-caps = { path = "../lgx-caps" }
 libc = "0.2"
 memmap2 = "0.9"
 wayland-client = "0.31"
 wayland-backend = "0.3"
 wayland-scanner = "0.31"
 bitflags = "2"
-pipewire = "0.10"
+pipewire = { version = "0.10", features = ["v0_3_49"] }
+ashpd = { version = "0.14.3", default-features = false, features = ["screencast", "async-io"] }
+futures-lite = "2"
 ringbuf = "0.4"

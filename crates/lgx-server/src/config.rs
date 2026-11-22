@@ -25,9 +25,8 @@ fn canonical(key: &str) -> String {
         | "server" | "video_port" | "audio_port" | "pair_port" | "discovery_port" => {
             ("network", key)
         }
-        "fps" | "bitrate" | "output" | "low_power" | "async_depth" | "vpp" => {
-            ("video", key)
-        }
+        "fps" | "bitrate" | "output" | "low_power" | "async_depth" | "vpp" | "drm_node"
+        | "capture" => ("video", key),
         "audio" => ("audio", "enabled"),
         "no_input" => ("input", "enabled"),
         _ => ("misc", key),
@@ -152,10 +151,23 @@ pub fn load_or_create() -> Config {
     cfg.set("video.low_power", "true");
     cfg.set("video.async_depth", 2u32);
     cfg.set("video.vpp", "true");
+    cfg.set("video.drm_node", "");
+    cfg.set("video.capture", "auto");
     cfg.set("audio.enabled", "true");
     cfg.set("input.enabled", "true");
     if let Err(e) = cfg.save() {
         eprintln!("lgx-server: cannot write {}: {e}", path().display());
     }
     cfg
+}
+
+#[cfg(test)]
+mod tests {
+    use super::canonical;
+
+    #[test]
+    fn drm_node_belongs_to_the_video_section() {
+        assert_eq!(canonical("drm_node"), "video.drm_node");
+        assert_eq!(canonical("video.drm_node"), "video.drm_node");
+    }
 }

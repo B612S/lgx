@@ -11,7 +11,7 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use lgx_proto::secure::{self, Secure};
 use lgx_proto::{codec, file, msg, Msg};
@@ -20,8 +20,13 @@ use crate::clients;
 use crate::clip;
 use crate::input::Cmd;
 
+/// How long a clipboard update may wait for room in the writer queue instead
+/// of being dropped behind a burst of video frames.
+const CLIP_QUEUE_TIMEOUT: Duration = Duration::from_millis(250);
+
 enum Out {
-    Video(Arc<Vec<u8>>),
+    Resize(u32, u32, u32),
+    Video(Arc<Vec<u8>>, u64),
     Clip(String),
     ClipHtml(Vec<u8>),
 }
@@ -33,6 +38,9 @@ pub struct Hub {
     keyframe: AtomicBool,
     last_keyframe_ms: AtomicU64,
     cursor_overlay: AtomicBool,
+    /// The server does not composite a pointer into the video (GNOME portal);
+    /// clients should draw their own.
+    cursor_local: AtomicBool,
     dropped: AtomicU64,
 }
 
@@ -50,6 +58,25 @@ struct Client {
     secure: Arc<Secure>,
 }
 
+/// Retry a clipboard message for a bounded time so a burst of video frames in
+/// the writer queue does not silently drop it. Called without the clients
+/// lock held.
+fn send_with_retry(tx: &SyncSender<Out>, mut out: Out) {
+    let deadline = Instant::now() + CLIP_QUEUE_TIMEOUT;
+    loop {
+        match tx.try_send(out) {
+            Ok(()) | Err(TrySendError::Disconnected(_)) => return,
+            Err(TrySendError::Full(returned)) => {
+                out = returned;
+                if Instant::now() >= deadline {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+    }
+}
+
 impl Hub {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
@@ -59,6 +86,7 @@ impl Hub {
             keyframe: AtomicBool::new(false),
             last_keyframe_ms: AtomicU64::new(0),
             cursor_overlay: AtomicBool::new(true),
+            cursor_local: AtomicBool::new(false),
             dropped: AtomicU64::new(0),
         })
     }
@@ -106,6 +134,22 @@ impl Hub {
         self.cursor_overlay.load(Ordering::Relaxed)
     }
 
+    /// Tell clients whether the pointer is part of the video. GNOME's portal
+    /// cannot embed it, so those clients must keep drawing their own.
+    pub fn set_cursor_local(&self, on: bool) {
+        self.cursor_local.store(on, Ordering::Relaxed);
+        let clients = self.clients.lock().unwrap();
+        for c in clients.iter() {
+            let _ = c
+                .secure
+                .send_msg(Msg::new(msg::CURSOR_LOCAL, 0, on as i32, 0), &[]);
+        }
+    }
+
+    pub fn cursor_local(&self) -> bool {
+        self.cursor_local.load(Ordering::Relaxed)
+    }
+
     pub fn revoke_missing(&self, valid: &HashMap<String, [u8; 32]>) {
         let mut list = self.clients.lock().unwrap();
         list.retain(|c| {
@@ -119,7 +163,7 @@ impl Hub {
         });
     }
 
-    pub fn broadcast_video(&self, chunk: Vec<u8>) {
+    pub fn broadcast_video(&self, chunk: Vec<u8>, ts_us: u64) {
         let chunk = Arc::new(chunk);
         let mut list = self.clients.lock().unwrap();
         // Scanning every packet for an IDR is only needed while a newly
@@ -130,7 +174,7 @@ impl Hub {
             if c.needs_idr && !idr {
                 return true;
             }
-            match c.tx.try_send(Out::Video(chunk.clone())) {
+            match c.tx.try_send(Out::Video(chunk.clone(), ts_us)) {
                 Ok(()) => {
                     c.needs_idr = false;
                     true
@@ -150,48 +194,94 @@ impl Hub {
     }
 
     pub fn broadcast_clip(&self, text: &str) {
-        let mut list = self.clients.lock().unwrap();
-        list.retain(|c| match c.tx.try_send(Out::Clip(text.to_string())) {
-            Ok(()) | Err(TrySendError::Full(_)) => true,
-            Err(TrySendError::Disconnected(_)) => false,
-        });
+        // Send outside the clients lock: a clipboard update may wait for a
+        // video burst, but the capture thread must never wait for it.
+        let senders: Vec<SyncSender<Out>> = self
+            .clients
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|c| c.tx.clone())
+            .collect();
+        for tx in senders {
+            match tx.try_send(Out::Clip(text.to_string())) {
+                Ok(()) | Err(TrySendError::Disconnected(_)) => {}
+                Err(TrySendError::Full(out)) => {
+                    send_with_retry(&tx, out);
+                }
+            }
+        }
     }
 
     pub fn broadcast_rich(&self, html: &str, text: &str) {
         let payload = lgx_proto::encode_rich(html, text);
-        let mut list = self.clients.lock().unwrap();
-        list.retain(|c| match c.tx.try_send(Out::ClipHtml(payload.clone())) {
-            Ok(()) | Err(TrySendError::Full(_)) => true,
-            Err(TrySendError::Disconnected(_)) => false,
-        });
+        let senders: Vec<SyncSender<Out>> = self
+            .clients
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|c| c.tx.clone())
+            .collect();
+        for tx in senders {
+            match tx.try_send(Out::ClipHtml(payload.clone())) {
+                Ok(()) | Err(TrySendError::Disconnected(_)) => {}
+                Err(TrySendError::Full(out)) => {
+                    send_with_retry(&tx, out);
+                }
+            }
+        }
+    }
+
+    /// Tell every connected client that the capture geometry changed; the
+    /// client asks the user before resizing its window.
+    pub fn broadcast_resize(&self, w: u32, h: u32, fps: u32) {
+        let senders: Vec<SyncSender<Out>> = self
+            .clients
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|c| c.tx.clone())
+            .collect();
+        for tx in senders {
+            match tx.try_send(Out::Resize(w, h, fps)) {
+                Ok(()) | Err(TrySendError::Disconnected(_)) => {}
+                Err(TrySendError::Full(out)) => {
+                    send_with_retry(&tx, out);
+                }
+            }
+        }
     }
 
     /// A file clipboard is a short burst; send it directly on each client's
-    /// secure stream. The writer thread's video messages can interleave, but
-    /// every message is sealed atomically.
+    /// secure stream, one sealed message at a time, so video can interleave.
+    /// The clients lock is released first: holding it for a 16 MiB transfer
+    /// would stop the capture thread from enqueueing frames.
     pub fn broadcast_file(&self, name: &str, data: &[u8]) {
         if data.len() as u64 > file::MAX_BYTES {
             return;
         }
         let begin = file::encode_begin(name, data.len() as u64);
-        let list = self.clients.lock().unwrap();
-        eprintln!("lgx-server: broadcasting file {} to {} client(s)", name, list.len());
-        for c in list.iter() {
-            if c.secure
+        let streams: Vec<Arc<Secure>> = {
+            let list = self.clients.lock().unwrap();
+            eprintln!("lgx-server: broadcasting file {} to {} client(s)", name, list.len());
+            list.iter().map(|c| c.secure.clone()).collect()
+        };
+        for secure in streams {
+            if secure
                 .send_msg(Msg::new(msg::FILE_BEGIN, 0, begin.len() as i32, 0), &begin)
                 .is_err()
             {
                 continue;
             }
             for chunk in data.chunks(32 * 1024) {
-                if c.secure
+                if secure
                     .send_msg(Msg::new(msg::FILE_DATA, 0, chunk.len() as i32, 0), chunk)
                     .is_err()
                 {
                     break;
                 }
             }
-            let _ = c.secure.send_msg(Msg::new(msg::FILE_END, 0, 0, 0), &[]);
+            let _ = secure.send_msg(Msg::new(msg::FILE_END, 0, 0, 0), &[]);
         }
     }
 
@@ -220,6 +310,7 @@ pub fn listen(
         let id = hub.next_id.fetch_add(1, Ordering::Relaxed);
         eprintln!("lgx-server: client #{id}: {:?}", stream.peer_addr());
         let _ = stream.set_nodelay(true);
+        secure::set_low_latency(&stream);
         let hub2 = hub.clone();
         let input2 = input.clone();
         let clip2 = clip_set.clone();
@@ -289,6 +380,9 @@ fn handle(
     {
         let (w, h) = hub.geometry();
         secure.send_msg(Msg::new(msg::HELLO, codec::HEVC, w as i32, h as i32), &[])?;
+        if hub.cursor_local() {
+            secure.send_msg(Msg::new(msg::CURSOR_LOCAL, 0, 1, 0), &[])?;
+        }
     }
 
     let (tx, rx) = std::sync::mpsc::sync_channel::<Out>(2);
@@ -311,9 +405,25 @@ fn handle(
         .spawn(move || {
             while let Ok(item) = rx.recv() {
                 let ok = match item {
-                    Out::Video(chunk) => {
-                        w2.send_msg(Msg::new(msg::VIDEO, 0, chunk.len() as i32, 0), &chunk)
-                            .is_ok()
+                    Out::Resize(w, h, fps) => w2
+                        .send_msg(
+                            Msg::new(msg::RESIZE, fps as u16, w as i32, h as i32),
+                            &[],
+                        )
+                        .is_ok(),
+                    Out::Video(chunk, ts_us) => {
+                        // 48-bit capture timestamp: high 16 bits in `code`,
+                        // low 32 in `b` (the client aligns audio with it).
+                        w2.send_msg(
+                            Msg::new(
+                                msg::VIDEO,
+                                (ts_us >> 32) as u16,
+                                chunk.len() as i32,
+                                ts_us as i32,
+                            ),
+                            &chunk,
+                        )
+                        .is_ok()
                     }
                     Out::Clip(text) => w2
                         .send_msg(
@@ -493,4 +603,74 @@ fn now_ms() -> u32 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc::sync_channel;
+
+    /// A connected secure pair whose server side never reads, so a large
+    /// broadcast blocks in the socket.
+    fn secure_pair(token: &'static str) -> (Arc<Secure>, Secure) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let id = secure::server_read_id(&mut stream).unwrap();
+            assert_eq!(id, "test");
+            secure::server_handshake(stream, token).unwrap()
+        });
+        let stream = TcpStream::connect(addr).unwrap();
+        let client = secure::client_handshake_id(stream, "test", token).unwrap();
+        let server = handle.join().unwrap();
+        (Arc::new(client), server)
+    }
+
+    fn hub_with_client(secure: Arc<Secure>) -> Hub {
+        let (tx, _rx) = sync_channel(1);
+        Hub {
+            clients: Mutex::new(vec![Client {
+                id: 1,
+                client: "test".into(),
+                token: [0; 32],
+                tx,
+                needs_idr: false,
+                secure,
+            }]),
+            next_id: AtomicU64::new(2),
+            geometry: Mutex::new((1920, 1080)),
+            keyframe: AtomicBool::new(false),
+            last_keyframe_ms: AtomicU64::new(0),
+            cursor_overlay: AtomicBool::new(false),
+            cursor_local: AtomicBool::new(false),
+            dropped: AtomicU64::new(0),
+        }
+    }
+
+    #[test]
+    fn broadcast_file_releases_the_clients_lock() {
+        let (client, server) = secure_pair("file-lock-test");
+        let hub = hub_with_client(client);
+        let data = vec![0u8; file::MAX_BYTES as usize];
+        let done = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                hub.broadcast_file("big.bin", &data);
+                done.store(true, Ordering::Relaxed);
+            });
+            // Let the writer fill the socket and block in send_msg.
+            std::thread::sleep(Duration::from_millis(300));
+            assert!(
+                !done.load(Ordering::Relaxed),
+                "the test needs a blocked file transfer"
+            );
+            assert!(
+                hub.clients.try_lock().is_ok(),
+                "the clients lock is held during the file transfer"
+            );
+            // Closing the unread peer makes the blocked write fail.
+            drop(server);
+        });
+    }
 }

@@ -15,11 +15,15 @@ mod clip;
 mod clients;
 mod config;
 mod dmabuf;
+mod encoder;
 pub mod glconv;
 mod input;
+mod nvenc;
 mod net;
 mod pair;
+mod portal;
 pub mod protocols;
+mod time;
 mod vaenc;
 
 use std::sync::Arc;
@@ -39,6 +43,11 @@ struct Args {
     low_power: bool,
     async_depth: u32,
     vpp: bool,
+    /// Explicit DRM render node (`--drm-node`/`video.drm_node`); auto-detected
+    /// when empty.
+    drm_node: Option<String>,
+    /// `auto`, `wlr` or `portal` (`--capture`/`video.capture`).
+    capture: String,
     pair: bool,
     pair_listen: String,
     pair_name: Option<String>,
@@ -96,7 +105,13 @@ fn parse_args() -> Result<Args, String> {
                 .ok_or_else(|| format!("network.interface {interface} has no IPv4 address"))?,
         )
     };
-    let bind_host = bind.map(|ip| ip.to_string());
+    // `network.server` is the bind address written by older packages; keep it
+    // working and use it when no interface is configured.
+    let bind_host = bind.map(|ip| ip.to_string()).or_else(|| {
+        cfg.get("network.server")
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    });
     let make_addr = |old_keys: &[&str], port: u16, label: &str| -> Result<String, String> {
         for key in old_keys {
             if let Some(v) = cfg.get(key) {
@@ -128,6 +143,11 @@ fn parse_args() -> Result<Args, String> {
         low_power: cfg.get_bool("video.low_power").unwrap_or(true),
         async_depth: cfg.get_u32("video.async_depth").unwrap_or(2),
         vpp: cfg.get_bool("video.vpp").unwrap_or(true),
+        capture: cfg.get("video.capture").unwrap_or("auto").to_string(),
+        drm_node: cfg
+            .get("video.drm_node")
+            .filter(|v| !v.is_empty())
+            .map(str::to_string),
         pair: false,
         pair_listen,
         pair_name: None,
@@ -159,6 +179,8 @@ fn parse_args() -> Result<Args, String> {
             "--audio-listen" => a.audio_listen = it.next().ok_or("--audio-listen")?,
             "--vpp" => a.vpp = true,
             "--no-vpp" => a.vpp = false,
+            "--capture" => a.capture = it.next().ok_or("--capture")?,
+            "--drm-node" => a.drm_node = Some(it.next().ok_or("--drm-node")?.to_string()),
             "--token" => a.token = Some(it.next().ok_or("--token")?),
             "--pair" => a.pair = true,
             "--pair-listen" => a.pair_listen = it.next().ok_or("--pair-listen")?,
@@ -172,7 +194,8 @@ fn parse_args() -> Result<Args, String> {
                      \x20          (--fps defaults to the output refresh rate)\n\
                      \x20          [--no-low-power] [--async-depth N] [--no-input]\n\
                      \x20          [--token T] [--no-audio]\n\
-                     \x20          [--audio-listen ADDR] [--vpp|--no-vpp]\n\
+                     \x20          [--audio-listen ADDR] [--vpp|--no-vpp] [--drm-node PATH]\n\
+                     \x20          [--capture auto|wlr|portal]\n\
                      \x20          [--pair] [--pair-listen ADDR] [--pair-name NAME]\n\
                      \x20          [--list] [--revoke ID|NAME] [--rotate ID|NAME]\n\
                      \x20          settings: ~/.config/lgx/server.conf"
@@ -206,37 +229,93 @@ impl Drop for FdGuard {
     }
 }
 
+/// Why `Stream::run` returned instead of streaming forever.
+enum RunOutcome {
+    /// The encoder produced no packets for 5 s while a client was connected;
+    /// fall back to the GL conversion path.
+    NoPackets,
+    /// Capture failed repeatedly (the compositor or Wayland connection is
+    /// gone); exit and let systemd restart the server.
+    CaptureDead,
+    /// The output's mode changed; rebuild the encoder at the new size and
+    /// tell the clients to offer a resize.
+    Resize,
+}
+
 /// The HEVC pipeline: capture -> GL NV12 -> VAAPI -> dma-buf packets.
 struct Stream {
     cap: capture::Capture,
     conv: Option<glconv::GlConv>,
     planes: Option<glconv::Planes>,
-    enc: vaenc::VaEnc,
+    enc: encoder::Encoder,
     w: u32,
     h: u32,
     fps: u32,
+    bitrate: u32,
     cpu: bool,
     vpp: bool,
     _target: Option<FdGuard>,
 }
 
 impl Stream {
-    fn new(args: &Args) -> Result<Self, String> {
+    fn new(args: &Args, force_gl: bool) -> Result<Self, String> {
         let mut cap = capture::Capture::connect(args.output.as_deref(), true)
             .map_err(|e| format!("capture: {e}"))?;
-        // The Intel render node supports VPP import of the captured tiled
-        // RGB dma-buf, which keeps the conversion off the 3D engine. Other
-        // drivers keep the GL path (LGX_NO_VPP forces it).
-        let intel = std::fs::read_to_string("/sys/class/drm/renderD128/device/vendor")
-            .map(|v| v.trim().eq_ignore_ascii_case("0x8086"))
-            .unwrap_or(false);
-        let cpu = std::env::var_os("LGX_CPU_CONVERT").is_some();
-        let vpp = args.vpp && !cpu && intel && std::env::var_os("LGX_NO_VPP").is_none();
+        // The encoder and the conversion path follow the capture GPU's real
+        // capabilities instead of a vendor guess: NVENC on NVIDIA, VAAPI
+        // elsewhere, and VPP only where the driver advertises video
+        // processing and the capture modifiers are known to import.
+        let node_path = lgx_server::gbm::drm_node();
+        let nodes = lgx_caps::drm_nodes();
+        let node = nodes.iter().find(|n| n.path.to_string_lossy() == node_path);
+        let va = node.and_then(lgx_caps::probe_vaapi);
+        let cuda = lgx_caps::cuda::available();
+        let backend = lgx_caps::encoder_for_node(node, va.as_ref(), cuda);
+        let intel = node.is_some_and(|n| n.is_intel());
+        let amd = node.is_some_and(|n| n.is_amd());
+        if let Some(n) = node {
+            eprintln!(
+                "lgx-server: capture GPU {} ({}, encoder {})",
+                n.name,
+                n.vendor_name(),
+                backend.map(|b| b.name()).unwrap_or("none"),
+            );
+        }
+        // NVENC takes system-memory NV12, so the CPU staging path is not an
+        // experiment there; on VAAPI the staging path stays opt-in.
+        let nvenc = backend == Some(lgx_caps::EncoderBackend::Nvenc);
+        let cpu = std::env::var_os("LGX_CPU_CONVERT").is_some() || nvenc;
+        // VPP keeps the RGB->NV12 conversion on the media engine. Capture
+        // buffers never use GBM's implicit modifier: mesa 26.3's i915 backend
+        // returns 0xb for them, which neither iHD nor EGL can import. Ask for
+        // Y-tiled instead (the compositor's fast screencopy blit), filtered
+        // by the modifiers the compositor advertises, with linear as the
+        // fallback. Other drivers keep the GL path (LGX_NO_VPP forces it for
+        // Intel too).
+        // `low_power` is the VAAPI VDENC entry point, which only Intel has.
+        // Mesa's radeonsi advertises the regular encode entry point, so the
+        // config default (true) must not reach an AMD driver.
+        let low_power = args.low_power && va.as_ref().is_some_and(|c| c.hevc_encode_low_power);
+        let vpp = args.vpp
+            && !cpu
+            && intel
+            && va.as_ref().is_some_and(|c| c.vpp)
+            && !force_gl
+            && std::env::var_os("LGX_NO_VPP").is_none();
         cap.state.use_gbm = true;
-        if cpu {
-            // Linear GPU buffer, mapped for the CPU: the compositor still
-            // blits once, but the RGB->NV12 conversion leaves the 3D engine.
+        if intel {
+            cap.state.gbm_mods = vec![lgx_server::gbm::I915_FORMAT_MOD_Y_TILED, 0];
+        } else if amd && !cpu {
+            // AMD modifiers are not part of the probe yet. A linear capture
+            // buffer is the one every Mesa import path accepts; the Y-tiled
+            // Intel modifier must never be requested here.
             cap.state.gbm_linear = true;
+        }
+        if cpu {
+            // The compositor still blits once, but the RGB->NV12 conversion
+            // leaves the 3D engine and runs on the CPU.
+            cap.state.gbm_linear = true;
+            cap.state.stage_cpu = true;
         }
         cap.begin().map_err(|e| format!("capture begin: {e}"))?;
         let (w, h) = {
@@ -257,30 +336,49 @@ impl Stream {
         let mut target = None;
         let mut conv = None;
         let mut planes = None;
-        let mut enc = if vpp {
-            vaenc::VaEnc::start_vpp(
-                "/tmp/lgx-vaenc.sock",
-                &helper,
-                w,
-                h,
-                fps,
-                args.bitrate,
-                args.low_power,
-                args.async_depth,
+        let mut enc = if nvenc {
+            let helper = std::env::var("LGX_NVENC")
+                .unwrap_or_else(|_| "/usr/lib/lgx/lgx-nvenc".to_string());
+            encoder::Encoder::Nvenc(
+                nvenc::NvEnc::start(
+                    "/tmp/lgx-nvenc.sock",
+                    &helper,
+                    w,
+                    h,
+                    fps,
+                    args.bitrate,
+                    args.async_depth,
+                )
+                .map_err(|e| format!("nvenc: {e}"))?,
             )
-            .map_err(|e| format!("vaenc: {e}"))?
+        } else if vpp {
+            encoder::Encoder::Vaapi(
+                vaenc::VaEnc::start_vpp(
+                    "/tmp/lgx-vaenc.sock",
+                    &helper,
+                    w,
+                    h,
+                    fps,
+                    args.bitrate,
+                    low_power,
+                    args.async_depth,
+                )
+                .map_err(|e| format!("vaenc: {e}"))?,
+            )
         } else if cpu {
-            vaenc::VaEnc::start_cpu(
-                "/tmp/lgx-vaenc.sock",
-                &helper,
-                w,
-                h,
-                fps,
-                args.bitrate,
-                args.low_power,
-                args.async_depth,
+            encoder::Encoder::Vaapi(
+                vaenc::VaEnc::start_cpu(
+                    "/tmp/lgx-vaenc.sock",
+                    &helper,
+                    w,
+                    h,
+                    fps,
+                    args.bitrate,
+                    low_power,
+                    args.async_depth,
+                )
+                .map_err(|e| format!("vaenc: {e}"))?,
             )
-            .map_err(|e| format!("vaenc: {e}"))?
         } else {
             let y_pitch = match lgx_server::gbm::alloc_linear_fmt(w, h, 0x2020_3852) {
                 Ok((_, fd, pitch, _)) => {
@@ -323,7 +421,7 @@ impl Stream {
             }
             .ok_or("cannot import the NV12 planes into GL")?);
             conv = Some(c);
-            e
+            encoder::Encoder::Vaapi(e)
         };
         let _ = &mut enc;
         if vpp {
@@ -333,10 +431,11 @@ impl Stream {
         }
 
         eprintln!(
-            "lgx-server: HEVC ready ({w}x{h}@{fps}, {} Mbit/s, low_power={}{})",
+            "lgx-server: HEVC ready ({w}x{h}@{fps}, {} Mbit/s, {} {}, {})",
             args.bitrate / 1_000_000,
-            args.low_power,
-            if cpu { ", CPU NV12" } else { "" }
+            enc.name(),
+            if cpu { "CPU NV12" } else if vpp { "VPP" } else { "GL" },
+            if nvenc { "" } else if low_power { "low_power=1" } else { "low_power=0" },
         );
         Ok(Self {
             cap,
@@ -346,20 +445,26 @@ impl Stream {
             w,
             h,
             fps,
+            bitrate: args.bitrate,
             cpu,
             vpp,
             _target: target,
         })
     }
 
-    fn run(mut self, hub: &Arc<Hub>) -> ! {
+    fn run(mut self, hub: &Arc<Hub>) -> RunOutcome {
         let mut t0 = Instant::now();
         let mut frames = 0u64;
         let mut bytes = 0u64;
-        let mut sum_wait = 0.0f64;
-        let mut sum_render = 0.0f64;
-        let mut sum_encode = 0.0f64;
+        let mut wait_samples: Vec<f32> = Vec::new();
+        let mut render_samples: Vec<f32> = Vec::new();
+        let mut encode_samples: Vec<f32> = Vec::new();
         let mut idle = true;
+        let mut last_progress = Instant::now();
+        let mut capture_errors = 0u32;
+        // Test hook: drop the VPP stream's packets so the watchdog exercises
+        // the GL fallback. The GL stream (vpp == false) is unaffected.
+        let drop_packets = std::env::var_os("LGX_TEST_NO_PACKETS").is_some() && self.vpp;
 
         loop {
             let loop_start = Instant::now();
@@ -373,9 +478,11 @@ impl Stream {
                 t0 = Instant::now();
                 frames = 0;
                 bytes = 0;
-                sum_wait = 0.0;
-                sum_render = 0.0;
-                sum_encode = 0.0;
+                wait_samples.clear();
+                render_samples.clear();
+                encode_samples.clear();
+                last_progress = Instant::now();
+                capture_errors = 0;
             }
             if hub.take_keyframe() {
                 if let Err(e) = self.enc.force_keyframe() {
@@ -386,16 +493,33 @@ impl Stream {
 
             let t_wait = Instant::now();
             if let Err(e) = self.cap.next_frame() {
+                capture_errors += 1;
                 eprintln!("lgx-server: capture: {e}");
+                if capture_errors >= 20 {
+                    eprintln!("lgx-server: capture keeps failing; exiting for a clean restart");
+                    return RunOutcome::CaptureDead;
+                }
                 std::thread::sleep(Duration::from_millis(50));
                 continue;
             }
+            capture_errors = 0;
+            if let Some(info) = self.cap.state.info.as_ref() {
+                if info.width != self.w || info.height != self.h {
+                    let (w, h) = (info.width, info.height);
+                    eprintln!(
+                        "lgx-server: capture resized {}x{} -> {w}x{h}; rebuilding the stream",
+                        self.w, self.h
+                    );
+                    return RunOutcome::Resize;
+                }
+            }
+            let capture_us = time::monotonic_us();
             let wait_ms = t_wait.elapsed().as_secs_f64() * 1000.0;
 
             let t_work = Instant::now();
             let packets = if self.vpp {
-                let (fd, stride, modifier, gw, gh) = match self.cap.last_gbm() {
-                    Some(g) => (g.fd, g.stride, g.modifier, g.width, g.height),
+                let (id, fd, stride, modifier, gw, gh) = match self.cap.last_gbm() {
+                    Some(g) => (g.id, g.fd, g.stride, g.modifier, g.width, g.height),
                     None => continue,
                 };
                 let fourcc = self
@@ -408,7 +532,7 @@ impl Stream {
                 let t_enc = Instant::now();
                 let packets = match self
                     .enc
-                    .vpp_send(fd as u32, gw, gh, stride, fourcc, modifier, fd)
+                    .vpp_send(id, gw, gh, stride, fourcc, modifier, 0, fd)
                 {
                     Ok(p) => p,
                     Err(e) => {
@@ -417,9 +541,9 @@ impl Stream {
                     }
                 };
                 let encode_ms = t_enc.elapsed().as_secs_f64() * 1000.0;
-                sum_wait += wait_ms;
-                sum_render += 0.0;
-                sum_encode += encode_ms;
+                wait_samples.push(wait_ms as f32);
+                render_samples.push(0.0);
+                encode_samples.push(encode_ms as f32);
                 frames += 1;
                 packets
             } else if self.cpu {
@@ -450,9 +574,9 @@ impl Stream {
                     }
                 };
                 let encode_ms = t_enc.elapsed().as_secs_f64() * 1000.0;
-                sum_wait += wait_ms;
-                sum_render += render_ms;
-                sum_encode += encode_ms;
+                wait_samples.push(wait_ms as f32);
+                render_samples.push(render_ms as f32);
+                encode_samples.push(encode_ms as f32);
                 frames += 1;
                 packets
             } else {
@@ -477,40 +601,110 @@ impl Stream {
                     }
                 };
                 let encode_ms = t_enc.elapsed().as_secs_f64() * 1000.0;
-                sum_wait += wait_ms;
-                sum_render += render_ms;
-                sum_encode += encode_ms;
+                wait_samples.push(wait_ms as f32);
+                render_samples.push(render_ms as f32);
+                encode_samples.push(encode_ms as f32);
                 frames += 1;
                 packets
             };
+            let mut produced = false;
             for data in packets {
-                if !data.is_empty() {
+                if !data.is_empty() && !drop_packets {
                     bytes += data.len() as u64;
-                    hub.broadcast_video(data);
+                    produced = true;
+                    hub.broadcast_video(data, capture_us);
                 }
+            }
+            if produced {
+                last_progress = Instant::now();
             }
             let period = if std::env::var_os("LGX_DEBUG_FPS").is_some() { 1 } else { 5 };
             if t0.elapsed() >= Duration::from_secs(period) {
-                let n = frames.max(1) as f64;
+                let (wait_p50, wait_p99) = percentiles(&mut wait_samples);
+                let (render_p50, render_p99) = percentiles(&mut render_samples);
+                let (encode_p50, encode_p99) = percentiles(&mut encode_samples);
+                let clients = hub.client_count();
+                let dropped = hub.take_dropped();
+                let fps = frames as f64 / t0.elapsed().as_secs_f64();
+                let mib_s = bytes as f64 / t0.elapsed().as_secs_f64() / 1_048_576.0;
                 eprintln!(
-                    "lgx-server: HEVC {:.1} fps, {:.1} MiB/s, wait {:.2} ms, render {:.2} ms, encode {:.2} ms, {} clients, {} dropped",
-                    frames as f64 / t0.elapsed().as_secs_f64(),
-                    bytes as f64 / t0.elapsed().as_secs_f64() / 1_048_576.0,
-                    sum_wait / n,
-                    sum_render / n,
-                    sum_encode / n,
-                    hub.client_count(),
-                    hub.take_dropped()
+                    "lgx-server: HEVC {fps:.1} fps, {mib_s:.1} MiB/s, wait p50/p99 {wait_p50:.2}/{wait_p99:.2} ms, render {render_p50:.2}/{render_p99:.2} ms, encode {encode_p50:.2}/{encode_p99:.2} ms, {clients} clients, {dropped} dropped"
                 );
+                let status = format!(
+                    concat!(
+                        "{{\"ts\":{},\"fps\":{:.1},\"mib_s\":{:.2},",
+                        "\"wait_p50_ms\":{:.2},\"wait_p99_ms\":{:.2},",
+                        "\"render_p50_ms\":{:.2},\"render_p99_ms\":{:.2},",
+                        "\"encode_p50_ms\":{:.2},\"encode_p99_ms\":{:.2},",
+                        "\"dropped\":{},\"clients\":{},\"width\":{},\"height\":{},",
+                        "\"target_fps\":{},\"bitrate\":{}}}\n"
+                    ),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0),
+                    fps,
+                    mib_s,
+                    wait_p50,
+                    wait_p99,
+                    render_p50,
+                    render_p99,
+                    encode_p50,
+                    encode_p99,
+                    dropped,
+                    clients,
+                    self.w,
+                    self.h,
+                    self.fps,
+                    self.bitrate
+                );
+                write_status(&status);
                 t0 = Instant::now();
                 frames = 0;
                 bytes = 0;
-                sum_wait = 0.0;
-                sum_render = 0.0;
-                sum_encode = 0.0;
+                wait_samples.clear();
+                render_samples.clear();
+                encode_samples.clear();
+            }
+            if frames > 0 && last_progress.elapsed() >= Duration::from_secs(5) {
+                eprintln!(
+                    "lgx-server: no video packets for 5 s while a client is connected; the encoder or VPP import is stuck"
+                );
+                return RunOutcome::NoPackets;
             }
             capture::throttle(loop_start, self.fps);
         }
+    }
+}
+
+fn percentiles(samples: &mut [f32]) -> (f32, f32) {
+    if samples.is_empty() {
+        return (0.0, 0.0);
+    }
+    samples.sort_by(f32::total_cmp);
+    let at = |p: f32| {
+        let idx = ((samples.len() - 1) as f32 * p).round() as usize;
+        samples[idx.min(samples.len() - 1)]
+    };
+    (at(0.5), at(0.99))
+}
+
+/// Latest stats for scripts and the macOS menu bar. Written atomically so a
+/// reader never sees a half-written file.
+fn write_status(text: &str) {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache")));
+    let Some(base) = base else {
+        return;
+    };
+    let dir = base.join("lgx");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let tmp = dir.join("status.json.tmp");
+    if std::fs::write(&tmp, text).is_ok() {
+        let _ = std::fs::rename(&tmp, dir.join("status.json"));
     }
 }
 
@@ -637,14 +831,22 @@ fn main() {
         );
     }
 
-    let stream = match Stream::new(&args) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("lgx-server: cannot start HEVC streaming: {e}");
-            std::process::exit(1);
-        }
-    };
-    hub.set_geometry(stream.w, stream.h);
+    // The render node must be pinned before any GBM/VAAPI call and before the
+    // encoder helper is spawned (it inherits LGX_DRM_NODE). CLI/config win
+    // over the environment; without either, auto-detection prefers Intel.
+    let drm_node = args
+        .drm_node
+        .clone()
+        .or_else(|| std::env::var("LGX_DRM_NODE").ok().filter(|v| !v.is_empty()))
+        .or_else(lgx_server::gbm::detect_render_node)
+        .unwrap_or_else(|| "/dev/dri/renderD128".to_string());
+    let explicit = args.drm_node.is_some();
+    lgx_server::gbm::set_drm_node(&drm_node);
+    eprintln!(
+        "lgx-server: DRM render node {drm_node} ({}, Intel: {})",
+        if explicit { "configured" } else { "auto-detected" },
+        lgx_server::gbm::node_vendor(&drm_node).eq_ignore_ascii_case("0x8086")
+    );
 
     let listen = args.listen.clone();
     let hub2 = hub.clone();
@@ -660,5 +862,77 @@ fn main() {
         })
         .expect("listen thread");
 
-    stream.run(&hub)
+    // KDE and GNOME do not implement wlr-screencopy; their supported capture
+    // path is the desktop portal. wlroots compositors keep the direct
+    // screencopy path, which is both faster and dialog-free.
+    if !matches!(args.capture.as_str(), "auto" | "wlr" | "portal") {
+        eprintln!("lgx-server: unknown --capture {} (auto, wlr or portal)", args.capture);
+        std::process::exit(2);
+    }
+    let use_portal = match args.capture.as_str() {
+        "portal" => true,
+        "wlr" => false,
+        _ => !capture::has_wlr_screencopy(),
+    };
+    if use_portal {
+        eprintln!("lgx-server: capture backend: xdg-desktop-portal ScreenCast");
+        let options = portal::Options {
+            helper_va: std::env::var("LGX_VAENC")
+                .unwrap_or_else(|_| "/usr/lib/lgx/lgx-vaenc".to_string()),
+            helper_nv: std::env::var("LGX_NVENC")
+                .unwrap_or_else(|_| "/usr/lib/lgx/lgx-nvenc".to_string()),
+            bitrate: args.bitrate,
+            fps: args.fps,
+            low_power: args.low_power,
+            async_depth: args.async_depth,
+            dmabuf: false,
+        };
+        if let Err(e) = portal::serve(hub, options) {
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                eprintln!("lgx-server: portal capture: {e}");
+                std::process::exit(0);
+            }
+            eprintln!("lgx-server: portal capture: {e}");
+            std::process::exit(1);
+        }
+        eprintln!("lgx-server: portal capture ended");
+        std::process::exit(1);
+    }
+    eprintln!("lgx-server: capture backend: wlr-screencopy");
+
+    // A broken encoder must never leave a silent dead stream: fall back to the
+    // GL conversion path and rebuild the pipeline, or exit for systemd.
+    let mut force_gl = false;
+    let mut last_geometry: Option<(u32, u32, u32)> = None;
+    loop {
+        let stream = match Stream::new(&args, force_gl) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("lgx-server: cannot start HEVC streaming: {e}");
+                std::process::exit(1);
+            }
+        };
+        hub.set_geometry(stream.w, stream.h);
+        let geometry = (stream.w, stream.h, stream.fps);
+        if last_geometry.is_some_and(|old| old != geometry) {
+            eprintln!(
+                "lgx-server: stream geometry now {}x{}@{}; asking clients to resize",
+                stream.w, stream.h, stream.fps
+            );
+            hub.broadcast_resize(stream.w, stream.h, stream.fps);
+        }
+        last_geometry = Some(geometry);
+        match stream.run(&hub) {
+            RunOutcome::Resize => {}
+
+            RunOutcome::NoPackets => {
+                eprintln!("lgx-server: falling back to GL conversion and rebuilding the stream");
+                force_gl = true;
+            }
+            RunOutcome::CaptureDead => {
+                eprintln!("lgx-server: exiting for a clean restart");
+                std::process::exit(1);
+            }
+        }
+    }
 }
