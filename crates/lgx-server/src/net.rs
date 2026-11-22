@@ -45,8 +45,10 @@ pub(crate) struct UdpLink {
 }
 
 impl UdpLink {
-    fn start(id: u64) -> std::io::Result<Arc<Self>> {
-        let sock = UdpSocket::bind(("0.0.0.0", 0))?;
+    fn start(id: u64, port: u16) -> std::io::Result<Arc<Self>> {
+        // Same number as the TCP control port: UDP and TCP do not collide, and
+        // a firewall rule for the video port then covers both transports.
+        let sock = UdpSocket::bind(("0.0.0.0", port))?;
         sock.set_read_timeout(Some(Duration::from_secs(2)))?;
         // One access unit can be several hundred kilobytes of datagrams; the
         // default send buffer drops the tail of a keyframe burst.
@@ -131,8 +133,8 @@ impl UdpLink {
 
 /// Bind a UDP socket for one client and tell it the port and key. Video keeps
 /// flowing over TCP until the client's hello datagram arrives.
-fn udp_offer(secure: &Secure, id: u64) -> Option<Arc<UdpLink>> {
-    let link = match UdpLink::start(id) {
+fn udp_offer(secure: &Secure, id: u64, port: u16) -> Option<Arc<UdpLink>> {
+    let link = match UdpLink::start(id, port) {
         Ok(link) => link,
         Err(e) => {
             eprintln!("lgx-server: client #{id}: udp: {e}");
@@ -514,6 +516,9 @@ fn handle(
     clip_set: Arc<dyn Fn(&str) + Send + Sync>,
     last_remote: Arc<Mutex<String>>,
 ) -> io::Result<()> {
+    // The TCP local port doubles as the UDP video port, so one firewall rule
+    // covers both transports.
+    let udp_port = stream.local_addr().map(|a| a.port()).unwrap_or_default();
     let client_id = match secure::server_read_id(&mut stream) {
         Ok(v) => v,
         Err(e) => {
@@ -644,7 +649,7 @@ fn handle(
                 // The client opted in. Only now does the server bind a UDP
                 // socket, so an old client that never asks keeps TCP video.
                 if hub.video_udp() {
-                    match udp_offer(&secure, id) {
+                    match udp_offer(&secure, id, udp_port) {
                         Some(link) => {
                             hub.attach_udp(id, link);
                         }

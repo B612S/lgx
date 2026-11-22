@@ -211,7 +211,9 @@ link Qt. Use `--no-reconnect` for tests.
 
 - Use the server's LAN address, not `127.0.0.1`, in the client profile.
 - Allow TCP **5902** (video/control) and **5903** (audio) through the server
-  firewall. TCP **5904** is only needed while pairing.
+  firewall. With `video.udp` the video datagrams arrive on UDP **5902** as
+  well (the server binds the same port number for both). TCP **5904** is only
+  needed while pairing.
 - The transport is AES-256-GCM; do not expose the ports to untrusted networks.
   Pairing is a one-shot local admin action, not an always-on endpoint.
 - One client per server. Different servers can be used side by side; the client
@@ -220,6 +222,12 @@ link Qt. Use `--no-reconnect` for tests.
   server's adaptive mode lowers it when frames are dropped and recovers when
   the link clears. `LGX_DEBUG_FPS=1 lgx-client ...` prints the client's
   per-second diagnostics.
+- Traffic is dominated by the encoder's rate control. On a 1080p160 desktop
+  that changes every frame (Hyprland with a blurred, animated bar): CBR at
+  40 Mbit/s sends 4.7 MiB/s, VBR 1.3-1.6 MiB/s, and `rc_mode = cqp` with
+  `qp = 22` sends 0.3 MiB/s at 33.7 dB PSNR (VBR at 40 Mbit/s measures
+  34.8 dB). CQP has no bitrate ceiling, so VBR stays the default; use CQP when
+  the link is fast and the traffic matters more than a hard cap.
 
 ## Configuration
 
