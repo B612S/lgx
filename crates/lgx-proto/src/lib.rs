@@ -64,6 +64,11 @@ pub mod msg {
     /// microseconds (u64 LE). The client turns it into the offset between the
     /// two clocks and can then report the capture-to-present latency.
     pub const PONG: u8 = 31;
+    /// The client missed UDP video fragments. Payload: u32 LE frame id,
+    /// u16 LE count, then `count` u16 LE fragment indices. The server resends
+    /// those datagrams unchanged, so the receiver's nonce and duplicate
+    /// checks still apply.
+    pub const NACK: u8 = 32;
     /// The client can receive video as UDP datagrams. Sent once after
     /// `CURSOR_SHAPE`; a server that predates UDP ignores it, and an old
     /// client never asks, so neither side breaks.
@@ -211,6 +216,7 @@ pub fn payload_len(m: &Msg) -> usize {
         | msg::FILE_DATA
         | msg::GAMEPAD
         | msg::VIDEO_UDP
+        | msg::NACK
         | msg::PONG
         | msg::CURSOR_IMAGE => m.a.max(0) as usize,
         _ => 0,

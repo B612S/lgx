@@ -42,7 +42,22 @@ pub(crate) struct UdpLink {
     key: [u8; lgx_proto::udp::KEY_LEN],
     peer: Mutex<Option<SocketAddr>>,
     next_frame: AtomicU32,
+    /// Recently sent access units, so a NACK can be answered without the
+    /// encoder: datagrams are stored sealed and resent byte for byte.
+    recent: Mutex<std::collections::VecDeque<SentFrame>>,
 }
+
+struct SentFrame {
+    frame_id: u32,
+    datagrams: Vec<Vec<u8>>,
+    bytes: usize,
+}
+
+/// Cache bound: a few hundred milliseconds of video. Staying small keeps the
+/// retransmission useful (a frame the client still needs) without pinning
+/// megabytes of capture output.
+const RECENT_FRAMES: usize = 64;
+const RECENT_BYTES: usize = 4 << 20;
 
 impl UdpLink {
     fn start(id: u64, port: u16) -> std::io::Result<Arc<Self>> {
@@ -70,6 +85,7 @@ impl UdpLink {
             key,
             peer: Mutex::new(None),
             next_frame: AtomicU32::new(1),
+            recent: Mutex::new(std::collections::VecDeque::new()),
         });
         let l = link.clone();
         std::thread::Builder::new()
@@ -112,6 +128,7 @@ impl UdpLink {
         }
         let frame_id = self.next_frame.fetch_add(1, Ordering::Relaxed);
         let mut datagram = Vec::with_capacity(lgx_proto::udp::MAX_DATAGRAM);
+        let mut sent = Vec::with_capacity(count);
         for (i, part) in chunk.chunks(lgx_proto::udp::MAX_PAYLOAD).enumerate() {
             let header = lgx_proto::udp::Header {
                 flags: if keyframe { lgx_proto::udp::FLAG_KEYFRAME } else { 0 },
@@ -126,8 +143,46 @@ impl UdpLink {
             if self.sock.send_to(&datagram, peer).is_err() {
                 return false;
             }
+            sent.push(datagram.clone());
+        }
+        {
+            let bytes: usize = sent.iter().map(|d| d.len()).sum();
+            let mut recent = self.recent.lock().unwrap();
+            recent.push_back(SentFrame {
+                frame_id,
+                datagrams: sent,
+                bytes,
+            });
+            while recent.len() > RECENT_FRAMES
+                || recent.iter().map(|f| f.bytes).sum::<usize>() > RECENT_BYTES
+            {
+                recent.pop_front();
+            }
         }
         true
+    }
+
+    /// Resend the fragments the client asked for. Returns how many datagrams
+    /// actually went out; a frame older than the cache is simply gone and the
+    /// client falls back to its IDR request.
+    fn retransmit(&self, frame_id: u32, indices: &[u16]) -> usize {
+        let peer = match *self.peer.lock().unwrap() {
+            Some(peer) => peer,
+            None => return 0,
+        };
+        let recent = self.recent.lock().unwrap();
+        let Some(frame) = recent.iter().find(|f| f.frame_id == frame_id) else {
+            return 0;
+        };
+        let mut sent = 0;
+        for &idx in indices {
+            if let Some(datagram) = frame.datagrams.get(idx as usize) {
+                if self.sock.send_to(datagram, peer).is_ok() {
+                    sent += 1;
+                }
+            }
+        }
+        sent
     }
 }
 
@@ -263,6 +318,18 @@ impl Hub {
 
     /// Switch one client's video to UDP. The next access unit is forced to be
     /// an IDR so the datagram stream starts from a clean reference.
+    /// Answer a client's NACK from the datagram cache. Called from the
+    /// control reader thread, never from the capture loop.
+    pub(crate) fn retransmit_udp(&self, id: u64, frame_id: u32, indices: &[u16]) -> usize {
+        let link = {
+            let list = self.clients.lock().unwrap();
+            list.iter()
+                .find(|c| c.id == id)
+                .and_then(|c| c.udp.clone())
+        };
+        link.map(|l| l.retransmit(frame_id, indices)).unwrap_or(0)
+    }
+
     pub(crate) fn attach_udp(&self, id: u64, link: Arc<UdpLink>) {
         {
             let mut list = self.clients.lock().unwrap();
@@ -644,6 +711,28 @@ fn handle(
                     eprintln!("lgx-server: client #{id} asked for an IDR");
                 }
                 hub.request_keyframe();
+            }
+            msg::NACK => {
+                // UDP video lost fragments: resend them from the cache.
+                if payload.len() >= 6 {
+                    let frame_id = u32::from_le_bytes(payload[0..4].try_into().unwrap());
+                    let count = u16::from_le_bytes([payload[4], payload[5]]) as usize;
+                    let mut indices = Vec::with_capacity(count.min(lgx_proto::udp::MAX_FRAGMENTS));
+                    for i in 0..count {
+                        let off = 6 + i * 2;
+                        if off + 2 > payload.len() {
+                            break;
+                        }
+                        indices.push(u16::from_le_bytes([payload[off], payload[off + 1]]));
+                    }
+                    let sent = hub.retransmit_udp(id, frame_id, &indices);
+                    if std::env::var_os("LGX_DEBUG_NACK").is_some() {
+                        eprintln!(
+                            "lgx-server: NACK frame {frame_id}: asked {}, resent {sent}",
+                            indices.len()
+                        );
+                    }
+                }
             }
             msg::UDP_VIDEO => {
                 // The client opted in. Only now does the server bind a UDP

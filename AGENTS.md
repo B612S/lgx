@@ -602,20 +602,23 @@ the Vulkan shader converts full-range BT.709, and the HEVC VUI says
   keyframe flag in the header, which is also the AAD). The client answers with
   one `LGXU` hello from its own socket; video stays on TCP until it arrives,
   and a failed datagram send falls back to TCP for that access unit. Nothing
-  is retransmitted: an incomplete access unit is dropped, the client skips to
-  the next keyframe and keeps re-requesting an IDR (over TCP) until one
-  arrives whole. The request is repeated every 50 ms while recovering,
-  because a keyframe is itself a burst that can lose a fragment; the server
-  answers each request with one IDR. Both sockets ask for an 8 MiB buffer
-  because one keyframe is hundreds of datagrams. Old clients never send
-  `UDP_VIDEO`, so they keep TCP video, and `LGX_NO_UDP=1` keeps a new client
-  on TCP. Measured on a clean LAN (1080p160, CQP qp=22): UDP 155 fps at
+  missing fragments are asked for again: the client sends `NACK` (frame id +
+  indices, over the control stream) when a frame has been quiet for 2 ms, and
+  the server answers from a cache of the last 64 access units / 4 MiB of
+  sealed datagrams. Two repair rounds are allowed per frame; after that the
+  frame is dropped and the client skips to the next keyframe, re-requesting an
+  IDR every 50 ms. A repair arrives a few milliseconds after the next frame
+  started, so completed access units wait in a two-slot reorder buffer and are
+  emitted in frame order. Both sockets ask for an 8 MiB buffer because one
+  keyframe is hundreds of datagrams. Old clients never send `UDP_VIDEO`, so
+  they keep TCP video, and `LGX_NO_UDP=1` keeps a new client on TCP. Measured on a clean LAN (1080p160, CQP qp=22): UDP 155 fps at
   capture->present p50/p99 0.6/4.7 ms, TCP 144 fps at 2.4/5.1 ms. With 0.5 %
   packet loss and 2 ms delay the trade-off flips: TCP keeps 142 fps at p99
   10.4 ms (retransmissions), UDP drops to ~108 fps at p99 7.1 ms because one
-  lost fragment discards the whole access unit. A NACK-based retransmission or
-  per-frame FEC would close that gap; do not claim UDP is universally better
-  without re-measuring.
+  lost fragment discards the whole access unit; with the NACK repair the same
+  lossy case measures ~110 fps, still below TCP because a fragment that is
+  lost twice, or whose frame was evicted from the cache, costs a keyframe.
+  Do not claim UDP is universally better without re-measuring.
 - `PING` (client) and `PONG` (server, payload = monotonic microseconds) let the
   client estimate the clock offset and print `capture->present` latency; the
   `--bench`/`--no-window` summary reports p50/p99 when the offset is known.

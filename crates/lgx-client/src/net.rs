@@ -272,9 +272,14 @@ fn set_socket_buffer(sock: &std::net::UdpSocket, opt: libc::c_int, bytes: libc::
     }
 }
 
-/// Reassemble HEVC access units from video datagrams. A lost fragment drops
-/// the whole access unit and asks the server for an IDR over the control
-/// stream, so the reference chain heals without a retransmission protocol.
+/// Reassemble HEVC access units from video datagrams.
+///
+/// Fragments are not retransmitted by the network: a fragment that never
+/// arrived is asked for again over the control stream (NACK) and the server
+/// answers from a small cache of recently sent datagrams. The repair arrives a
+/// few milliseconds after the newer frame started, so completed access units
+/// are held in a two-slot reorder buffer: emitting them in frame order keeps
+/// the decoder happy while a repair is in flight.
 fn udp_video(
     conn: Arc<Conn>,
     sock: std::net::UdpSocket,
@@ -291,6 +296,110 @@ fn udp_video(
         ts: u64,
         keyframe: bool,
         bytes: usize,
+        last_rx: std::time::Instant,
+        nacks: u8,
+    }
+
+    impl Partial {
+        fn new(id: u32, count: u16, ts: u64, keyframe: bool) -> Self {
+            Self {
+                id,
+                count,
+                got: 0,
+                parts: (0..count).map(|_| None).collect(),
+                ts,
+                keyframe,
+                bytes: 0,
+                last_rx: std::time::Instant::now(),
+                nacks: 0,
+            }
+        }
+
+        fn complete(&self) -> bool {
+            self.got == self.count
+        }
+
+        fn fill(&mut self, idx: usize, data: Vec<u8>) {
+            if idx < self.parts.len() && self.parts[idx].is_none() {
+                self.bytes += data.len();
+                self.parts[idx] = Some(data);
+                self.got += 1;
+                self.last_rx = std::time::Instant::now();
+            }
+        }
+
+        fn missing(&self) -> Vec<u16> {
+            self.parts
+                .iter()
+                .enumerate()
+                .filter(|(_, part)| part.is_none())
+                .map(|(i, _)| i as u16)
+                .collect()
+        }
+
+        fn into_au(self) -> Vec<u8> {
+            let mut au = Vec::with_capacity(self.bytes);
+            for part in self.parts.into_iter().flatten() {
+                au.extend_from_slice(&part);
+            }
+            au
+        }
+    }
+
+    fn request_idr(conn: &Conn, last: &mut Option<std::time::Instant>) {
+        if last.is_none_or(|t| t.elapsed() >= std::time::Duration::from_millis(50)) {
+            *last = Some(std::time::Instant::now());
+            let _ = conn.send(Msg::new(msg::IDR, 0, 0, 0), &[]);
+        }
+    }
+
+    /// Emit completed frames in id order. A frame stays queued while an older
+    /// one is still being repaired; the caller drops stale partials, so this
+    /// cannot wait forever.
+    fn pump(
+        ready: &mut std::collections::BTreeMap<u32, Partial>,
+        partials: &[Partial],
+        video: &std::sync::mpsc::SyncSender<Chunk>,
+        conn: &Conn,
+        dump: &mut Option<Option<std::fs::File>>,
+        skipping: &mut bool,
+        last_idr: &mut Option<std::time::Instant>,
+    ) -> bool {
+        while let Some((&id, _)) = ready.iter().next() {
+            if partials.iter().any(|p| p.id < id) {
+                break;
+            }
+            let p = ready.remove(&id).expect("queued frame");
+            if *skipping {
+                if !p.keyframe {
+                    continue;
+                }
+                eprintln!("lgx-client: udp: keyframe received, resuming");
+                *skipping = false;
+            }
+            conn.bytes.fetch_add(p.bytes as u64, Ordering::Relaxed);
+            let ts = p.ts;
+            let au = p.into_au();
+            if let Some(Some(file)) = dump.as_mut() {
+                use std::io::Write;
+                let _ = file.write_all(&au);
+            }
+            let chunk = Chunk {
+                data: au,
+                off: 0,
+                at: std::time::Instant::now(),
+                capture_us: ts,
+            };
+            match video.try_send(chunk) {
+                Ok(()) => {}
+                Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                    *skipping = true;
+                    request_idr(conn, last_idr);
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => return false,
+            }
+        }
+        true
     }
 
     let mut dump = std::env::var_os("LGX_DUMP_BITSTREAM").map(|path| {
@@ -301,19 +410,14 @@ fn udp_video(
             .ok()
     });
     let mut buf = vec![0u8; lgx_proto::udp::MAX_DATAGRAM];
-    let mut partial: Option<Partial> = None;
+    // Incomplete frames, oldest first; only the newest one grows, the older
+    // one is waiting for its retransmitted fragments.
+    let mut partials: Vec<Partial> = Vec::new();
+    // Completed frames waiting for an older repair to finish.
+    let mut ready: std::collections::BTreeMap<u32, Partial> = std::collections::BTreeMap::new();
     let mut last_id = 0u32;
     let mut skipping = false;
     let mut last_idr: Option<std::time::Instant> = None;
-    // A keyframe is itself a burst of datagrams, so it can be lost too. Ask
-    // often (20/s) while recovering: the server answers with one IDR per
-    // request and the extra traffic lasts only until a whole one arrives.
-    let request_idr = |last: &mut Option<std::time::Instant>| {
-        if last.is_none_or(|t| t.elapsed() >= std::time::Duration::from_millis(50)) {
-            *last = Some(std::time::Instant::now());
-            let _ = conn.send(Msg::new(msg::IDR, 0, 0, 0), &[]);
-        }
-    };
 
     loop {
         if conn.closed.load(Ordering::Relaxed) {
@@ -327,107 +431,97 @@ fn udp_video(
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                 ) =>
             {
+                let now = std::time::Instant::now();
+                // Ask for missing fragments of any frame that has gone quiet.
+                for p in partials.iter_mut() {
+                    if !p.complete()
+                        && p.nacks < 2
+                        && now.duration_since(p.last_rx).as_millis() >= 2
+                    {
+                        let missing = p.missing();
+                        let mut nack = Vec::with_capacity(6 + 2 * missing.len());
+                        nack.extend_from_slice(&p.id.to_le_bytes());
+                        nack.extend_from_slice(&(missing.len() as u16).to_le_bytes());
+                        for idx in &missing {
+                            nack.extend_from_slice(&idx.to_le_bytes());
+                        }
+                        if std::env::var_os("LGX_DEBUG_NACK").is_some() {
+                            eprintln!(
+                                "lgx-client: NACK frame {} for {} fragment(s)",
+                                p.id,
+                                missing.len()
+                            );
+                        }
+                        let _ = conn.send(Msg::new(msg::NACK, 0, nack.len() as i32, 0), &nack);
+                        p.nacks += 1;
+                        p.last_rx = now;
+                    }
+                }
+                // Give up on a frame only after both repair rounds failed.
+                let before = partials.len();
+                partials.retain(|p| {
+                    !(!p.complete()
+                        && p.nacks >= 2
+                        && now.duration_since(p.last_rx).as_millis() >= 15)
+                });
+                if partials.len() != before {
+                    skipping = true;
+                    request_idr(&conn, &mut last_idr);
+                }
+                if !pump(
+                    &mut ready,
+                    &partials,
+                    &video,
+                    &conn,
+                    &mut dump,
+                    &mut skipping,
+                    &mut last_idr,
+                ) {
+                    return;
+                }
                 continue;
             }
             Err(_) => return,
         };
-        let dbg = std::env::var_os("LGX_DEBUG_UDP").is_some();
         let Some((header, range)) = rx.open(&mut buf[..n]) else {
-            if dbg {
-                eprintln!("lgx-client: udp: bad datagram {n} bytes");
-            }
             continue;
         };
-        if dbg {
-            eprintln!(
-                "lgx-client: udp: frame {} frag {}/{} len {}",
-                header.frame_id, header.frag_idx, header.frag_count, range.len()
-            );
-        }
-        if header.frame_id < last_id {
-            // Late fragment of an access unit that was already dropped.
+        if header.frame_id < last_id && !partials.iter().any(|p| p.id == header.frame_id) {
+            // A late fragment of a frame that was already given up.
             continue;
         }
         if header.frame_id > last_id {
-            if let Some(p) = partial.take() {
-                if p.got < p.count {
-                    // A P-frame that references the lost one would only feed
-                    // the decoder garbage; wait for an IDR instead.
-                    if std::env::var_os("LGX_DEBUG_UDP").is_some() {
-                        eprintln!(
-                            "lgx-client: udp: frame {} incomplete ({}/{} fragments, {} bytes)",
-                            p.id, p.got, p.count, p.bytes
-                        );
-                    }
-                    skipping = true;
-                    request_idr(&mut last_idr);
-                }
-            }
             last_id = header.frame_id;
-            partial = Some(Partial {
-                id: header.frame_id,
-                count: header.frag_count,
-                got: 0,
-                parts: (0..header.frag_count).map(|_| None).collect(),
-                ts: header.ts_us,
-                keyframe: header.is_keyframe(),
-                bytes: 0,
-            });
+            // Keep at most two frames in flight: the previous one waiting for
+            // repairs and the current one. Anything older is lost.
+            partials.retain(|p| p.id + 2 > header.frame_id);
+            partials.push(Partial::new(
+                header.frame_id,
+                header.frag_count,
+                header.ts_us,
+                header.is_keyframe(),
+            ));
         }
-        let Some(p) = partial.as_mut() else {
+        let Some(p) = partials.iter_mut().find(|p| p.id == header.frame_id) else {
             continue;
         };
-        let idx = header.frag_idx as usize;
-        if idx < p.parts.len() && p.parts[idx].is_none() {
-            p.bytes += range.len();
-            p.parts[idx] = Some(buf[range].to_vec());
-            p.got += 1;
-        }
-        if p.got < p.count {
-            continue;
-        }
-        let done = partial.take().expect("partial frame");
-        conn.bytes.fetch_add(done.bytes as u64, Ordering::Relaxed);
-        let mut au = Vec::with_capacity(done.bytes);
-        for part in done.parts.into_iter().flatten() {
-            au.extend_from_slice(&part);
-        }
-        if std::env::var_os("LGX_DEBUG_UDP").is_some() {
-            eprintln!(
-                "lgx-client: udp: frame {last_id} complete, {} bytes, keyframe {}, skipping {skipping}",
-                au.len(),
-                done.keyframe
-            );
-        }
-        if skipping {
-            if !done.keyframe {
-                // Keep asking: a keyframe that loses one fragment is useless,
-                // and the only recovery is another one.
-                request_idr(&mut last_idr);
-                continue;
+        p.fill(header.frag_idx as usize, buf[range].to_vec());
+        if p.complete() {
+            if let Some(pos) = partials.iter().position(|q| q.id == header.frame_id) {
+                let done = partials.remove(pos);
+                ready.insert(done.id, done);
             }
-            eprintln!("lgx-client: udp: keyframe received, resuming");
-            skipping = false;
         }
-        if let Some(Some(file)) = dump.as_mut() {
-            let _ = std::io::Write::write_all(file, &au);
-        }
-        let chunk = Chunk {
-            data: au,
-            off: 0,
-            at: std::time::Instant::now(),
-            capture_us: done.ts,
-        };
-        match video.try_send(chunk) {
-            Ok(()) => {}
-            Err(std::sync::mpsc::TrySendError::Full(_)) => {
-                if !skipping {
-                    eprintln!("lgx-client: udp: decoder queue full, waiting for an IDR");
-                }
-                skipping = true;
-                request_idr(&mut last_idr);
-            }
-            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => return,
+        if !pump(
+            &mut ready,
+            &partials,
+            &video,
+            &conn,
+            &mut dump,
+            &mut skipping,
+            &mut last_idr,
+        ) {
+            return;
         }
     }
 }
@@ -541,7 +635,9 @@ fn reader(
                 // The server cannot know our ephemeral port; one hello from it
                 // tells it where to send, and it keeps using TCP until then.
                 let _ = sock.send_to(b"LGXUhello", addr);
-                let _ = sock.set_read_timeout(Some(std::time::Duration::from_millis(200)));
+                // A short timeout lets the receiver notice a fragment that
+                // never arrived and NACK it before the next frame's burst.
+                let _ = sock.set_read_timeout(Some(std::time::Duration::from_millis(2)));
                 udp_started = true;
                 eprintln!("lgx-client: video over UDP {addr}");
                 let conn2 = conn.clone();
