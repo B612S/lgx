@@ -228,6 +228,13 @@ link Qt. Use `--no-reconnect` for tests.
   `qp = 22` sends 0.3 MiB/s at 33.7 dB PSNR (VBR at 40 Mbit/s measures
   34.8 dB). CQP has no bitrate ceiling, so VBR stays the default; use CQP when
   the link is fast and the traffic matters more than a hard cap.
+- On macOS, `--vt-quality Q` replaces the bitrate target with VideoToolbox's
+  constant quality: 1920x1200 with an active screen cost 14.4 MiB/s at
+  200 Mbit/s and **1.4 MiB/s at quality 0.7**, at the same frame rate. The
+  LaunchAgent runs `--bitrate 50000000 --vt-quality 0.7`.
+- Audio is lossless **FLAC**: 48 kHz stereo would be 187.5 KiB/s as raw PCM,
+  and a desktop stream costs 15-18 KiB/s on the wire (the client prints the
+  wire rate).
 
 ## Configuration
 

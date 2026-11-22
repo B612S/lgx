@@ -440,11 +440,11 @@ pub fn run(
                                 timeline.push(ts, pushed);
                             }
                         }
-                        total += pcm.len() as u64;
+                        total += chunk.len() as u64;
                         if last.elapsed() >= Duration::from_secs(5) {
                             let missed = underruns.swap(0, Ordering::Relaxed);
                             eprintln!(
-                                "lgx-client: audio {:.1} KiB/s, {missed} underrun(s)",
+                                "lgx-client: audio {:.1} KiB/s on the wire, {missed} underrun(s)",
                                 total as f64 / 1024.0 / last.elapsed().as_secs_f64()
                             );
                             total = 0;
@@ -475,13 +475,14 @@ pub fn run(
                     timeline.push(ts_us, pushed);
                 }
             }
-            total += pcm.len() as u64;
+            total += chunk.len() as u64;
             if last.elapsed() >= Duration::from_secs(5) {
                 // Underruns are the audible kind of quality problem; surface
-                // them instead of hiding the gaps as silence.
+                // them instead of hiding the gaps as silence. The rate is what
+                // arrives on the wire, so FLAC and PCM can be compared.
                 let missed = underruns.swap(0, Ordering::Relaxed);
                 eprintln!(
-                    "lgx-client: audio {:.1} KiB/s, {missed} underrun(s)",
+                    "lgx-client: audio {:.1} KiB/s on the wire, {missed} underrun(s)",
                     total as f64 / 1024.0 / last.elapsed().as_secs_f64()
                 );
                 total = 0;
