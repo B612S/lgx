@@ -1,0 +1,11 @@
+[package]
+name = "lgx-vkvideo"
+description = "Native Vulkan Video H.265 decoder for lgx (experimental)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ash = { version = "0.38", features = ["loaded"] }
+libc = "0.2"
