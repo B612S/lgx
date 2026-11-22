@@ -601,8 +601,8 @@ the Vulkan shader converts full-range BT.709, and the HEVC VUI says
   (`lgx_proto::udp`: frame id, fragment index/count, capture timestamp and a
   keyframe flag in the header, which is also the AAD). The client answers with
   one `LGXU` hello from its own socket; video stays on TCP until it arrives,
-  and a failed datagram send falls back to TCP for that access unit. Nothing
-  missing fragments are asked for again: the client sends `NACK` (frame id +
+  and a failed datagram send falls back to TCP for that access unit. Missing
+  fragments are asked for again: the client sends `NACK` (frame id +
   indices, over the control stream) when a frame has been quiet for 2 ms, and
   the server answers from a cache of the last 64 access units / 4 MiB of
   sealed datagrams. Two repair rounds are allowed per frame; after that the
