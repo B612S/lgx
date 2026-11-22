@@ -266,6 +266,9 @@ enum RunOutcome {
     /// The output's mode changed; rebuild the encoder at the new size and
     /// tell the clients to offer a resize.
     Resize,
+    /// Constant-quality mode exceeded the configured bitrate; rebuild the
+    /// encoder with a higher quantiser.
+    Rate { qp: u32 },
 }
 
 /// The HEVC pipeline: capture -> GL NV12 -> VAAPI -> dma-buf packets.
@@ -278,6 +281,9 @@ struct Stream {
     h: u32,
     fps: u32,
     bitrate: u32,
+    /// Quantiser the encoder was opened with (constant-quality mode).
+    qp: u32,
+    cqp: bool,
     cpu: bool,
     vpp: bool,
     _target: Option<FdGuard>,
@@ -488,6 +494,8 @@ impl Stream {
             h,
             fps,
             bitrate: args.bitrate,
+            qp: args.qp,
+            cqp: args.rc_mode == "cqp",
             cpu,
             vpp,
             _target: target,
@@ -505,6 +513,10 @@ impl Stream {
         let mut last_progress = Instant::now();
         let mut capture_errors = 0u32;
         let mut skipped = 0u64;
+        // Constant quality has no bitrate ceiling of its own; count ticks over
+        // and under the configured cap to adapt the quantiser.
+        let mut over_ticks = 0u32;
+        let mut under_ticks = 0u32;
         let mut damage_changed = 0u64;
         let mut damage_unknown = 0u64;
         // Digest of the picture the client currently has. Only a frame whose
@@ -721,10 +733,52 @@ impl Stream {
                 let clients = hub.client_count();
                 let dropped = hub.take_dropped();
                 let fps = frames as f64 / t0.elapsed().as_secs_f64();
-                let mib_s = bytes as f64 / t0.elapsed().as_secs_f64() / 1_048_576.0;
+                let dt = t0.elapsed().as_secs_f64();
+                let mib_s = bytes as f64 / dt / 1_048_576.0;
                 eprintln!(
                     "lgx-server: HEVC {fps:.1} fps, {mib_s:.1} MiB/s, wait p50/p99 {wait_p50:.2}/{wait_p99:.2} ms, render {render_p50:.2}/{render_p99:.2} ms, encode {encode_p50:.2}/{encode_p99:.2} ms, {clients} clients, {dropped} dropped, {skipped} skipped"
                 );
+                if self.cqp {
+                    let rate = bytes as f64 * 8.0 / dt;
+                    let cap = self.bitrate as f64;
+                    if rate > cap {
+                        over_ticks += 1;
+                        under_ticks = 0;
+                        // Jump far when the content is many times over the
+                        // cap (full-screen noise costs 400 Mbit/s at qp 22).
+                        if over_ticks >= 2 {
+                            let step = if rate > cap * 4.0 { 8 } else { 4 };
+                            let qp = (self.qp + step).min(51);
+                            if qp != self.qp {
+                                eprintln!(
+                                    "lgx-server: CQP {:.1} Mbit/s is over the {} Mbit/s cap; raising qp {} -> {qp}",
+                                    rate / 1e6,
+                                    self.bitrate / 1_000_000,
+                                    self.qp
+                                );
+                                return RunOutcome::Rate { qp };
+                            }
+                        }
+                    } else {
+                        over_ticks = 0;
+                        // Recover slowly so a short calm period does not make
+                        // the stream oscillate.
+                        if rate < cap * 0.25 && self.qp > 18 {
+                            under_ticks += 1;
+                            if under_ticks >= 6 {
+                                let qp = (self.qp - 2).max(18);
+                                eprintln!(
+                                    "lgx-server: CQP is at {:.1} Mbit/s, well under the cap; lowering qp {} -> {qp}",
+                                    rate / 1e6,
+                                    self.qp
+                                );
+                                return RunOutcome::Rate { qp };
+                            }
+                        } else {
+                            under_ticks = 0;
+                        }
+                    }
+                }
                 let status = format!(
                     concat!(
                         "{{\"ts\":{},\"fps\":{:.1},\"mib_s\":{:.2},",
@@ -1010,6 +1064,7 @@ fn main() {
     // GL conversion path and rebuild the pipeline, or exit for systemd.
     let mut force_gl = false;
     let mut last_geometry: Option<(u32, u32, u32)> = None;
+    let mut args = args;
     loop {
         let stream = match Stream::new(&args, force_gl) {
             Ok(s) => s,
@@ -1030,6 +1085,9 @@ fn main() {
         last_geometry = Some(geometry);
         match stream.run(&hub) {
             RunOutcome::Resize => {}
+            RunOutcome::Rate { qp } => {
+                args.qp = qp;
+            }
 
             RunOutcome::NoPackets => {
                 eprintln!("lgx-server: falling back to GL conversion and rebuilding the stream");

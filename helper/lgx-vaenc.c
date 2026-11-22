@@ -319,13 +319,13 @@ int main(int argc, char **argv) {
         int qp = 24;
         const char *q = getenv("LGX_QP");
         if (q && atoi(q) > 0 && atoi(q) < 52) qp = atoi(q);
-        /* qmin == qmax is the constant quantiser. Setting global_quality
-         * instead is not equivalent: iHD treats it as a raw QP and clamps
-         * the awkward FF_QP2LAMBDA-scaled value to 51, which crushed the
-         * picture (24.5 dB PSNR instead of 33.7 dB for the same bitrate). */
+        /* iHD takes the constant quantiser from global_quality, raw (not
+         * FF_QP2LAMBDA-scaled: multiplying it clamped to QP 51 and crushed
+         * the picture). qmin/qmax are set to match, but VDENC ignores them,
+         * so an adaptive QP has to go through global_quality. */
+        enc->global_quality = qp;
         enc->qmin = qp;
         enc->qmax = qp;
-        enc->global_quality = -1;
     }
     if (rc_mode >= 3) {
         enc->rc_max_rate = bitrate;

@@ -98,16 +98,22 @@ Commit format: `area: short imperative summary`, for example
   pads a static desktop up to the target, so an idle 1080p160 session cost
   4.7 MiB/s. VBR spends bits on the content and costs 1.2-1.6 MiB/s, but it
   also spends its whole VBV budget on a near-lossless keyframe (527 KiB every
-  second) and VDENC ignores `qmin` in VBR. CQP (`qmin == qmax == qp`) is what
-  the driver actually honours: qp=22 cost ~2.5 Mbit/s on the same desktop
-  with 33.7 dB PSNR against 34.8 dB for VBR at 40 Mbit/s. Setting
-  `global_quality` instead is not equivalent — iHD treats it as a raw QP and
-  clamps the FF_QP2LAMBDA-scaled value to 51, which crushed the picture
-  (24.5 dB). CQP has no bitrate ceiling, so VBR stays the default; the VM runs
-  `rc_mode = cqp, qp = 22`. Measured worst case: a full-screen 1080p60 noise
-  source costs 51 MiB/s (410 Mbit/s) at qp=22, against 0.3 MiB/s for a normal
-  desktop — only use CQP where the link can absorb that spike. NVENC maps `cqp` to `constqp` and otherwise keeps
-  its `rc` option (VBR is unverified on NVIDIA hardware).
+  second) and VDENC ignores `qmin` in VBR. In CQP the quantiser comes from
+  `avctx->global_quality`, **raw** — iHD does not apply FF_QP2LAMBDA there, and
+  `qmin == qmax` is ignored by VDENC (an adaptive QP has to go through
+  `global_quality`; the QP only changes by reopening the encoder). Multiplying
+  the QP by `FF_QP2LAMBDA` clamps it to 51 and crushes the picture (24.5 dB
+  instead of 34.4 dB). Measured at true qp=22: 0.6 MiB/s (5 Mbit/s) on a
+  changing 1080p desktop at 34.4 dB PSNR, against 1.5 MiB/s for VBR at
+  40 Mbit/s and 34.8 dB. CQP has no bitrate ceiling of its own: a full-screen
+  1080p60 noise source costs 425 Mbit/s at qp=22. The server therefore watches
+  the outgoing rate every stats tick: two ticks over `video.bitrate` rebuild
+  the encoder at a higher qp (+8 when more than 4x over the cap, +4
+  otherwise), and six ticks below a quarter of the cap lower it by 2 (never
+  below 18). Measured: the noise case settled under a 10 Mbit/s cap in ~20 s
+  and went back down once the noise stopped. VBR is still the default; the VM
+  runs `rc_mode = cqp, qp = 22`. NVENC maps `cqp` to `constqp` and otherwise
+  keeps its `rc` option (VBR is unverified on NVIDIA hardware).
 - The helper is a separate process because it owns the VAAPI/VPP surfaces.
   With VPP the server only sends the captured frame fd and metadata; the GL
   fallback renders into the helper's dma-bufs.
