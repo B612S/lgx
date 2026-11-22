@@ -1,9 +1,11 @@
 //! System audio capture and fan-out to the single audio client.
 //!
-//! The capture itself lives in the `lgx-macos-audio` helper: a Core Audio
-//! process tap reads the macOS system mix, mutes the local playback while the
-//! tap is being read, and writes timestamped s16le 48 kHz stereo frames to
-//! stdout. This module owns the audio TCP listener, the lgx secure handshake,
+//! The capture itself lives in the `lgx-macos-audio` helper: Core Audio
+//! process taps read the macOS system mix (while a software mixer such as
+//! FineTune runs, that mixer's output plus the system sound daemon, which the
+//! mixer leaves untouched), mute the local playback while the taps are being
+//! read, and write timestamped s16le 48 kHz stereo frames to stdout. This
+//! module owns the audio TCP listener, the lgx secure handshake,
 //! the pipe between the helper and the client, and the timestamp framing that
 //! lets the client align audio with the video timeline.
 //!

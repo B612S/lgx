@@ -17,8 +17,8 @@
 //! ```
 //!
 //! The command line still wins over the file, so a one-off run can override
-//! everything; `--rotate` writes a fresh token here *and* into the LaunchAgent
-//! so the plist copy does not go stale.
+//! everything; `--rotate` writes a fresh token here and removes a legacy
+//! `--token` from the LaunchAgent (the plist must not carry secrets).
 
 use std::io;
 use std::os::unix::fs::OpenOptionsExt;

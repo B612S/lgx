@@ -143,6 +143,55 @@ fn launch_agent_path() -> Option<std::path::PathBuf> {
     path.exists().then_some(path)
 }
 
+/// Removes a legacy `--token VALUE` pair from the LaunchAgent. The token lives
+/// in `macos.conf` (mode 0600); leaving it in `ProgramArguments` exposes it to
+/// every `ps`/`pgrep` on the machine. Launchd caches the plist, so the agent
+/// has to be restarted once before the scrubbed copy takes effect.
+fn scrub_launch_agent_token() -> bool {
+    let Some(plist) = launch_agent_path() else {
+        return false;
+    };
+    let Some(plist) = plist.to_str() else {
+        return false;
+    };
+    let print = |key: &str| -> Option<String> {
+        Command::new("/usr/libexec/PlistBuddy")
+            .args(["-c", &format!("Print :ProgramArguments:{key}"), plist])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    };
+    let mut found = None;
+    for i in 0..32 {
+        match print(&i.to_string()) {
+            Some(value) if value == "--token" => {
+                found = Some(i);
+                break;
+            }
+            Some(_) => continue,
+            None => break,
+        }
+    }
+    let Some(i) = found else {
+        return false;
+    };
+    // Delete the value first so the flag index stays valid.
+    let _ = Command::new("/usr/libexec/PlistBuddy")
+        .args(["-c", &format!("Delete :ProgramArguments:{}", i + 1), plist])
+        .status();
+    let ok = Command::new("/usr/libexec/PlistBuddy")
+        .args(["-c", &format!("Delete :ProgramArguments:{i}"), plist])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if ok {
+        info!("removed --token from the LaunchAgent; the token is read from {}", config::path().display());
+        info!("restart the LaunchAgent once so launchd stops passing the old token");
+    }
+    ok
+}
+
 fn parse_args() -> Args {
     let cfg = Config::load();
     let mut a = Args {
@@ -201,7 +250,10 @@ fn parse_args() -> Args {
         };
         match argv[i].as_str() {
             "--listen" => a.listen = next(&mut i),
-            "--token" => a.token = next(&mut i),
+            "--token" => {
+                warn!("--token is visible in ps; put it in {} or LGX_TOKEN instead", config::path().display());
+                a.token = next(&mut i);
+            }
             "--fps" => a.fps = Some(next(&mut i).parse().unwrap_or(60)),
             "--bitrate" => a.bitrate = next(&mut i).parse().unwrap_or(20_000_000),
             "--display" => a.display = next(&mut i).parse().ok(),
@@ -232,8 +284,8 @@ fn cfg_audio_enabled() -> bool {
     std::env::var("LGX_NO_AUDIO").is_err()
 }
 
-/// Generate a fresh token, store it in the config and mirror it into the
-/// LaunchAgent, whose `--token` argument would otherwise override the file.
+/// Generate a fresh token and store it in the config. A legacy `--token` in
+/// the LaunchAgent is removed so the secret does not appear in `ps`.
 fn rotate(args: &Args) -> std::io::Result<()> {
     let token = auth::generate_token();
     let mut cfg = Config::load();
@@ -246,16 +298,9 @@ fn rotate(args: &Args) -> std::io::Result<()> {
     cfg.wheel_invert = Some(args.wheel_invert);
     cfg.adaptive = Some(args.adaptive);
     cfg.save()?;
-    if let Some(plist) = launch_agent_path() {
-        let status = Command::new("/usr/libexec/PlistBuddy")
-            .arg("-c")
-            .arg(format!("Set :ProgramArguments:4 {token}"))
-            .arg(&plist)
-            .status();
-        if !matches!(status, Ok(s) if s.success()) {
-            warn!("cannot update {}: the running server keeps the old token", plist.display());
-        }
-    }
+    // The token must never live in the LaunchAgent: drop a legacy copy so the
+    // plist and `ps` stop carrying it.
+    scrub_launch_agent_token();
     info!("new token written to {}", config::path().display());
     info!("restart the server, then re-pair the client so its profile gets the new token");
     Ok(())
@@ -542,6 +587,8 @@ fn send_helper(helper: &Mutex<Option<std::process::ChildStdin>>, line: &str) {
 
 fn main() {
     let mut args = parse_args();
+    // Existing installs may still pass the token through ProgramArguments.
+    scrub_launch_agent_token();
 
     if args.rotate {
         match rotate(&args) {

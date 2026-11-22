@@ -1,10 +1,13 @@
 // lgx-macos-audio — capture the macOS system audio mix for lgx.
 //
-// A Core Audio process tap (macOS 14.4+) captures every process's output.
-// The tap uses CATapMutedWhenTapped, so while this process reads it the HAL
-// stops sending that audio to the speakers: the client hears the stream and
-// the Mac itself stays quiet. No virtual audio driver is installed and the
-// system's default output device is not changed.
+// A Core Audio process tap (macOS 14.4+) captures the system mix. The tap
+// uses CATapMutedWhenTapped, so while this process reads it the HAL stops
+// sending that audio to the speakers: the client hears the stream and the
+// Mac itself stays quiet. While an audio mixer (FineTune) runs, the capture
+// is a mixdown of the mixer plus the system sound daemon (the one system
+// source the mixer does not re-render), and a global mute-only tap keeps
+// everything else silent locally. No virtual audio driver is installed and
+// the system's default output device is not changed.
 //
 // stdout carries framed PCM: u64 LE timestamp, u32 LE byte count, then
 // little-endian signed 16-bit stereo frames at 48 kHz. The timestamp is the
@@ -298,6 +301,13 @@ let mixerBundleIDs: [String] = {
 }()
 let tapMode = ProcessInfo.processInfo.environment["LGX_AUDIO_TAP"] ?? "auto"
 
+/// The daemon that renders alert/UI/notification sounds. FineTune keeps it
+/// out of its own tap (its process monitor filters system daemons), so a
+/// mixer-only capture never receives it. On current macOS the process object
+/// reports the plain bundle ID `systemsoundserverd`; older builds used a
+/// `com.apple.systemsound*` ID. Match both.
+let systemSoundBundlePrefixes = ["systemsound", "com.apple.systemsound"]
+
 /// One process tap plus its private tap-only aggregate and running IOProc.
 final class TapSource {
     var tapID = AudioObjectID(kAudioObjectUnknown)
@@ -429,10 +439,8 @@ func processBundleID(_ process: AudioObjectID) -> String? {
     return value.takeRetainedValue() as String
 }
 
-/// Process objects of the known audio mixers. The object exists as soon as the
-/// app is an audio client, even before it renders anything, so the topology can
-/// be chosen at startup.
-func mixerProcesses() -> [AudioObjectID] {
+/// Audio client processes currently known to the HAL.
+func processObjectList() -> [AudioObjectID] {
     var list = [AudioObjectID](repeating: 0, count: 256)
     var size = UInt32(list.count * MemoryLayout<AudioObjectID>.size)
     var address = propertyAddress(kAudioHardwarePropertyProcessObjectList)
@@ -441,36 +449,92 @@ func mixerProcesses() -> [AudioObjectID] {
     )
     guard status == noErr else { return [] }
     let count = Int(size) / MemoryLayout<AudioObjectID>.size
-    return list.prefix(count).filter { process in
+    return Array(list.prefix(count))
+}
+
+/// Process objects of the known audio mixers. The object exists as soon as the
+/// app is an audio client, even before it renders anything, so the topology can
+/// be chosen at startup.
+func mixerProcesses() -> [AudioObjectID] {
+    processObjectList().filter { process in
         guard let bundle = processBundleID(process) else { return false }
         return mixerBundleIDs.contains(bundle)
     }
 }
 
-/// Process object ids of the mixers the current tap topology was built for.
+/// Process objects of the system sound daemon. Its output is guest system
+/// audio (alerts, UI and notification sounds) that belongs in the stream, but
+/// FineTune deliberately does not re-render it, so it has to be captured
+/// alongside the mixer.
+func systemSoundProcesses() -> [AudioObjectID] {
+    processObjectList().filter { process in
+        guard let bundle = processBundleID(process)?.lowercased() else { return false }
+        return systemSoundBundlePrefixes.contains(where: { bundle.hasPrefix($0) })
+    }
+}
+
+/// Process object ids the current tap topology was built for.
 var activeMixers: [AudioObjectID] = []
+var activeSystemSounds: [AudioObjectID] = []
+
+/// Creates the pair used by the mixer topology: a global mute-only tap that
+/// silences every process except `excluded` (the mixer itself, which the
+/// capture tap mutes), and the mixdown `captured`. Returns nil after tearing
+/// down a half-built pair so a caller can retry with a smaller capture set.
+func startMixerPair(
+    _ captured: [AudioObjectID],
+    excluding excluded: [AudioObjectID]
+) -> [TapSource]? {
+    let muteDescription = CATapDescription(stereoGlobalTapButExcludeProcesses: excluded)
+    let captureDescription = CATapDescription(stereoMixdownOfProcesses: captured)
+    let muteSource = createTapSource(muteDescription, "lgx audio mute")
+    let captureSource = createTapSource(captureDescription, "lgx audio mixer")
+    guard let muteSource, let captureSource else {
+        if let muteSource { destroyTapSource(muteSource) }
+        if let captureSource { destroyTapSource(captureSource) }
+        return nil
+    }
+    guard checkTapFormat(captureSource, "mixer"),
+          startTapSource(muteSource, "mute", { _ in }),
+          startTapSource(captureSource, "mixer", { handleInput($0) })
+    else {
+        destroyTapSource(muteSource)
+        destroyTapSource(captureSource)
+        return nil
+    }
+    return [muteSource, captureSource]
+}
 
 func setupTaps() -> Bool {
-    let mixers = tapMode == "global" ? [] : mixerProcesses()
+    var mixers: [AudioObjectID] = []
+    var systemSounds: [AudioObjectID] = []
+    if tapMode != "global" {
+        mixers = mixerProcesses()
+        systemSounds = systemSoundProcesses()
+    }
     activeMixers = mixers
+    activeSystemSounds = systemSounds
+    if !mixers.isEmpty, systemSounds.isEmpty {
+        log("system sound daemon not running; system sounds will be added when it appears")
+    }
     if !mixers.isEmpty {
-        let muteDescription = CATapDescription(stereoGlobalTapButExcludeProcesses: mixers)
-        let captureDescription = CATapDescription(stereoMixdownOfProcesses: mixers)
-        let muteSource = createTapSource(muteDescription, "lgx audio mute")
-        let captureSource = createTapSource(captureDescription, "lgx audio mixer")
-        if let muteSource, let captureSource,
-           checkTapFormat(captureSource, "mixer"),
-           startTapSource(muteSource, "mute", { _ in }),
-           startTapSource(captureSource, "mixer", { handleInput($0) }) {
-            tapSources = [muteSource, captureSource]
+        var captured = mixers
+        for process in systemSounds where !captured.contains(process) {
+            captured.append(process)
+        }
+        if let sources = startMixerPair(captured, excluding: mixers) {
+            tapSources = sources
+            let extra = systemSounds.isEmpty ? "" : " and system sounds"
             log(
-                "capturing the mixer output (\(mixerBundleIDs.joined(separator: ","))); "
-                    + "other apps are muted locally"
+                "capturing the mixer output (\(mixerBundleIDs.joined(separator: ",")))"
+                    + "\(extra); other apps are muted locally"
             )
+        } else if captured != mixers, let sources = startMixerPair(mixers, excluding: mixers) {
+            // A system daemon cannot always be tapped. Keep the de-duplicated
+            // mixer path rather than falling back to the doubled full mix.
+            tapSources = sources
+            log("cannot capture system sounds; capturing the mixer output only")
         } else {
-            // Do not leave a half-built pair behind; fall back to the whole mix.
-            if let muteSource { destroyTapSource(muteSource) }
-            if let captureSource { destroyTapSource(captureSource) }
             log("mixer capture unavailable; falling back to the full system mix")
         }
     }
@@ -555,11 +619,18 @@ watchdog.setEventHandler {
         log("no non-silent audio after 15 s; if the client is silent, allow System Audio Recording for the app")
     }
     // FineTune may start after the helper or quit mid-session; the topology
-    // has to follow, otherwise the client either doubles or goes silent.
+    // has to follow, otherwise the client either doubles or goes silent. The
+    // system sound daemon is tracked too: if it appears after the mixer tap
+    // was built, alerts would stay inaudible until the next restart.
     if ticks % 2 == 0, tapMode != "global" {
         let mixers = mixerProcesses()
         if Set(mixers) != Set(activeMixers) {
             rebuildTaps()
+        } else if !mixers.isEmpty {
+            let systemSounds = systemSoundProcesses()
+            if Set(systemSounds) != Set(activeSystemSounds) {
+                rebuildTaps()
+            }
         }
     }
 }
