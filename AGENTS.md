@@ -90,7 +90,11 @@ Commit format: `area: short imperative summary`, for example
   the frame that was actually sent. A pending keyframe always encodes, or a
   client that connects while the desktop is idle would never get its IDR.
   Skipped frames do not trip the 5 s no-packet watchdog.
-  `LGX_NO_DAMAGE_SKIP=1` disables the skip. The CPU mapping costs one 8 KiB
+  `video.skip_idle` (default true) controls the whole mechanism, including the
+  digest: the hash reads the entire capture buffer and `DMA_BUF_IOCTL_SYNC`
+  around it flushes it, ~0.6 ms per 1080p frame on this VM, so on a desktop
+  whose widgets animate every frame (the digest never matches) it is pure
+  cost. `LGX_NO_DAMAGE_SKIP=1` disables it as well. The CPU mapping costs one 8 KiB
   memcpy worth of bandwidth per 1080p frame; if a compositor cannot map the
   buffer the server simply encodes every frame.
 - **Rate control is `video.rc_mode` (`cbr`/`vbr`/`cqp`/`icq`, default `vbr`)
