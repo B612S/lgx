@@ -27,6 +27,7 @@
 //!
 //! Usage:
 //!   lgx-server-macos [--listen ADDR] [--fps N] [--bitrate BPS] [--display N]
+//!                    [--vt-quality Q] [--vt-max-delay N]
 //!                    [--wheel-invert|--no-wheel-invert] [--no-adaptive]
 //!                    [--no-audio] [--audio-listen ADDR]
 //!                    [--helper PATH] [--input-helper PATH] [--audio-helper PATH]
@@ -145,6 +146,12 @@ struct Args {
     pb_helper: String,
     /// Flip the wheel direction passed to `lgx-cginput`.
     wheel_invert: bool,
+    /// Frames VideoToolbox may hold (`LGX_VT_MAX_DELAY`); 1 drops frames the
+    /// encoder cannot finish in time.
+    vt_max_delay: u32,
+    /// 0 disables constant quality; 0 < q <= 1 sets `Quality` and drops the
+    /// bitrate target.
+    vt_quality: f64,
     /// Lower the bitrate when frames are dropped and raise it again when the
     /// link recovers.
     adaptive: bool,
@@ -258,6 +265,14 @@ fn parse_args() -> Args {
             .or_else(|| sibling("lgx-pb"))
             .unwrap_or_else(|| "lgx-pb".into()),
         wheel_invert: cfg.wheel_invert.unwrap_or(false),
+        vt_max_delay: std::env::var("LGX_VT_MAX_DELAY")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1),
+        vt_quality: std::env::var("LGX_VT_QUALITY")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.0),
         adaptive: cfg.adaptive.unwrap_or(true),
         pair: false,
         pair_name: "macbook".into(),
@@ -294,6 +309,8 @@ fn parse_args() -> Args {
             }
             "--fps" => a.fps = Some(next(&mut i).parse().unwrap_or(60)),
             "--bitrate" => a.bitrate = next(&mut i).parse().unwrap_or(20_000_000),
+            "--vt-max-delay" => a.vt_max_delay = next(&mut i).parse().unwrap_or(1),
+            "--vt-quality" => a.vt_quality = next(&mut i).parse().unwrap_or(0.0),
             "--display" => a.display = next(&mut i).parse().ok(),
             "--helper" => a.helper = next(&mut i),
             "--input-helper" => a.input_helper = next(&mut i),
@@ -443,6 +460,8 @@ fn spawn_capture(args: &Args) -> std::io::Result<(Child, u32, u32, u32, Option<u
     let mut child = child_cmd
         .arg("--bitrate")
         .arg(args.bitrate.to_string())
+        .env("LGX_VT_MAX_DELAY", args.vt_max_delay.to_string())
+        .env("LGX_VT_QUALITY", format!("{:.3}", args.vt_quality))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

@@ -59,6 +59,13 @@ func envInt(_ name: String, _ fallback: Int) -> Int {
     return n
 }
 
+func envDouble(_ name: String, _ fallback: Double) -> Double {
+    guard let value = ProcessInfo.processInfo.environment[name], let n = Double(value) else {
+        return fallback
+    }
+    return n
+}
+
 
 func runSelfTest(_ w: Int, _ h: Int, _ frames: Int, _ fps: Int, _ handle: FileHandle) {
     let enc = Encoder(out: handle)
@@ -472,8 +479,18 @@ final class Encoder: NSObject, SCStreamOutput, SCStreamDelegate {
                              value: kVTProfileLevel_HEVC_Main_AutoLevel)
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AllowFrameReordering,
                              value: kCFBooleanFalse)
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate,
-                             value: bitrate as CFNumber)
+        // Constant-quality mode: `Quality` (0..1) makes the encoder spend bits
+        // where the picture needs them and never drops a frame to hit a rate,
+        // which is what a static desktop wants. The bitrate target is then
+        // only a ceiling for the server's adaptive logic.
+        let quality = envDouble("LGX_VT_QUALITY", 0)
+        if quality > 0 {
+            VTSessionSetProperty(session, key: kVTCompressionPropertyKey_Quality,
+                                 value: quality as CFNumber)
+        } else {
+            VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate,
+                                 value: bitrate as CFNumber)
+        }
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ExpectedFrameRate,
                              value: fps as CFNumber)
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameInterval,

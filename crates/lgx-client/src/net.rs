@@ -97,6 +97,8 @@ pub struct Conn {
     secure: Arc<Secure>,
     pub last_remote: Arc<Mutex<String>>,
     pub bytes: AtomicU64,
+    /// VIDEO messages received (before any queueing).
+    pub videos: AtomicU64,
     /// Set by the reader when the server closes or the stream fails.
     pub closed: std::sync::atomic::AtomicBool,
     /// Server asked for a local cursor (it does not composite the pointer).
@@ -198,7 +200,7 @@ pub fn connect(
     keymap: &[u8],
     client_id: &str,
     token: &str,
-    video: std::sync::mpsc::SyncSender<Chunk>,
+    video: Arc<ChunkQueue>,
     clipboard: ClipPolicy,
 ) -> std::io::Result<(Arc<Conn>, Hello)> {
     let stream = TcpStream::connect(addr)?;
@@ -241,6 +243,7 @@ pub fn connect(
         secure: secure.clone(),
         last_remote,
         bytes: AtomicU64::new(0),
+        videos: AtomicU64::new(0),
         closed: std::sync::atomic::AtomicBool::new(false),
         clock: std::sync::Mutex::new(Clock::default()),
         local_cursor: std::sync::atomic::AtomicBool::new(false),
@@ -284,7 +287,7 @@ fn udp_video(
     conn: Arc<Conn>,
     sock: std::net::UdpSocket,
     rx: lgx_proto::udp::Rx,
-    video: std::sync::mpsc::SyncSender<Chunk>,
+    video: Arc<ChunkQueue>,
 ) {
     use std::sync::atomic::Ordering;
 
@@ -294,21 +297,19 @@ fn udp_video(
         got: u16,
         parts: Vec<Option<Vec<u8>>>,
         ts: u64,
-        keyframe: bool,
         bytes: usize,
         last_rx: std::time::Instant,
         nacks: u8,
     }
 
     impl Partial {
-        fn new(id: u32, count: u16, ts: u64, keyframe: bool) -> Self {
+        fn new(id: u32, count: u16, ts: u64) -> Self {
             Self {
                 id,
                 count,
                 got: 0,
                 parts: (0..count).map(|_| None).collect(),
                 ts,
-                keyframe,
                 bytes: 0,
                 last_rx: std::time::Instant::now(),
                 nacks: 0,
@@ -359,10 +360,9 @@ fn udp_video(
     fn pump(
         ready: &mut std::collections::BTreeMap<u32, Partial>,
         partials: &[Partial],
-        video: &std::sync::mpsc::SyncSender<Chunk>,
+        video: &ChunkQueue,
         conn: &Conn,
         dump: &mut Option<Option<std::fs::File>>,
-        skipping: &mut bool,
         last_idr: &mut Option<std::time::Instant>,
     ) -> bool {
         while let Some((&id, _)) = ready.iter().next() {
@@ -370,13 +370,6 @@ fn udp_video(
                 break;
             }
             let p = ready.remove(&id).expect("queued frame");
-            if *skipping {
-                if !p.keyframe {
-                    continue;
-                }
-                eprintln!("lgx-client: udp: keyframe received, resuming");
-                *skipping = false;
-            }
             conn.bytes.fetch_add(p.bytes as u64, Ordering::Relaxed);
             let ts = p.ts;
             let au = p.into_au();
@@ -390,13 +383,8 @@ fn udp_video(
                 at: std::time::Instant::now(),
                 capture_us: ts,
             };
-            match video.try_send(chunk) {
-                Ok(()) => {}
-                Err(std::sync::mpsc::TrySendError::Full(_)) => {
-                    *skipping = true;
-                    request_idr(conn, last_idr);
-                }
-                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => return false,
+            if video.push(chunk) {
+                request_idr(conn, last_idr);
             }
         }
         true
@@ -416,7 +404,6 @@ fn udp_video(
     // Completed frames waiting for an older repair to finish.
     let mut ready: std::collections::BTreeMap<u32, Partial> = std::collections::BTreeMap::new();
     let mut last_id = 0u32;
-    let mut skipping = false;
     let mut last_idr: Option<std::time::Instant> = None;
 
     loop {
@@ -465,7 +452,6 @@ fn udp_video(
                         && now.duration_since(p.last_rx).as_millis() >= 15)
                 });
                 if partials.len() != before {
-                    skipping = true;
                     request_idr(&conn, &mut last_idr);
                 }
                 if !pump(
@@ -474,7 +460,6 @@ fn udp_video(
                     &video,
                     &conn,
                     &mut dump,
-                    &mut skipping,
                     &mut last_idr,
                 ) {
                     return;
@@ -499,7 +484,6 @@ fn udp_video(
                 header.frame_id,
                 header.frag_count,
                 header.ts_us,
-                header.is_keyframe(),
             ));
         }
         let Some(p) = partials.iter_mut().find(|p| p.id == header.frame_id) else {
@@ -518,7 +502,6 @@ fn udp_video(
             &video,
             &conn,
             &mut dump,
-            &mut skipping,
             &mut last_idr,
         ) {
             return;
@@ -530,18 +513,16 @@ fn reader(
     secure: Arc<Secure>,
     conn: Arc<Conn>,
     last_remote: Arc<Mutex<String>>,
-    video: std::sync::mpsc::SyncSender<Chunk>,
+    video: Arc<ChunkQueue>,
     clipboard: ClipPolicy,
     peer: std::net::SocketAddr,
 ) {
     // Set once the server offered UDP video; the socket lives in its own
     // thread, this flag only keeps a second offer from starting another one.
     let mut udp_started = false;
-    // Decoded frames are dropped, never queued without bound: a slow decoder
-    // used to turn a 120 fps stream into smooth but seconds-old video. When the
-    // queue is full the reader skips to the next IDR and asks the server for
-    // one, so latency stays bounded and the reference chain heals quickly.
-    let mut skipping = false;
+    // The queue keeps latency bounded by evicting the oldest access unit, so a
+    // slow decoder must not block or drop the reader. An eviction breaks the
+    // reference chain, so ask for an IDR (at most twice a second).
     let mut last_idr_request: Option<std::time::Instant> = None;
     // Incoming file clipboard transfer.
     let mut incoming_file: Option<(String, u64, Vec<u8>)> = None;
@@ -574,12 +555,7 @@ fn reader(
                     let _ = std::io::Write::write_all(file, body);
                 }
                 conn.bytes.fetch_add(body.len() as u64, Ordering::Relaxed);
-                if skipping {
-                    if !is_idr(body) {
-                        continue;
-                    }
-                    skipping = false;
-                }
+                conn.videos.fetch_add(1, Ordering::Relaxed);
                 // 48-bit capture timestamp in microseconds, 0 if the server
                 // does not timestamp video.
                 let capture_us = ((m.code as u64) << 32) | (m.b as u32 as u64);
@@ -589,18 +565,13 @@ fn reader(
                     at: std::time::Instant::now(),
                     capture_us,
                 };
-                match video.try_send(chunk) {
-                    Ok(()) => {}
-                    Err(std::sync::mpsc::TrySendError::Full(_)) => {
-                        skipping = true;
-                        let due = last_idr_request
-                            .is_none_or(|t| t.elapsed() >= std::time::Duration::from_millis(500));
-                        if due {
-                            last_idr_request = Some(std::time::Instant::now());
-                            let _ = conn.send(Msg::new(msg::IDR, 0, 0, 0), &[]);
-                        }
+                if video.push(chunk) {
+                    let due = last_idr_request
+                        .is_none_or(|t| t.elapsed() >= std::time::Duration::from_millis(500));
+                    if due {
+                        last_idr_request = Some(std::time::Instant::now());
+                        let _ = conn.send(Msg::new(msg::IDR, 0, 0, 0), &[]);
                     }
-                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => break,
                 }
             }
             msg::VIDEO_UDP => {
@@ -747,36 +718,89 @@ fn reader(
         }
     }
     conn.closed.store(true, Ordering::Relaxed);
-}
-
-/// True when an Annex-B access unit contains an HEVC IDR NAL (type 19 or 20).
-fn is_idr(data: &[u8]) -> bool {
-    let mut i = 0;
-    while i + 3 <= data.len() {
-        if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
-            let mut nal = i + 3;
-            // 4-byte start codes leave a zero byte before the NAL header.
-            if nal < data.len() && data[nal] == 0 {
-                nal += 1;
-            }
-            if nal < data.len() {
-                let typ = (data[nal] >> 1) & 0x3f;
-                if typ == 19 || typ == 20 {
-                    return true;
-                }
-                i = nal;
-            }
-            i += 1;
-        } else {
-            i += 1;
-        }
-    }
-    false
+    // Let the decoder thread leave its blocking pop.
+    video.close();
 }
 
 /// Frames buffered between the reader and the decoder. Six frames at 120 Hz
 /// bound the extra latency to ~50 ms.
 pub const VIDEO_QUEUE: usize = 6;
+
+/// Bounded queue of access units between the reader and the decoder.
+///
+/// The newest frame wins: when the decoder falls behind, the oldest queued
+/// access unit is evicted instead of blocking the reader or dropping the new
+/// frame until a keyframe (a deep burst, like ScreenCaptureKit produces, then
+/// freezes the picture for a GOP). The evicted reference chain shows up as a
+/// short artifact and the reader asks for an IDR immediately.
+pub struct ChunkQueue {
+    inner: std::sync::Mutex<QueueState>,
+    cv: std::sync::Condvar,
+}
+
+/// Access units dropped by any queue because the decoder fell behind.
+static EVICTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn evicted_total() -> u64 {
+    EVICTED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+struct QueueState {
+    items: std::collections::VecDeque<Chunk>,
+    capacity: usize,
+    closed: bool,
+}
+
+impl ChunkQueue {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            inner: std::sync::Mutex::new(QueueState {
+                items: std::collections::VecDeque::with_capacity(capacity.max(2)),
+                capacity: capacity.max(2),
+                closed: false,
+            }),
+            cv: std::sync::Condvar::new(),
+        }
+    }
+
+    /// Enqueue an access unit, evicting the oldest when the queue is full.
+    /// Returns true when something had to be dropped.
+    pub fn push(&self, chunk: Chunk) -> bool {
+        let mut g = self.inner.lock().unwrap();
+        let mut dropped = false;
+        while g.items.len() >= g.capacity {
+            g.items.pop_front();
+            dropped = true;
+        }
+        if dropped {
+            EVICTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        g.items.push_back(chunk);
+        drop(g);
+        self.cv.notify_one();
+        dropped
+    }
+
+    /// Blocking pop; `None` once the queue is closed and drained.
+    pub fn pop(&self) -> Option<Chunk> {
+        let mut g = self.inner.lock().unwrap();
+        loop {
+            if let Some(chunk) = g.items.pop_front() {
+                return Some(chunk);
+            }
+            if g.closed {
+                return None;
+            }
+            g = self.cv.wait(g).unwrap();
+        }
+    }
+
+    /// Wake the decoder so it can exit.
+    pub fn close(&self) {
+        self.inner.lock().unwrap().closed = true;
+        self.cv.notify_all();
+    }
+}
 
 #[cfg(test)]
 mod tests {

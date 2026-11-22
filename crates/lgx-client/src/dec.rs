@@ -14,7 +14,6 @@
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
@@ -430,7 +429,7 @@ enum NativeResult {
 /// Decode with the native Vulkan Video implementation. On any failure it
 /// returns the current chunk so the FFmpeg path can take over.
 fn run_native(
-    rx: &Receiver<Chunk>,
+    rx: &crate::net::ChunkQueue,
     sink: &Arc<Sink>,
     wake: &Option<Box<dyn Fn() + Send>>,
     request_idr: &Option<Box<dyn Fn() + Send>>,
@@ -459,9 +458,9 @@ fn run_native(
         .and_then(|v| v.parse().ok());
     let mut frames = 0u64;
     loop {
-        let chunk = match rx.recv() {
-            Ok(c) => c,
-            Err(_) => {
+        let chunk = match rx.pop() {
+            Some(c) => c,
+            None => {
                 sink.stopped.store(true, Ordering::Relaxed);
                 return NativeResult::Done;
             }
@@ -587,7 +586,7 @@ pub fn spawn(
     want_dmabuf: bool,
     native: bool,
     request_idr: Option<Box<dyn Fn() + Send>>,
-    rx: Receiver<Chunk>,
+    rx: Arc<crate::net::ChunkQueue>,
     sink: Arc<Sink>,
     wake: Option<Box<dyn Fn() + Send>>,
 ) -> std::thread::JoinHandle<()> {
@@ -634,9 +633,9 @@ pub fn spawn(
             loop {
                 let chunk = match pending.take() {
                     Some(chunk) => chunk,
-                    None => match rx.recv() {
-                        Ok(chunk) => chunk,
-                        Err(_) => break,
+                    None => match rx.pop() {
+                        Some(chunk) => chunk,
+                        None => break,
                     },
                 };
                 // A packet can be refused until pending frames are pulled.
