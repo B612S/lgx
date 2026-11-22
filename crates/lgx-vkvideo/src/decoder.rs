@@ -13,7 +13,7 @@ use ash::vk;
 use ash::vk::native as n;
 
 use crate::bitstream::{nal_type, parse_slice_header, PpsInfo, SpsInfo, VpsInfo};
-use crate::{dpb::Dpb, std as vkstd, H265_MAIN_PROFILE_IDC, STREAM_CHROMA, STREAM_CHROMA_DEPTH, STREAM_LUMA_DEPTH};
+use crate::{dpb::{Dpb, SLOTS}, std as vkstd, H265_MAIN_PROFILE_IDC, STREAM_CHROMA, STREAM_CHROMA_DEPTH, STREAM_LUMA_DEPTH};
 
 pub struct Frame {
     pub width: u32,
@@ -35,6 +35,64 @@ pub struct DmaFrame {
     pub y_pitch: u32,
     pub uv_offset: u32,
     pub uv_pitch: u32,
+    /// Keeps the DPB slot from being reused until the client drops the frame.
+    pub hold: Option<SlotHold>,
+}
+
+/// Slots the client still needs. The decoder never rewrites one of these.
+struct Holds {
+    held: std::sync::Mutex<[bool; SLOTS]>,
+    cv: std::sync::Condvar,
+}
+
+impl Default for Holds {
+    fn default() -> Self {
+        Self {
+            held: std::sync::Mutex::new([false; SLOTS]),
+            cv: std::sync::Condvar::new(),
+        }
+    }
+}
+
+impl Holds {
+    fn snapshot(&self) -> [bool; SLOTS] {
+        *self.held.lock().unwrap()
+    }
+
+    fn take(&self, slot: usize) -> bool {
+        let mut held = self.held.lock().unwrap();
+        if held[slot] {
+            false
+        } else {
+            held[slot] = true;
+            true
+        }
+    }
+
+    fn release(&self, slot: usize) {
+        self.held.lock().unwrap()[slot] = false;
+        self.cv.notify_all();
+    }
+
+    /// Waits for any release; false when the timeout expired.
+    fn wait(&self, timeout: std::time::Duration) -> bool {
+        let held = self.held.lock().unwrap();
+        let (held, timed) = self.cv.wait_timeout(held, timeout).unwrap();
+        drop(held);
+        !timed.timed_out()
+    }
+}
+
+/// Marks one DPB slot as in use by the client until it is dropped.
+pub struct SlotHold {
+    holds: std::sync::Arc<Holds>,
+    slot: usize,
+}
+
+impl Drop for SlotHold {
+    fn drop(&mut self) {
+        self.holds.release(self.slot);
+    }
 }
 
 struct Slot {
@@ -53,7 +111,6 @@ struct Session {
     params: vk::VideoSessionParametersKHR,
     mems: Vec<vk::DeviceMemory>,
     slots: Vec<Slot>,
-    out: Slot,
     pool: vk::CommandPool,
     cmd: vk::CommandBuffer,
     fence: vk::Fence,
@@ -63,8 +120,9 @@ struct Session {
     src_size: u64,
     width: u32,
     height: u32,
-    slot_layout: [vk::ImageLayout; 2],
-    out_layout: vk::ImageLayout,
+    slot_layout: [vk::ImageLayout; SLOTS],
+    /// DPB slot of the most recent picture, for `readback`.
+    last_slot: Option<usize>,
     sps: SpsInfo,
     pps: PpsInfo,
 }
@@ -94,6 +152,11 @@ pub struct NativeDecoder {
     mem_props: vk::PhysicalDeviceMemoryProperties,
     session: Option<Session>,
     dpb: Dpb,
+    holds: std::sync::Arc<Holds>,
+    /// The device can export a DRM-modifier image as dma-buf.
+    can_export: bool,
+    /// This session's slots are exported and imported by the renderer.
+    export: bool,
     format: vk::Format,
 }
 
@@ -142,6 +205,70 @@ unsafe fn choose_modifier(
 }
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+unsafe fn destroy_slot(device: &ash::Device, slot: &Slot) {
+    unsafe {
+        device.destroy_image_view(slot.view, None);
+        device.destroy_image(slot.image, None);
+        device.free_memory(slot.mem, None);
+    }
+}
+
+/// A DPB image that stays on the GPU: used when the driver cannot export the
+/// decode layout as a dma-buf, with `readback` supplying CPU NV12 instead.
+#[allow(clippy::too_many_arguments)]
+unsafe fn make_plain_image(
+    device: &ash::Device,
+    props: &vk::PhysicalDeviceMemoryProperties,
+    profile_list: &vk::VideoProfileListInfoKHR,
+    format: vk::Format,
+    width: u32,
+    height: u32,
+) -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView), Box<dyn std::error::Error>> {
+    let mut info = vk::ImageCreateInfo::default();
+    info.p_next = profile_list as *const _ as *const std::ffi::c_void;
+    info.image_type = vk::ImageType::TYPE_2D;
+    info.format = format;
+    info.extent = vk::Extent3D { width, height, depth: 1 };
+    info.mip_levels = 1;
+    info.array_layers = 1;
+    info.samples = vk::SampleCountFlags::TYPE_1;
+    info.tiling = vk::ImageTiling::OPTIMAL;
+    info.usage = vk::ImageUsageFlags::VIDEO_DECODE_DPB_KHR
+        | vk::ImageUsageFlags::VIDEO_DECODE_DST_KHR
+        | vk::ImageUsageFlags::TRANSFER_SRC;
+    info.sharing_mode = vk::SharingMode::EXCLUSIVE;
+    info.initial_layout = vk::ImageLayout::UNDEFINED;
+    let image = unsafe { device.create_image(&info, None)? };
+    let req = unsafe { device.get_image_memory_requirements(image) };
+    let ty = find_memory_type(props, req.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL);
+    let mem = unsafe {
+        device.allocate_memory(
+            &vk::MemoryAllocateInfo::default()
+                .allocation_size(req.size)
+                .memory_type_index(ty),
+            None,
+        )?
+    };
+    unsafe { device.bind_image_memory(image, mem, 0)? };
+    let view = unsafe {
+        device.create_image_view(
+            &vk::ImageViewCreateInfo::default()
+                .image(image)
+                .view_type(vk::ImageViewType::TYPE_2D)
+                .format(format)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                }),
+            None,
+        )?
+    };
+    Ok((image, mem, view))
+}
+
 unsafe fn make_export_image(
     device: &ash::Device,
     props: &vk::PhysicalDeviceMemoryProperties,
@@ -238,13 +365,43 @@ impl NativeDecoder {
         };
         let video_instance = ash::khr::video_queue::Instance::new(&entry, &instance);
         let phys = unsafe { instance.enumerate_physical_devices()? };
-        let pd = phys
-            .into_iter()
-            .find(|pd| {
-                let exts = unsafe { instance.enumerate_device_extension_properties(*pd) }.unwrap_or_default();
-                exts.iter().any(|e| unsafe { std::ffi::CStr::from_ptr(e.extension_name.as_ptr()) } == ash::khr::video_decode_h265::NAME)
-            })
-            .ok_or("no device with VK_KHR_video_decode_h265")?;
+        // Prefer the same device the renderer uses: the frame is exported as a
+        // dma-buf and imported there, which needs one driver. `LGX_VK_DEVICE`
+        // pins it by name; otherwise a discrete GPU wins, as in the renderer.
+        let want = std::env::var("LGX_VK_DEVICE").ok();
+        let mut candidates: Vec<(vk::PhysicalDevice, vk::PhysicalDeviceType, String)> = Vec::new();
+        for pd in phys {
+            let exts = unsafe { instance.enumerate_device_extension_properties(pd) }.unwrap_or_default();
+            let ok = exts.iter().any(|e| unsafe {
+                std::ffi::CStr::from_ptr(e.extension_name.as_ptr())
+            } == ash::khr::video_decode_h265::NAME);
+            if !ok {
+                continue;
+            }
+            let props = unsafe { instance.get_physical_device_properties(pd) };
+            let name = unsafe { std::ffi::CStr::from_ptr(props.device_name.as_ptr()) }
+                .to_string_lossy()
+                .into_owned();
+            candidates.push((pd, props.device_type, name));
+        }
+        if candidates.is_empty() {
+            return Err("no device with VK_KHR_video_decode_h265".into());
+        }
+        let pd = match want.as_deref() {
+            Some(want) => candidates
+                .iter()
+                .find(|(_, _, name)| name.contains(want))
+                .or_else(|| {
+                    candidates.iter().find(|(_, ty, _)| *ty == vk::PhysicalDeviceType::DISCRETE_GPU)
+                })
+                .unwrap_or(&candidates[0])
+                .0,
+            None => candidates
+                .iter()
+                .find(|(_, ty, _)| *ty == vk::PhysicalDeviceType::DISCRETE_GPU)
+                .unwrap_or(&candidates[0])
+                .0,
+        };
         let families = unsafe { instance.get_physical_device_queue_family_properties(pd) };
         let qf = families
             .iter()
@@ -275,24 +432,27 @@ impl NativeDecoder {
         let has = |name: &std::ffi::CStr| {
             available.iter().any(|e| unsafe { std::ffi::CStr::from_ptr(e.extension_name.as_ptr()) } == name)
         };
-        if !has(external_memory_fd::NAME)
-            || !has(external_memory_dma_buf::NAME)
-            || !has(image_drm_format_modifier::NAME)
-        {
-            return Err("device cannot export dma-buf".into());
-        }
+        // dma-buf export is what makes the frames zero-copy, but it is not
+        // required: without it the decoder reads each picture back to CPU NV12
+        // and the client uploads it like any software frame.
+        let can_export = std::env::var_os("LGX_NATIVE_CPU").is_none()
+            && has(external_memory_fd::NAME)
+            && has(external_memory_dma_buf::NAME)
+            && has(image_drm_format_modifier::NAME);
         let priorities = [1.0f32];
         let queue_info = [vk::DeviceQueueCreateInfo::default()
             .queue_family_index(qf)
             .queue_priorities(&priorities)];
-        let exts = [
+        let mut exts = vec![
             ash::khr::video_queue::NAME.as_ptr(),
             ash::khr::video_decode_queue::NAME.as_ptr(),
             ash::khr::video_decode_h265::NAME.as_ptr(),
-            external_memory_fd::NAME.as_ptr(),
-            external_memory_dma_buf::NAME.as_ptr(),
-            image_drm_format_modifier::NAME.as_ptr(),
         ];
+        if can_export {
+            exts.push(external_memory_fd::NAME.as_ptr());
+            exts.push(external_memory_dma_buf::NAME.as_ptr());
+            exts.push(image_drm_format_modifier::NAME.as_ptr());
+        }
         let device = unsafe {
             instance.create_device(
                 pd,
@@ -330,6 +490,9 @@ impl NativeDecoder {
             mem_props,
             session: None,
             dpb: Dpb::new(),
+            holds: std::sync::Arc::new(Holds::default()),
+            can_export,
+            export: false,
             format: vk::Format::G8_B8R8_2PLANE_420_UNORM,
         })
     }
@@ -355,9 +518,6 @@ impl NativeDecoder {
         profile.chroma_subsampling = STREAM_CHROMA;
         profile.luma_bit_depth = STREAM_LUMA_DEPTH;
         profile.chroma_bit_depth = STREAM_CHROMA_DEPTH;
-        let mut profile_list = vk::VideoProfileListInfoKHR::default();
-        profile_list.profile_count = 1;
-        profile_list.p_profiles = &profile;
         let ptl = vkstd::profile_tier_level(sps);
         let dpb_mgr = vkstd::dpb(sps);
         let std_vps = vkstd::vps(vps, &ptl, &dpb_mgr);
@@ -440,50 +600,70 @@ impl NativeDecoder {
                 self.device.handle(), &params_info, std::ptr::null(), &mut params,
             ).result()?
         };
-        let format = self.format;
-        let make_image = |device: &ash::Device, usage, profile_list: &vk::VideoProfileListInfoKHR| -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView), Box<dyn std::error::Error>> {
-            let mut info = vk::ImageCreateInfo::default();
-            info.p_next = profile_list as *const _ as *const std::ffi::c_void;
-            info.image_type = vk::ImageType::TYPE_2D;
-            info.format = format;
-            info.extent = vk::Extent3D { width: extent.width, height: extent.height, depth: 1 };
-            info.mip_levels = 1; info.array_layers = 1;
-            info.samples = vk::SampleCountFlags::TYPE_1;
-            info.tiling = vk::ImageTiling::OPTIMAL;
-            info.usage = usage;
-            info.sharing_mode = vk::SharingMode::EXCLUSIVE;
-            info.initial_layout = vk::ImageLayout::UNDEFINED;
-            let image = unsafe { device.create_image(&info, None)? };
-            let req = unsafe { device.get_image_memory_requirements(image) };
-            let ty = find_memory_type(&mem_props, req.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL);
-            let mem = unsafe { device.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(ty), None)? };
-            unsafe { device.bind_image_memory(image, mem, 0)? };
-            let view = unsafe {
-                device.create_image_view(&vk::ImageViewCreateInfo::default()
-                    .image(image).view_type(vk::ImageViewType::TYPE_2D).format(format)
-                    .subresource_range(vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 }), None)?
-            };
-            Ok((image, mem, view))
+        let modifier = if self.can_export {
+            unsafe { choose_modifier(&self.instance, self.physical, self.format) }
+        } else {
+            None
         };
-        let modifier = unsafe { choose_modifier(&self.instance, self.physical, self.format) }
-            .ok_or("no DRM modifier for video decode")?;
-        self.modifier = modifier;
+        let mut profile_list = vk::VideoProfileListInfoKHR::default();
+        profile_list.profile_count = 1;
+        profile_list.p_profiles = &profile;
         self.generation = self.generation.wrapping_add(1);
-        let mut slots = Vec::new();
-        for _ in 0..2 {
-            let (image, mem, view, fd, y_offset, y_pitch, uv_offset, uv_pitch) = unsafe { make_export_image(
-                &self.device,
-                &self.mem_props,
-                &self.ext_fd,
-                &self.drm_ext,
-                self.format,
-                extent.width,
-                extent.height,
-                modifier,
-            ) }?;
-            slots.push(Slot { image, mem, view, fd, y_offset, y_pitch, uv_offset, uv_pitch });
+        // Export first; a driver that cannot hand out this layout still gets a
+        // working decoder, just with a CPU readback per picture.
+        let mut slots: Vec<Slot> = Vec::new();
+        let mut export = modifier.is_some();
+        if let Some(modifier) = modifier.filter(|_| export) {
+            let mut failed = None;
+            for _ in 0..SLOTS {
+                match unsafe {
+                    make_export_image(
+                        &self.device,
+                        &self.mem_props,
+                        &self.ext_fd,
+                        &self.drm_ext,
+                        self.format,
+                        extent.width,
+                        extent.height,
+                        modifier,
+                    )
+                } {
+                    Ok((image, mem, view, fd, y_offset, y_pitch, uv_offset, uv_pitch)) => {
+                        slots.push(Slot { image, mem, view, fd, y_offset, y_pitch, uv_offset, uv_pitch });
+                    }
+                    Err(e) => {
+                        failed = Some(e);
+                        break;
+                    }
+                }
+            }
+            if let Some(e) = failed {
+                eprintln!(
+                    "lgx-vkvideo: dma-buf export failed ({e}); reading pictures back to CPU NV12"
+                );
+                export = false;
+                for slot in slots.drain(..) {
+                    unsafe { destroy_slot(&self.device, &slot) };
+                }
+            }
         }
-        let (out_image, out_mem, out_view) = make_image(&self.device, vk::ImageUsageFlags::VIDEO_DECODE_DST_KHR, &profile_list)?;
+        if !export {
+            for _ in 0..SLOTS {
+                let (image, mem, view) = unsafe {
+                    make_plain_image(
+                        &self.device,
+                        &self.mem_props,
+                        &profile_list,
+                        self.format,
+                        extent.width,
+                        extent.height,
+                    )
+                }?;
+                slots.push(Slot { image, mem, view, fd: -1, y_offset: 0, y_pitch: 0, uv_offset: 0, uv_pitch: 0 });
+            }
+        }
+        self.export = export;
+        self.modifier = modifier.unwrap_or(0);
         let pool = unsafe { self.device.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(self.qf), None)? };
         let cmd = unsafe { self.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1))? }[0];
         let fence = unsafe { self.device.create_fence(&vk::FenceCreateInfo::default(), None)? };
@@ -501,12 +681,12 @@ impl NativeDecoder {
                 .map_memory(src_mem, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())? as *mut u8
         };
         self.session = Some(Session {
-            handle, params, mems, slots, out: Slot { image: out_image, mem: out_mem, view: out_view, fd: -1, y_offset: 0, y_pitch: 0, uv_offset: 0, uv_pitch: 0 },
+            handle, params, mems, slots,
             pool, cmd, fence,
             src_buf, src_mem, src_ptr, src_size,
             width: sps.width, height: sps.height,
-            slot_layout: [vk::ImageLayout::UNDEFINED; 2],
-            out_layout: vk::ImageLayout::UNDEFINED,
+            slot_layout: [vk::ImageLayout::UNDEFINED; SLOTS],
+            last_slot: None,
             sps: sps.clone(), pps: pps.clone(),
         });
         self.dpb = Dpb::new();
@@ -519,7 +699,7 @@ impl NativeDecoder {
                 (self.video_device.fp().destroy_video_session_parameters_khr)(self.device.handle(), s.params, std::ptr::null());
                 (self.video_device.fp().destroy_video_session_khr)(self.device.handle(), s.handle, std::ptr::null());
                 for mem in &s.mems { self.device.free_memory(*mem, None); }
-                for slot in s.slots.iter().chain(std::iter::once(&s.out)) {
+                for slot in s.slots.iter() {
                     self.device.destroy_image_view(slot.view, None);
                     self.device.destroy_image(slot.image, None);
                     self.device.free_memory(slot.mem, None);
@@ -555,14 +735,40 @@ impl NativeDecoder {
                 ref_slots.push(slot);
             }
         }
-        let cur = self.dpb.choose(&ref_pocs).ok_or("no free DPB slot")?;
+        // Pick a slot that neither the bitstream's references nor the client's
+        // renderer still need. Waiting here is what keeps the exported picture
+        // stable while it is on screen; the client releases the slot when it
+        // drops the frame.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let cur = loop {
+            let held = self.holds.snapshot();
+            if let Some(slot) = self.dpb.choose(&ref_pocs, &held) {
+                if self.holds.take(slot) {
+                    break slot;
+                }
+                continue;
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err("every DPB slot is still in use by the renderer".into());
+            }
+            self.holds.wait(std::time::Duration::from_millis(2));
+        };
+        // Released on every error path below as well as when the client drops
+        // the frame.
+        let hold = SlotHold {
+            holds: self.holds.clone(),
+            slot: cur,
+        };
         let device = &self.device;
         let queue = self.queue;
         let extent = vk::Extent2D { width: session.width, height: session.height };
         let pics: Vec<vk::VideoPictureResourceInfoKHR> = session.slots.iter().map(|s| {
             vk::VideoPictureResourceInfoKHR::default().coded_extent(extent).image_view_binding(s.view)
         }).collect();
-        let out_pic = vk::VideoPictureResourceInfoKHR::default().coded_extent(extent).image_view_binding(session.out.view);
+        // The decoded picture must be the same picture resource as the setup
+        // reference slot (VUID-VkVideoDecodeInfoKHR-pSetupReferenceSlot): the
+        // exported dma-buf is then exactly the decoded picture.
+        let out_pic = vk::VideoPictureResourceInfoKHR::default().coded_extent(extent).image_view_binding(session.slots[cur].view);
         let mut ref_std: Vec<n::StdVideoDecodeH265ReferenceInfo> = Vec::new();
         let mut ref_dpb: Vec<vk::VideoDecodeH265DpbSlotInfoKHR> = Vec::new();
         let mut ref_infos: Vec<vk::VideoReferenceSlotInfoKHR> = Vec::new();
@@ -617,7 +823,7 @@ impl NativeDecoder {
             std::ptr::copy_nonoverlapping(nal.as_ptr(), session.src_ptr.add(3), nal.len());
         }
         let range = vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 };
-        unsafe {
+        let decoded = unsafe {
             device.reset_fences(&[session.fence])?;
             device.reset_command_buffer(session.cmd, vk::CommandBufferResetFlags::empty())?;
             device.begin_command_buffer(session.cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
@@ -630,17 +836,6 @@ impl NativeDecoder {
                     .old_layout(old)
                     .new_layout(vk::ImageLayout::VIDEO_DECODE_DPB_KHR)
                     .image(session.slots[cur].image)
-                    .subresource_range(range);
-                device.cmd_pipeline_barrier2(session.cmd, &vk::DependencyInfo::default().image_memory_barriers(&[b]));
-            }
-            if session.out_layout == vk::ImageLayout::UNDEFINED {
-                let b = vk::ImageMemoryBarrier2::default()
-                    .src_stage_mask(vk::PipelineStageFlags2::NONE)
-                    .dst_stage_mask(vk::PipelineStageFlags2::VIDEO_DECODE_KHR)
-                    .dst_access_mask(vk::AccessFlags2::VIDEO_DECODE_WRITE_KHR)
-                    .old_layout(vk::ImageLayout::UNDEFINED)
-                    .new_layout(vk::ImageLayout::VIDEO_DECODE_DST_KHR)
-                    .image(session.out.image)
                     .subresource_range(range);
                 device.cmd_pipeline_barrier2(session.cmd, &vk::DependencyInfo::default().image_memory_barriers(&[b]));
             }
@@ -688,29 +883,170 @@ impl NativeDecoder {
             let list = [session.cmd];
             device.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(&list)], session.fence)?;
             device.wait_for_fences(&[session.fence], true, u64::MAX)?;
-            let fd = libc::dup(session.slots[cur].fd);
-            if fd < 0 {
-                return Err("cannot dup the DPB dma-buf".into());
-            }
-            let dma = DmaFrame {
-                fd,
-                cache_key: (self.generation << 8) | (cur as u64 + 1),
-                modifier: self.modifier,
-                y_offset: session.slots[cur].y_offset,
-                y_pitch: session.slots[cur].y_pitch,
-                uv_offset: session.slots[cur].uv_offset,
-                uv_pitch: session.slots[cur].uv_pitch,
-            };
             session.slot_layout[cur] = vk::ImageLayout::VIDEO_DECODE_DPB_KHR;
-            session.out_layout = vk::ImageLayout::VIDEO_DECODE_DST_KHR;
+            session.last_slot = Some(cur);
             self.dpb.commit(cur, poc);
+            let (w, h) = (session.width, session.height);
+            let dma = if self.export {
+                let fd = libc::dup(session.slots[cur].fd);
+                if fd < 0 {
+                    return Err("cannot dup the DPB dma-buf".into());
+                }
+                Some((
+                    fd,
+                    (self.generation << 8) | (cur as u64 + 1),
+                    self.modifier,
+                    session.slots[cur].y_offset,
+                    session.slots[cur].y_pitch,
+                    session.slots[cur].uv_offset,
+                    session.slots[cur].uv_pitch,
+                ))
+            } else {
+                None
+            };
+            (w, h, dma)
+        };
+        let (width, height, dma) = decoded;
+        if let Some((fd, cache_key, modifier, y_offset, y_pitch, uv_offset, uv_pitch)) = dma {
             Ok(Some(Frame {
-                width: session.width,
-                height: session.height,
+                width,
+                height,
                 poc,
                 data: Vec::new(),
-                dma: Some(dma),
+                dma: Some(DmaFrame {
+                    fd,
+                    cache_key,
+                    modifier,
+                    y_offset,
+                    y_pitch,
+                    uv_offset,
+                    uv_pitch,
+                    hold: Some(hold),
+                }),
             }))
+        } else {
+            // The picture is copied out synchronously, so the client never
+            // holds the slot and it can be released right away.
+            drop(hold);
+            let data = self.readback()?;
+            Ok(Some(Frame { width, height, poc, data, dma: None }))
+        }
+    }
+
+    /// Copies the most recently decoded picture into CPU NV12.
+    ///
+    /// This exists for offline verification of the decoder against FFmpeg (see
+    /// `src/bin/native_dump.rs`); production frames stay on the GPU and are
+    /// imported by the renderer as dma-bufs.
+    pub fn readback(&mut self) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let Some(session) = self.session.as_mut() else {
+            return Err("no session".into());
+        };
+        let slot = session.last_slot.ok_or("no decoded picture")?;
+        let (w, h) = (session.width, session.height);
+        let y_size = (w as usize) * (h as usize);
+        let uv_size = y_size / 2;
+        let size = (y_size + uv_size) as u64;
+        unsafe {
+            let (buffer, mem) = make_host_buffer(
+                &self.device,
+                &self.mem_props,
+                size,
+                vk::BufferUsageFlags::TRANSFER_DST,
+            )?;
+            self.device.reset_fences(&[session.fence])?;
+            self.device.reset_command_buffer(
+                session.cmd,
+                vk::CommandBufferResetFlags::empty(),
+            )?;
+            self.device.begin_command_buffer(
+                session.cmd,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )?;
+            let range = vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::PLANE_0 | vk::ImageAspectFlags::PLANE_1,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            };
+            let to_src = vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+                .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)
+                .old_layout(vk::ImageLayout::VIDEO_DECODE_DPB_KHR)
+                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .image(session.slots[slot].image)
+                .subresource_range(range);
+            self.device.cmd_pipeline_barrier2(
+                session.cmd,
+                &vk::DependencyInfo::default().image_memory_barriers(&[to_src]),
+            );
+            let regions = [
+                vk::BufferImageCopy::default()
+                    .buffer_offset(0)
+                    .image_subresource(vk::ImageSubresourceLayers {
+                        aspect_mask: vk::ImageAspectFlags::PLANE_0,
+                        mip_level: 0,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    })
+                    .image_extent(vk::Extent3D { width: w, height: h, depth: 1 }),
+                vk::BufferImageCopy::default()
+                    .buffer_offset(y_size as u64)
+                    .image_subresource(vk::ImageSubresourceLayers {
+                        aspect_mask: vk::ImageAspectFlags::PLANE_1,
+                        mip_level: 0,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    })
+                    .image_extent(vk::Extent3D {
+                        width: w / 2,
+                        height: h / 2,
+                        depth: 1,
+                    }),
+            ];
+            self.device.cmd_copy_image_to_buffer(
+                session.cmd,
+                session.slots[slot].image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                buffer,
+                &regions,
+            );
+            let back = vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+                .src_access_mask(vk::AccessFlags2::TRANSFER_READ)
+                .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                .dst_access_mask(vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE)
+                .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .new_layout(vk::ImageLayout::VIDEO_DECODE_DPB_KHR)
+                .image(session.slots[slot].image)
+                .subresource_range(range);
+            self.device.cmd_pipeline_barrier2(
+                session.cmd,
+                &vk::DependencyInfo::default().image_memory_barriers(&[back]),
+            );
+            self.device.end_command_buffer(session.cmd)?;
+            let list = [session.cmd];
+            self.device.queue_submit(
+                self.queue,
+                &[vk::SubmitInfo::default().command_buffers(&list)],
+                session.fence,
+            )?;
+            self.device
+                .wait_for_fences(&[session.fence], true, u64::MAX)?;
+            let ptr = self
+                .device
+                .map_memory(mem, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())?
+                as *const u8;
+            let mut out = vec![0u8; size as usize];
+            std::ptr::copy_nonoverlapping(ptr, out.as_mut_ptr(), out.len());
+            self.device.unmap_memory(mem);
+            self.device.destroy_buffer(buffer, None);
+            self.device.free_memory(mem, None);
+            Ok(out)
         }
     }
 }

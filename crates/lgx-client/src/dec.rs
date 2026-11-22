@@ -130,6 +130,9 @@ pub struct Dmabuf {
     handle: *mut c_void,
     /// Fds owned by a native dma-buf frame (closed in Drop).
     native_fds: Vec<c_int>,
+    /// Keeps a native decoder DPB slot from being reused while this frame is
+    /// still displayed; dropped with the frame.
+    hold: Option<Box<dyn Send>>,
     /// Stable key for renderer-side import caching (0 = import per frame).
     pub cache_key: u64,
 }
@@ -342,6 +345,7 @@ fn frame_from_info(
             layers: info.layers,
             handle,
             native_fds: Vec::new(),
+            hold: None,
             cache_key: 0,
         };
         if d.planes != 2 || !(1..=2).contains(&d.layers) {
@@ -461,7 +465,10 @@ fn run_native(
     let mut vps: Option<VpsInfo> = None;
     let mut sps: Option<SpsInfo> = None;
     let mut pps: Option<PpsInfo> = None;
-    let mut configured: Option<SpsInfo> = None;
+    // The parsed parameter sets the session was built from. Encoder rebuilds
+    // (rate control, resolution changes) can change them, and decoding with a
+    // stale PPS/SPS misparses every following slice header.
+    let mut configured: Option<(VpsInfo, SpsInfo, PpsInfo)> = None;
     let fail_after: Option<u64> = std::env::var("LGX_TEST_NATIVE_FAIL")
         .ok()
         .and_then(|v| v.parse().ok());
@@ -496,11 +503,7 @@ fn run_native(
                         return NativeResult::Fallback(Some(chunk));
                     };
                     let need_reconfigure = match configured.as_ref() {
-                        Some(c) => {
-                            c.width != s.width
-                                || c.height != s.height
-                                || c.sps_id != s.sps_id
-                        }
+                        Some((cv, cs, cp)) => cv != v || cs != s || cp != p,
                         None => true,
                     };
                     if s.width != s.display_width() || s.height != s.display_height() {
@@ -520,7 +523,7 @@ fn run_native(
                             ask_idr();
                             return NativeResult::Fallback(Some(chunk));
                         }
-                        configured = Some(s.clone());
+                        configured = Some((v.clone(), s.clone(), p.clone()));
                     }
                     match decoder.decode(nal) {
                         Ok(Some(f)) => {
@@ -535,6 +538,7 @@ fn run_native(
                                     layers: 1,
                                     handle: std::ptr::null_mut(),
                                     native_fds: vec![d.fd],
+                                    hold: d.hold.map(|h| Box::new(h) as Box<dyn Send>),
                                     cache_key: d.cache_key,
                                 })
                             } else {

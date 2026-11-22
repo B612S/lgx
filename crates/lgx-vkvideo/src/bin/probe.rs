@@ -454,7 +454,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 ref_slots.push(slot);
                             }
                         }
-                        let cur = dpb.choose(&ref_pocs).ok_or("no free DPB slot")?;
+                        let cur = dpb
+                            .choose(&ref_pocs, &[false; lgx_vkvideo::dpb::SLOTS])
+                            .ok_or("no free DPB slot")?;
                         let len = (3 + nal.len() + align - 1) & !(align - 1);
                         let (buf, bmem) = make_host_buffer(&device, &mem_props, len as u64, vk::BufferUsageFlags::VIDEO_DECODE_SRC_KHR)?;
                         let ptr = device.map_memory(bmem, 0, len as u64, vk::MemoryMapFlags::empty())? as *mut u8;

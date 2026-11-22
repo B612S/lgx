@@ -309,18 +309,38 @@ Commit format: `area: short imperative summary`, for example
 - `LGX_VULKAN_VIDEO=native` selects the in-tree Vulkan Video H.265 decoder
   (`lgx-vkvideo::decoder::NativeDecoder`) instead of FFmpeg: it owns its
   instance/device/video decode queue, builds the session from the in-band
-  VPS/SPS/PPS, keeps a two-slot DPB and returns CPU NV12 frames. It sustains
-  157-159 fps. The DPB images are created with a DRM modifier and exported as
-  dma-buf; the client wraps them in `Pixels::Dmabuf` and the renderer samples
-  them directly, so the native path is zero-copy (no NV12 readback).
-  **It is opt-in, not the default.** The renderer imports those images on its
-  own Vulkan device while the decoder may reuse a slot two frames later; with
-  the live 1080p stream that showed up as persistent garbage over part or all
-  of the window that only a client restart cleared, although the same access
-  units decode cleanly with FFmpeg. Until the slot hand-off has a hold/release
-  protocol (or the pictures are copied into renderer-owned images), the
-  default is FFmpeg; `--decoder` other than Vulkan and any native
-  setup/decode error also fall back to FFmpeg (Vulkan/VAAPI/software).
+  VPS/SPS/PPS and returns dma-buf frames. It sustains 157-159 fps at 1080p160.
+  It is the default when the device supports Vulkan Video and dma-buf import;
+  `LGX_VULKAN_VIDEO=ffmpeg` (or `0`), `--decoder` other than Vulkan, and any
+  native setup/decode error fall back to FFmpeg (Vulkan/VAAPI/software).
+  - **The DPB slot is the decoded picture.** `dst_picture_resource` must be
+    the same picture resource as `pSetupReferenceSlot`; the code used to
+    decode into a separate `out` image and export a DPB slot that the driver
+    happened to fill, which is not portable (Mesa validates the VUID).
+  - **A slot is never rewritten while the client still shows it.** The
+    decoder keeps six slots and each `DmaFrame` carries a hold; the client
+    drops the frame only after the next `draw()` has waited for the previous
+    submit's fence, and `decode()` waits (2 s cap) for a slot that is neither
+    a current reference nor held. Without that hand-off the decoder reused a
+    slot two frames later and the renderer sampled memory being overwritten:
+    persistent garbage over part or all of the window that only a client
+    restart cleared, while the same access units decoded cleanly with FFmpeg.
+  - The decoder picks the same class of GPU as the renderer (discrete when
+    present, `LGX_VK_DEVICE` pins by name): the exported dma-buf is imported
+    there, and a hybrid system must not decode on the iGPU while rendering on
+    the dGPU.
+  - **dma-buf export is optional.** If the device cannot export the decode
+    layout as a DRM-modifier dma-buf (`LGX_NATIVE_CPU=1` forces this), the
+    decoder allocates plain DPB images and `readback()` copies each picture
+    to CPU NV12, so the native decoder still works on drivers without
+    exportable video images (just without zero-copy).
+  - A new in-band VPS/SPS/PPS whose parsed fields differ from the configured
+    ones reconfigures the session. Encoder rebuilds (rate control, resize) can
+    change them, and decoding with a stale PPS misparses every later slice
+    header.
+  - `src/bin/native_dump.rs` decodes a captured Annex-B stream and writes
+    NV12 frames; comparing them against `ffmpeg -f hevc` is how the decoder is
+    verified (the client writes the stream with `LGX_DUMP_BITSTREAM`).
 - One decode thread owns libavcodec; the window takes only the newest frame
   from a one-slot mailbox.
 - Gamepad state snapshots go over the same TCP stream; the server's input
