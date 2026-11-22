@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/lgx-proto", "crates/lgx-server", "crates/lgx-client", "crates/lgx-server-macos", "tests"]
+members = ["crates/lgx-caps", "crates/lgx-proto", "crates/lgx-server", "crates/lgx-client", "crates/lgx-server-macos", "tests"]
 
 [workspace.package]
 version = "0.4.0"

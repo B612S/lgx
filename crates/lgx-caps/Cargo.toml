@@ -1,0 +1,15 @@
+[package]
+name = "lgx-caps"
+description = "Runtime GPU, VAAPI and Vulkan capability detection for lgx"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ash = { version = "0.38", features = ["loaded"] }
+libc = "0.2"
+
+[[bin]]
+name = "lgx-caps"
+path = "src/bin/lgx-caps.rs"
