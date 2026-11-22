@@ -697,6 +697,25 @@ fn main() {
             }
         }
     };
+    // The server forces an IDR for a new session, but the decoder may still be
+    // opening at that moment and the readiness gate drops the frame. Ask for
+    // one more keyframe as soon as the decoder is up, so the picture starts
+    // immediately instead of waiting for the next periodic IDR.
+    {
+        let idr_conn = conn.clone();
+        let ready_wait = decoder_ready.clone();
+        std::thread::spawn(move || {
+            for _ in 0..500 {
+                if ready_wait.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            if ready_wait.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = idr_conn.send(Msg::new(msg::IDR, 0, 0, 0), &[]);
+            }
+        });
+    }
     // Remember the attempt count in case this session drops quickly.
     std::env::set_var(RECONNECT_ATTEMPT_ENV, connect_attempt.to_string());
     let _ = conn.send(
