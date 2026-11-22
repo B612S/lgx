@@ -578,6 +578,13 @@ the Vulkan shader converts full-range BT.709, and the HEVC VUI says
   client against the Linux VM at 1080p160 decodes 155 fps at p50/p99 3.6/5.1
   ms. A deeper queue alone (64) also decodes everything but at p99 ~240 ms,
   so the eviction policy, not the depth, is what keeps latency down.
+- **Measured with real motion (a 60 fps test video playing, 1920x1200):**
+  42.6 encoded fps at **0.2 MiB/s**, `capture->present` max age 56 ms, IDR
+  0.2/s 4.6 KiB/s (none requested), CPU `lgx-server-bin` 3.6 %, `lgx-vtenc`
+  1.1 %, `lgx-macos-audio` 1.0 %. Idle desktop: 0.0 MiB/s video and ~17 KiB/s
+  of FLAC audio. `lgx-client --no-window --screenshot FILE` writes the decoded
+  frame as NV12 PPM (6.2 MB at 1080p); it only fires on a frame the client
+  actually decoded, so on a resyncing session with no IDR yet no file appears.
 - **Encoder quality without a display.** `lgx-vtenc --selftest --out FILE`
   encodes 120 frames of a deterministic pattern (luma `(col/8 + frame*3) % 200
   + 20`, chroma 128, frame index starting at 1) through the same VideoToolbox
