@@ -312,10 +312,15 @@ Commit format: `area: short imperative summary`, for example
   VPS/SPS/PPS, keeps a two-slot DPB and returns CPU NV12 frames. It sustains
   157-159 fps. The DPB images are created with a DRM modifier and exported as
   dma-buf; the client wraps them in `Pixels::Dmabuf` and the renderer samples
-  them directly, so the native path is zero-copy (no NV12 readback). It is
-  the default when the device supports Vulkan Video and dma-buf import;
-  `LGX_VULKAN_VIDEO=ffmpeg` (or `0`), `--decoder` other than Vulkan, and any
-  native setup/decode error fall back to FFmpeg (Vulkan/VAAPI/software).
+  them directly, so the native path is zero-copy (no NV12 readback).
+  **It is opt-in, not the default.** The renderer imports those images on its
+  own Vulkan device while the decoder may reuse a slot two frames later; with
+  the live 1080p stream that showed up as persistent garbage over part or all
+  of the window that only a client restart cleared, although the same access
+  units decode cleanly with FFmpeg. Until the slot hand-off has a hold/release
+  protocol (or the pictures are copied into renderer-owned images), the
+  default is FFmpeg; `--decoder` other than Vulkan and any native
+  setup/decode error also fall back to FFmpeg (Vulkan/VAAPI/software).
 - One decode thread owns libavcodec; the window takes only the newest frame
   from a one-slot mailbox.
 - Gamepad state snapshots go over the same TCP stream; the server's input

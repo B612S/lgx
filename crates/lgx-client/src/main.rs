@@ -901,20 +901,25 @@ fn main() {
     } else {
         detect_decoders(Some(renderer.device_name()))
     };
+    // The native decoder exports the decoder's own DPB images and the renderer
+    // samples them on another Vulkan device. Nothing keeps the decoder from
+    // reusing (and overwriting) a slot that is still being displayed, and in
+    // the live 1080p stream that produces persistent garbage that only a fresh
+    // session clears. It stays opt-in until the slot hand-off is synchronized.
     let native_ok = renderer.video_decode_queue().is_some()
         && renderer.can_import_dmabuf()
         && (s.decoder.is_empty() || s.decoder == "default" || s.decoder == "vulkan")
         && args.screenshot.is_none()
-        && !matches!(
+        && matches!(
             std::env::var("LGX_VULKAN_VIDEO").as_deref(),
-            Ok("ffmpeg") | Ok("0")
+            Ok("native") | Ok("1")
         );
     eprintln!(
         "lgx-client: native Vulkan Video path {}",
         if native_ok {
-            "enabled by default (LGX_VULKAN_VIDEO=ffmpeg forces FFmpeg)"
+            "enabled by LGX_VULKAN_VIDEO (experimental zero-copy decoder)"
         } else {
-            "disabled"
+            "disabled (LGX_VULKAN_VIDEO=native enables the experimental decoder)"
         }
     );
     let want_dmabuf = renderer.can_import_dmabuf();
