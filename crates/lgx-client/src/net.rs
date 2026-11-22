@@ -566,8 +566,10 @@ fn reader(
                     capture_us,
                 };
                 if video.push(chunk) {
+                    // The decoder is waiting for a keyframe now, so ask
+                    // promptly; the floor only stops a request storm.
                     let due = last_idr_request
-                        .is_none_or(|t| t.elapsed() >= std::time::Duration::from_millis(500));
+                        .is_none_or(|t| t.elapsed() >= std::time::Duration::from_millis(50));
                     if due {
                         last_idr_request = Some(std::time::Instant::now());
                         let _ = conn.send(Msg::new(msg::IDR, 0, 0, 0), &[]);
@@ -724,7 +726,34 @@ fn reader(
 
 /// Frames buffered between the reader and the decoder. Six frames at 120 Hz
 /// bound the extra latency to ~50 ms.
-pub const VIDEO_QUEUE: usize = 6;
+/// True when an Annex-B access unit contains an HEVC IDR NAL (type 19 or 20).
+fn is_idr(data: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 4 < data.len() {
+        if data[i] == 0 && data[i + 1] == 0 {
+            if data[i + 2] == 1 {
+                let t = (data[i + 3] >> 1) & 0x3f;
+                if t == 19 || t == 20 {
+                    return true;
+                }
+                i += 3;
+                continue;
+            }
+            if data[i + 2] == 0 && data[i + 3] == 1 {
+                let t = (data[i + 4] >> 1) & 0x3f;
+                if t == 19 || t == 20 {
+                    return true;
+                }
+                i += 4;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+pub const VIDEO_QUEUE: usize = 20;
 
 /// Bounded queue of access units between the reader and the decoder.
 ///
@@ -749,6 +778,10 @@ struct QueueState {
     items: std::collections::VecDeque<Chunk>,
     capacity: usize,
     closed: bool,
+    /// Set when a unit had to be evicted: the reference chain is broken, so
+    /// the consumer resumes at the next keyframe instead of feeding frames
+    /// whose references are gone (libavcodec drops those silently).
+    resync: bool,
 }
 
 impl ChunkQueue {
@@ -758,6 +791,7 @@ impl ChunkQueue {
                 items: std::collections::VecDeque::with_capacity(capacity.max(2)),
                 capacity: capacity.max(2),
                 closed: false,
+                resync: false,
             }),
             cv: std::sync::Condvar::new(),
         }
@@ -774,6 +808,7 @@ impl ChunkQueue {
         }
         if dropped {
             EVICTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            g.resync = true;
         }
         g.items.push_back(chunk);
         drop(g);
@@ -785,7 +820,13 @@ impl ChunkQueue {
     pub fn pop(&self) -> Option<Chunk> {
         let mut g = self.inner.lock().unwrap();
         loop {
-            if let Some(chunk) = g.items.pop_front() {
+            while let Some(chunk) = g.items.pop_front() {
+                if g.resync {
+                    if !is_idr(&chunk.data[chunk.off..]) {
+                        continue;
+                    }
+                    g.resync = false;
+                }
                 return Some(chunk);
             }
             if g.closed {

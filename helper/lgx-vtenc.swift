@@ -122,6 +122,7 @@ func runSelfTest(_ w: Int, _ h: Int, _ frames: Int, _ fps: Int, _ handle: FileHa
 final class EncoderStats {
     private let lock = NSLock()
     private var sck: UInt64 = 0
+    private var unique: UInt64 = 0
     private var encoded: UInt64 = 0
     private var calls: UInt64 = 0
     private var errors: UInt64 = 0
@@ -131,6 +132,7 @@ final class EncoderStats {
     private var emitNs: UInt64 = 0
     private var writeNs: UInt64 = 0
     private var lastSck: UInt64 = 0
+    private var lastUnique: UInt64 = 0
     private var lastEncoded: UInt64 = 0
     private var lastErrors: UInt64 = 0
     private var lastCalls: UInt64 = 0
@@ -141,6 +143,11 @@ final class EncoderStats {
 
     func sckFrame() {
         lock.lock(); sck &+= 1; lock.unlock()
+    }
+    /// Callbacks that carried a new presentation timestamp; ScreenCaptureKit
+    /// repeats the same timestamp when it delivers a frame more than once.
+    func uniqueFrame() {
+        lock.lock(); unique &+= 1; lock.unlock()
     }
     func submitted(_ ns: UInt64) {
         lock.lock()
@@ -170,12 +177,13 @@ final class EncoderStats {
         let dt = max(Double(now &- lastNs) / 1_000_000_000.0, 0.001)
         let ds = sck &- lastSck
         let de = encoded &- lastEncoded
+        let du = unique &- lastUnique
         let derr = errors &- lastErrors
         let dcalls = calls &- lastCalls
         let dsubmit = submitNs &- lastSubmitNs
         let demit = emitNs &- lastEmitNs
         let dwrite = writeNs &- lastWriteNs
-        lastSck = sck; lastEncoded = encoded; lastErrors = errors
+        lastSck = sck; lastEncoded = encoded; lastErrors = errors; lastUnique = unique
         lastCalls = calls; lastSubmitNs = submitNs; lastEmitNs = emitNs; lastWriteNs = writeNs
         lastNs = now
         let flights = inFlight
@@ -186,8 +194,8 @@ final class EncoderStats {
         let avgWrite = de > 0 ? Double(dwrite) / Double(de) / 1_000_000.0 : 0
         lock.unlock()
         return String(
-            format: "SCK %.1f fps, encoded %.1f fps, errors %llu, in-flight %d/%d, submit %.2f ms, emit %.2f ms, write %.2f ms",
-            Double(ds) / dt, Double(de) / dt, derr, flights, worst,
+            format: "SCK %.1f fps (%.1f unique), encoded %.1f fps, errors %llu, in-flight %d/%d, submit %.2f ms, emit %.2f ms, write %.2f ms",
+            Double(ds) / dt, Double(du) / dt, Double(de) / dt, derr, flights, worst,
             avgSubmit, avgEmit, avgWrite)
     }
 }
@@ -391,6 +399,8 @@ final class CursorProbe {
 }
 
 final class Encoder: NSObject, SCStreamOutput, SCStreamDelegate {
+    /// Presentation timestamp of the frame last submitted to VideoToolbox.
+    private var lastSubmittedPts: CMTime?
     var session: VTCompressionSession?
     var out: FileHandle
     var frames = 0
@@ -503,8 +513,13 @@ final class Encoder: NSObject, SCStreamOutput, SCStreamDelegate {
             VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxFrameDelayCount,
                                  value: maxDelay as CFNumber)
         }
+        // Prioritizing speed lets VideoToolbox drop frames it cannot finish in
+        // time; that is the difference between the live pipeline and the
+        // selftest's full 120 fps at 1200p. LGX_VT_SPEED_OVER_QUALITY=0 turns
+        // it off for measurement.
+        let speedFirst = ProcessInfo.processInfo.environment["LGX_VT_SPEED_OVER_QUALITY"] != "0"
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality,
-                             value: kCFBooleanTrue)
+                             value: speedFirst as CFBoolean)
         VTCompressionSessionPrepareToEncodeFrames(session)
     }
 
@@ -605,6 +620,16 @@ final class Encoder: NSObject, SCStreamOutput, SCStreamDelegate {
         guard type == .screen, CMSampleBufferIsValid(sb) else { return }
         stats.sckFrame()
         guard let pb = CMSampleBufferGetImageBuffer(sb), let session else { return }
+        // ScreenCaptureKit repeats a frame (same presentation timestamp) when
+        // the display refreshes faster than the content changes. Submitting the
+        // duplicates makes VideoToolbox drop the new ones, which is why the
+        // live pipeline encoded ~30 fps of the ~76 callbacks.
+        let stampPts = CMSampleBufferGetPresentationTimeStamp(sb)
+        if let last = lastSubmittedPts, CMTimeCompare(last, stampPts) == 0 {
+            return
+        }
+        lastSubmittedPts = stampPts
+        stats.uniqueFrame()
         if cursorProbePath != nil {
             mailbox.store(pb)
         }

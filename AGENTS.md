@@ -519,24 +519,39 @@ the Vulkan shader converts full-range BT.709, and the HEVC VUI says
   clock. At 1080p160 the audio head trails the video capture by ~50 ms (the
   8 KiB playout cushion), stable within a few ms; the video hold stays
   opt-in and capped at 30 ms, so the default presents immediately.
-- Measured bandwidth on the macOS server (2026-11-22): the LaunchAgent's
-  200 Mbit/s let VideoToolbox spend 14.8 MiB/s while the screen changed; with
-  25 Mbit/s the same screen costs 2.9-3.1 MiB/s. Lower the LaunchAgent's
-  `--bitrate` rather than expecting the encoder to self-limit. The SCK and
-  VideoToolbox queues deliver frames in bursts (log shows `in-flight 1/4`),
-  so on an active screen the client decoded only ~20 of the 33 encoded frames
-  and `capture->present` p99 reached ~220 ms while p50 stayed at 19 ms. The
-  macOS pipeline needs output pacing, not just a lower bitrate. Frames whose
-  capture timestamp is older than `LGX_MAX_FRAME_AGE_MS` (default 100) when
-  they reach the writer are dropped and an IDR is requested; the client's
-  pre-decode queue is deliberately shallow (`LGX_VIDEO_QUEUE` overrides it for
-  experiments: 6 slots decode ~14 fps of a bursty macOS stream, 64 slots decode
-  all of it but at p99 ~240 ms).
-- `lgx-vtenc` logs `SCK x fps, encoded y fps, encode errors n` every 5 s and
-  whether VideoToolbox chose the hardware encoder. A low HEVC fps with a much
-  higher SCK rate means the encoder is dropping input; both equal means the
-  display content itself changed at that rate. The first frame of every
-  session is forced to an IDR.
+- **VideoToolbox constant quality.** `--vt-quality Q` (0..1, `LGX_VT_QUALITY`)
+  sets `kVTCompressionPropertyKey_Quality` and drops the bitrate target; `Q=0`
+  keeps the CBR/AverageBitRate path. Quality mode is what a desktop wants: a
+  static screen costs nothing, an active one spends bits where the picture
+  needs them, and the encoder never drops a frame to hit a rate. Measured at
+  1920x1200 with an active screen: 200 Mbit/s CBR cost 14.4 MiB/s, 50 Mbit/s
+  6.2 MiB/s, quality 0.7 **1.4 MiB/s** and quality 0.5 0.2 MiB/s, all at the
+  same ~30-40 encoded fps, and quality mode also made the emit call 5x faster
+  (0.1 ms against 0.5-0.8 ms). `--vt-max-delay N` sets VideoToolbox's
+  `MaxFrameDelayCount` (0 leaves it unset); it made no measurable difference.
+- **ScreenCaptureKit repeats frames.** With `--fps 120` on a 60-78 Hz panel
+  SCK delivers each frame twice: the log shows `SCK 77.4 fps (30.0 unique)`.
+  Submitting the duplicates made VideoToolbox silently drop the new frames
+  (encoded 30 of 77), which is where the "macOS encodes 30 fps" came from.
+  `lgx-vtenc` now skips a callback whose presentation timestamp equals the
+  previous one, so `encoded` always equals `unique`; the encoder's own
+  `--selftest` at 1200p sustains 120 fps (7200 frames in 60 s).
+- **The client's pre-decode queue is the other half of the pair.** It holds 20
+  access units, evicts the oldest when full (newest wins) and then *resyncs to
+  the next keyframe*: feeding frames whose references were evicted makes
+  libavcodec drop every one of them ("Could not find ref with POC n"), which
+  measured 10 fps of a 35 fps stream. The reader asks for an IDR within 50 ms
+  of an eviction. Measured against the macOS server, 1920x1200: 33-35 fps
+  decoded of 40 encoded, `capture->present` p50 11-13 ms, p99 18 ms; the same
+  client against the Linux VM at 1080p160 decodes 155 fps at p50/p99 3.6/5.1
+  ms. A deeper queue alone (64) also decodes everything but at p99 ~240 ms,
+  so the eviction policy, not the depth, is what keeps latency down.
+- `lgx-vtenc` logs `SCK x fps (y unique), encoded z fps, encode errors n`
+  every 5 s and whether VideoToolbox chose the hardware encoder. `unique`
+  counts callbacks with a new presentation timestamp; `encoded` should equal
+  it. A gap between the two means VideoToolbox dropped input, and a gap
+  between SCK and unique means ScreenCaptureKit repeated frames. The first
+  frame of every session is forced to an IDR.
 
 ## Pairing and clients
 

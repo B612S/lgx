@@ -273,7 +273,14 @@ impl Decoder {
     pub fn pull(&mut self, arrival: Instant) -> io::Result<Option<Frame>> {
         let mut info: FrameInfo = unsafe { std::mem::zeroed() };
         let mut handle: *mut c_void = std::ptr::null_mut();
+        let started = Instant::now();
         let r = unsafe { lgx_dec_pull(self.raw, &mut info, &mut handle) };
+        if std::env::var_os("LGX_DEBUG_DEC").is_some() {
+            let us = started.elapsed().as_micros();
+            if us > 20_000 {
+                eprintln!("lgx-client: pull took {us} us (r={r})");
+            }
+        }
         if r == 0 {
             return Ok(None);
         }
