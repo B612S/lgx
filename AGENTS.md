@@ -513,6 +513,14 @@ the Vulkan shader converts full-range BT.709, and the HEVC VUI says
   clock. At 1080p160 the audio head trails the video capture by ~50 ms (the
   8 KiB playout cushion), stable within a few ms; the video hold stays
   opt-in and capped at 30 ms, so the default presents immediately.
+- Measured bandwidth on the macOS server (2026-11-22): the LaunchAgent's
+  200 Mbit/s let VideoToolbox spend 14.8 MiB/s while the screen changed; with
+  25 Mbit/s the same screen costs 2.9-3.1 MiB/s. Lower the LaunchAgent's
+  `--bitrate` rather than expecting the encoder to self-limit. The SCK and
+  VideoToolbox queues deliver frames in bursts (log shows `in-flight 1/4`),
+  so on an active screen the client decoded only ~20 of the 33 encoded frames
+  and `capture->present` p99 reached ~220 ms while p50 stayed at 19 ms. The
+  macOS pipeline needs output pacing, not just a lower bitrate.
 - `lgx-vtenc` logs `SCK x fps, encoded y fps, encode errors n` every 5 s and
   whether VideoToolbox chose the hardware encoder. A low HEVC fps with a much
   higher SCK rate means the encoder is dropping input; both equal means the
