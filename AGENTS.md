@@ -562,8 +562,12 @@ the Vulkan shader converts full-range BT.709, and the HEVC VUI says
   `MaxKeyFrameInterval`; a constant-quality IDR costs 45-90 KiB at 1200p, so a
   2 s interval spent a noticeable share of the traffic on keyframes. The client
   still asks for an IDR explicitly when it needs one. The stats line now reports
-  `IDR x/s y KiB/s` so the share is visible. `--no-vt-speed-over-quality` turns
-  off VideoToolbox's speed hint (more encoder CPU, usually fewer bits).
+  `IDR x/s y KiB/s (n requested)` so the share is visible; `requested` counts
+  the keyframes the *client* asked for after it dropped a frame. Measured: with
+  a live client the two keyframes in a 5 s window were both requested, so the
+  keyframe traffic is client-driven, not a VideoToolbox timer.
+  `--no-vt-speed-over-quality` turns off VideoToolbox's speed hint (more
+  encoder CPU, usually fewer bits).
 - **The client's pre-decode queue is the other half of the pair.** It holds 20
   access units, evicts the oldest when full (newest wins) and then *resyncs to
   the next keyframe*: feeding frames whose references were evicted makes

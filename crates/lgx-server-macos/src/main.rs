@@ -1015,6 +1015,10 @@ fn serve(args: &Args, secure: Arc<Secure>) -> std::io::Result<()> {
 
     let mut last_ping = Instant::now();
     let mut last_idr: Option<Instant> = None;
+    // IDRs the client asked for (dropped frames, new session, lost sync). A
+    // high rate means the client is discarding frames, not that the encoder
+    // fires keyframes on its own timer.
+    let mut idr_requests = 0u64;
     let (mut frames, mut bytes) = (0u64, 0u64);
     // Keyframes are the expensive part of constant-quality video; counting
     // them separately shows whether the keyframe interval dominates traffic.
@@ -1051,13 +1055,14 @@ fn serve(args: &Args, secure: Arc<Secure>) -> std::io::Result<()> {
             && need_idr.swap(false, Ordering::Relaxed)
         {
             last_idr = Some(Instant::now());
+            idr_requests += 1;
             send_helper(&capture_stdin, "idr");
         }
         if t0.elapsed() >= Duration::from_secs(stats_period) {
             let elapsed = t0.elapsed().as_secs_f64();
             let lost = dropped.swap(0, Ordering::Relaxed);
             info!(
-                "HEVC {:.1} fps, {:.1} MiB/s, send {:.2} ms, {} dropped, {} late, max age {} ms, IDR {:.1}/s {:.1} KiB/s, {} kbps",
+                "HEVC {:.1} fps, {:.1} MiB/s, send {:.2} ms, {} dropped, {} late, max age {} ms, IDR {:.1}/s {:.1} KiB/s ({} requested), {} kbps",
                 frames as f64 / elapsed,
                 bytes as f64 / elapsed / 1_048_576.0,
                 if frames > 0 { send_secs * 1000.0 / frames as f64 } else { 0.0 },
@@ -1066,12 +1071,14 @@ fn serve(args: &Args, secure: Arc<Secure>) -> std::io::Result<()> {
                 max_age_ms,
                 keyframes as f64 / elapsed,
                 key_bytes as f64 / elapsed / 1024.0,
+                idr_requests,
                 bitrate / 1000
             );
             late = 0;
             max_age_ms = 0;
             keyframes = 0;
             key_bytes = 0;
+            idr_requests = 0;
             // Adaptive bitrate: drops mean the pipe (or the client) cannot take
             // the current rate. Back off quickly, recover slowly.
             if args.adaptive {
