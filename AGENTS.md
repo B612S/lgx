@@ -429,6 +429,19 @@ the Vulkan shader converts full-range BT.709, and the HEVC VUI says
   clipboard URI. Keep /tmp visible to the service.
 - Never add clipboard hotkeys, `CLIP_GET`/`CLIP_ACK` or a paste injection back.
   Normal Ctrl+C/Ctrl+V is the whole UX.
+- **Lossless audio is FLAC.** After the float->s16 conversion the server
+  encodes every chunk as one self-contained FLAC frame and frames it as
+  `LGXF` + u64 LE timestamp + u32 LE length + frame; the client decodes it with
+  `claxon` and keeps the same timestamp/ring path as `LGXA`, so A/V sync is
+  unchanged. Each frame carries its own block size and stream parameters, so
+  there is no stream-level buffering and no added latency. A chunk that cannot
+  be framed (too short, odd length) or would not shrink is sent as `LGXA` PCM
+  instead. The client opts in with `AUDIO_FLAC` right after `AUDIO_SYNC`; a
+  server that predates it keeps sending PCM and an old client never asks.
+  Measured: a 512-frame chunk of a tone costs 426 bytes against 2048 bytes of
+  PCM, and 512 frames of silence fit in under 120 bytes. Tests:
+  `flac_frame_round_trips_and_is_smaller_than_pcm`,
+  `silent_chunk_costs_almost_nothing`.
 - Audio is on by default (`--no-audio` disables it) and uses the same secure
   handshake/record layer with the same token PSK. Both sides use native
   PipeWire streams (`pipewire-rs`); do not reintroduce `parec`/`pacat`,

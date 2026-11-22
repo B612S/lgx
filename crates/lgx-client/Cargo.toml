@@ -21,3 +21,4 @@ ash = { version = "0.38", features = ["loaded"] }
 freetype-rs = "0.38"
 pipewire = { version = "0.10", features = ["v0_3_49"] }
 ringbuf = "0.4"
+claxon = "0.4.3"

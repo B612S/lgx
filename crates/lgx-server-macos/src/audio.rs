@@ -99,7 +99,17 @@ fn handle(
     // noise. The flag is client -> server, so an old server that never reads
     // it is unaffected.
     let _ = secure.set_read_timeout(Some(Duration::from_millis(250)));
-    let framed = matches!(secure.recv_msg(), Ok((m, _)) if m.typ == msg::AUDIO_SYNC);
+    let mut framed = false;
+    let mut flac = false;
+    // The client sends its capabilities back to back; an old client sends
+    // nothing and the timeout ends the loop.
+    while let Ok((m, _)) = secure.recv_msg() {
+        match m.typ {
+            msg::AUDIO_SYNC => framed = true,
+            msg::AUDIO_FLAC => flac = true,
+            _ => break,
+        }
+    }
     let _ = secure.set_read_timeout(None);
 
     let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(4);
@@ -116,7 +126,7 @@ fn handle(
     };
     eprintln!("lgx-server-macos: audio client {client_id} connected");
 
-    if let Err(e) = start_capture(state, framed) {
+    if let Err(e) = start_capture(state, framed, flac) {
         eprintln!("lgx-server-macos: audio capture unavailable: {e}");
         unregister(state, generation);
         secure.close();
@@ -152,7 +162,7 @@ fn unregister(state: &Arc<State>, generation: u64) {
     }
 }
 
-fn start_capture(state: &Arc<State>, framed: bool) -> Result<(), String> {
+fn start_capture(state: &Arc<State>, framed: bool, flac: bool) -> Result<(), String> {
     let mut capture = state.capture.lock().unwrap();
     if capture.is_some() {
         return Ok(());
@@ -174,7 +184,7 @@ fn start_capture(state: &Arc<State>, framed: bool) -> Result<(), String> {
     let sink = Arc::clone(state);
     let reader = thread::Builder::new()
         .name("lgx-audio-read".into())
-        .spawn(move || read_pcm(stdout, sink, framed))
+        .spawn(move || read_pcm(stdout, sink, framed, flac))
         .map_err(|e| format!("audio reader thread: {e}"))?;
     *capture = Some(Capture { child, reader });
     Ok(())
@@ -186,7 +196,9 @@ fn start_capture(state: &Arc<State>, framed: bool) -> Result<(), String> {
 /// then PCM, so a client that needs A/V sync can rebuild the server timeline.
 /// Chunks are dropped, not queued, when the client falls behind: a growing
 /// backlog would turn into latency, and the client already reports underruns.
-fn read_pcm(mut stdout: impl Read, state: Arc<State>, framed: bool) {
+fn read_pcm(mut stdout: impl Read, state: Arc<State>, framed: bool, flac: bool) {
+    let mut framer = if flac { FlacFramer::new() } else { None };
+    let mut pcm_out = Vec::new();
     let mut header = [0u8; 12];
     let mut dropped = 0u64;
     let mut last_report = Instant::now();
@@ -210,7 +222,29 @@ fn read_pcm(mut stdout: impl Read, state: Arc<State>, framed: bool) {
             break;
         }
         let ts_us = ts_ns / 1000;
-        let record = if framed {
+        let record = if flac {
+            // One self-contained FLAC frame per chunk keeps the timestamp on
+            // the ring; PCM is the fallback when a chunk cannot be framed or
+            // would not shrink.
+            match framer.as_mut().and_then(|f| f.frame(&pcm)) {
+                Some(frame) if frame.len() < pcm.len() => {
+                    let mut record = Vec::with_capacity(16 + frame.len());
+                    record.extend_from_slice(b"LGXF");
+                    record.extend_from_slice(&ts_us.to_le_bytes());
+                    record.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+                    record.extend_from_slice(&frame);
+                    record
+                }
+                _ => {
+                    pcm_out.clear();
+                    pcm_out.extend_from_slice(b"LGXA");
+                    pcm_out.extend_from_slice(&ts_us.to_le_bytes());
+                    pcm_out.extend_from_slice(&(pcm.len() as u32).to_le_bytes());
+                    pcm_out.extend_from_slice(&pcm);
+                    std::mem::take(&mut pcm_out)
+                }
+            }
+        } else if framed {
             let mut record = Vec::with_capacity(16 + pcm.len());
             record.extend_from_slice(b"LGXA");
             record.extend_from_slice(&ts_us.to_le_bytes());
@@ -263,4 +297,57 @@ fn stop_capture(capture: Capture) {
     }
     let _ = reader.join();
     eprintln!("lgx-server-macos: audio capture stopped");
+}
+
+/// Encodes 16-bit stereo chunks as single FLAC frames (`LGXF` records).
+///
+/// This mirrors `lgx-server`'s framer: a FLAC frame is self-contained, so the
+/// client can decode each record on its own and keep the timestamp per chunk.
+struct FlacFramer {
+    config: flacenc::error::Verified<flacenc::config::Encoder>,
+    info: flacenc::component::StreamInfo,
+    frame_no: usize,
+    scratch: Vec<i32>,
+}
+
+impl FlacFramer {
+    fn new() -> Option<Self> {
+        use flacenc::error::Verify;
+        Some(Self {
+            config: flacenc::config::Encoder::default().into_verified().ok()?,
+            info: flacenc::component::StreamInfo::new(48_000, 2, 16).ok()?,
+            frame_no: 0,
+            scratch: Vec::new(),
+        })
+    }
+
+    fn frame(&mut self, pcm: &[u8]) -> Option<Vec<u8>> {
+        use flacenc::component::BitRepr;
+        use flacenc::source::{FrameBuf, MemSource, Source};
+
+        if pcm.len() < 64 || !pcm.len().is_multiple_of(4) {
+            return None;
+        }
+        let channels = 2usize;
+        let frames = pcm.len() / (2 * channels);
+        if !(16..=65535).contains(&frames) {
+            return None;
+        }
+        self.scratch.clear();
+        self.scratch.extend(
+            pcm.as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| i16::from_le_bytes(*b) as i32),
+        );
+        let mut source = MemSource::from_samples(&self.scratch, channels, 16, 48_000);
+        let mut fb = FrameBuf::with_size(channels, frames).ok()?;
+        source.read_samples(frames, &mut fb).ok()?;
+        let frame =
+            flacenc::encode_fixed_size_frame(&self.config, &fb, self.frame_no, &self.info).ok()?;
+        self.frame_no = self.frame_no.wrapping_add(1);
+        let mut sink = flacenc::bitsink::ByteSink::new();
+        frame.write(&mut sink).ok()?;
+        Some(sink.as_slice().to_vec())
+    }
 }

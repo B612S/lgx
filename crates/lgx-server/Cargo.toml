@@ -21,3 +21,7 @@ ashpd = { version = "0.14.3", default-features = false, features = ["screencast"
 futures-lite = "2"
 ringbuf = "0.4"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
+flacenc = "0.5.1"
+
+[dev-dependencies]
+claxon = "0.4.3"

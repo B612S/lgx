@@ -81,6 +81,10 @@ pub mod msg {
     /// framing. Sent once after the token; an older server ignores it and an
     /// older client never sends it, so both keep raw PCM compatibility.
     pub const AUDIO_SYNC: u8 = 26;
+    /// Client tells the audio server that it decodes `LGXF` FLAC records. Sent
+    /// once after the token, right after `AUDIO_SYNC`; without it the server
+    /// keeps sending `LGXA` PCM (or raw PCM to a server that predates sync).
+    pub const AUDIO_FLAC: u8 = 33;
     pub const GAMEPAD_LEN: usize = 24;
 }
 

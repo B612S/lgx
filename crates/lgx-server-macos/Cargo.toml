@@ -10,5 +10,6 @@ name = "lgx-server-macos"
 path = "src/main.rs"
 
 [dependencies]
+flacenc = "0.5.1"
 lgx-proto = { path = "../lgx-proto" }
 libc = "0.2"

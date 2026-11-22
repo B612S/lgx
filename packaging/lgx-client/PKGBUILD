@@ -2,7 +2,7 @@
 # Build with packaging/build.sh; bump pkgrel on every rebuild.
 pkgname=lgx-client
 pkgver=0.5.0
-pkgrel=3
+pkgrel=4
 pkgdesc='lgx: zero-copy HEVC client (NVDEC/VAAPI decode)'
 arch=('x86_64')
 url='https://github.com/B612S/lgx'

@@ -654,23 +654,47 @@ fn handle(
     // chunk from waiting; an old client sends nothing and the thread simply
     // ends with the connection.
     let timestamped = Arc::new(AtomicBool::new(false));
+    let flac_wanted = Arc::new(AtomicBool::new(false));
     {
         let reader = secure.clone();
         let flag = timestamped.clone();
+        let flac = flac_wanted.clone();
         std::thread::Builder::new()
             .name("lgx-audio-sync".into())
             .spawn(move || {
-                if let Ok((m, _)) = reader.recv_msg() {
-                    if m.typ == msg::AUDIO_SYNC {
-                        flag.store(true, Ordering::Relaxed);
+                // The client sends its capabilities back to back right after
+                // the token; an old client sends nothing and this thread simply
+                // ends with the connection.
+                while let Ok((m, _)) = reader.recv_msg() {
+                    match m.typ {
+                        msg::AUDIO_SYNC => flag.store(true, Ordering::Relaxed),
+                        msg::AUDIO_FLAC => flac.store(true, Ordering::Relaxed),
+                        _ => break,
                     }
                 }
             })
             .ok();
     }
+    let mut framer: Option<FlacFramer> = None;
     while let Ok((ts_us, chunk)) = rx.recv() {
         let framed;
-        let bytes: &[u8] = if timestamped.load(Ordering::Relaxed) {
+        let bytes: &[u8] = if flac_wanted.load(Ordering::Relaxed) {
+            if framer.is_none() {
+                framer = FlacFramer::new();
+            }
+            match framer.as_mut().and_then(|f| f.frame(&chunk)) {
+                Some(frame) if frame.len() < chunk.len() => {
+                    framed = lgxf_record(ts_us, &frame);
+                    &framed
+                }
+                _ => {
+                    // Incompressible or too small: fall back to PCM so the
+                    // chunk still arrives on time.
+                    framed = lgxa_record(ts_us, &chunk);
+                    &framed
+                }
+            }
+        } else if timestamped.load(Ordering::Relaxed) {
             framed = lgxa_record(ts_us, &chunk);
             &framed
         } else {
@@ -694,6 +718,76 @@ fn handle(
         }
     }
     Ok(())
+}
+
+/// Encodes 16-bit stereo chunks as single FLAC frames, framed as `LGXF` +
+/// u64 LE timestamp + u32 LE frame length + FLAC frame.
+///
+/// A FLAC frame is self-contained (its header carries the block size, sample
+/// rate, channel count and bit depth), so the client can decode each record on
+/// its own and keep the timestamp on the ring. That is what makes lossless
+/// compression compatible with the low-latency path: no stream-level
+/// buffering, no lookahead, one chunk in and one frame out.
+struct FlacFramer {
+    config: flacenc::error::Verified<flacenc::config::Encoder>,
+    info: flacenc::component::StreamInfo,
+    frame_no: usize,
+    scratch: Vec<i32>,
+}
+
+impl FlacFramer {
+    fn new() -> Option<Self> {
+        use flacenc::error::Verify;
+        Some(Self {
+            config: flacenc::config::Encoder::default().into_verified().ok()?,
+            info: flacenc::component::StreamInfo::new(RATE as usize, CHANNELS as usize, 16).ok()?,
+            frame_no: 0,
+            scratch: Vec::new(),
+        })
+    }
+
+    /// One FLAC frame for one PCM chunk, or `None` when the chunk cannot be
+    /// framed (a partial chunk shorter than a FLAC block, or an odd length):
+    /// the caller then sends the chunk as `LGXA` PCM.
+    fn frame(&mut self, pcm: &[u8]) -> Option<Vec<u8>> {
+        use flacenc::component::BitRepr;
+        use flacenc::source::{FrameBuf, MemSource, Source};
+
+        if pcm.len() < 64 || !pcm.len().is_multiple_of(2) {
+            return None;
+        }
+        let channels = CHANNELS as usize;
+        let frames = pcm.len() / (2 * channels);
+        if !(16..=65535).contains(&frames) {
+            return None;
+        }
+        self.scratch.clear();
+        self.scratch.extend(
+            pcm.as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| i16::from_le_bytes(*b) as i32),
+        );
+        let mut source = MemSource::from_samples(&self.scratch, channels, 16, RATE as usize);
+        let mut fb = FrameBuf::with_size(channels, frames).ok()?;
+        source.read_samples(frames, &mut fb).ok()?;
+        let frame =
+            flacenc::encode_fixed_size_frame(&self.config, &fb, self.frame_no, &self.info).ok()?;
+        self.frame_no = self.frame_no.wrapping_add(1);
+        let mut sink = flacenc::bitsink::ByteSink::new();
+        frame.write(&mut sink).ok()?;
+        Some(sink.as_slice().to_vec())
+    }
+}
+
+/// `LGXF` + u64 LE timestamp + u32 LE FLAC frame length + frame.
+fn lgxf_record(ts_us: u64, frame: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(16 + frame.len());
+    out.extend_from_slice(b"LGXF");
+    out.extend_from_slice(&ts_us.to_le_bytes());
+    out.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+    out.extend_from_slice(frame);
+    out
 }
 
 /// `LGXA` + u64 LE timestamp + u32 LE PCM length + PCM, the framing the
@@ -807,5 +901,53 @@ mod tests {
         f32_to_s16_dithered(&input, &mut out, &mut rng, 1.0, 1.0);
         assert_eq!(s16_at(&out, 0), 32767);
         assert_eq!(s16_at(&out, 1), -32768);
+    }
+
+    #[test]
+    fn flac_frame_round_trips_and_is_smaller_than_pcm() {
+        let mut framer = FlacFramer::new().expect("framer");
+        let mut pcm = Vec::new();
+        let mut want = Vec::new();
+        for i in 0..512 {
+            let v = ((i as f32 * 440.0 * std::f32::consts::TAU / RATE as f32).sin() * 8000.0) as i16;
+            want.push(v as i32);
+            want.push((v / 2) as i32);
+            pcm.extend_from_slice(&v.to_le_bytes());
+            pcm.extend_from_slice(&(v / 2).to_le_bytes());
+        }
+        let frame = framer.frame(&pcm).expect("flac frame");
+        assert!(
+            frame.len() < pcm.len() / 2,
+            "flac {} bytes for {} pcm",
+            frame.len(),
+            pcm.len()
+        );
+        let rec = lgxf_record(0x0102_0304_0506, &frame);
+        assert_eq!(&rec[..4], b"LGXF");
+        assert_eq!(u64::from_le_bytes(rec[4..12].try_into().unwrap()), 0x0102_0304_0506);
+        assert_eq!(
+            u32::from_le_bytes(rec[12..16].try_into().unwrap()) as usize,
+            frame.len()
+        );
+        let mut reader = claxon::frame::FrameReader::new(std::io::Cursor::new(&rec[16..]));
+        let block = reader.read_next_or_eof(Vec::new()).unwrap().expect("block");
+        assert_eq!(block.duration(), 512);
+        assert_eq!(block.channels(), CHANNELS);
+        for i in 0..512u32 {
+            assert_eq!(block.sample(0, i), want[i as usize * 2]);
+            assert_eq!(block.sample(1, i), want[i as usize * 2 + 1]);
+        }
+    }
+
+    #[test]
+    fn silent_chunk_costs_almost_nothing() {
+        let mut framer = FlacFramer::new().expect("framer");
+        let pcm = vec![0u8; 512 * CHANNELS as usize * 2];
+        let frame = framer.frame(&pcm).expect("frame");
+        assert!(
+            frame.len() < 120,
+            "512 frames of silence took {} bytes",
+            frame.len()
+        );
     }
 }

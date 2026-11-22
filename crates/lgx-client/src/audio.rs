@@ -43,6 +43,8 @@ const BYTES_PER_SEC: u64 = 48_000 * 4;
 /// Audio records from a timestamp-aware server start with this magic. Old
 /// servers send raw PCM and are played without A/V sync.
 const AUDIO_MAGIC: &[u8; 4] = b"LGXA";
+/// `LGXF` + u64 LE timestamp + u32 LE length + one FLAC frame.
+const FLAC_MAGIC: &[u8; 4] = b"LGXF";
 
 /// Shared A/V clock. `head_us` is the server capture/write timestamp of the
 /// next sample the playback callback will consume; the video presenter holds a
@@ -395,6 +397,10 @@ pub fn run(
         // frame (it is client -> server, so it cannot corrupt playback) and
         // keeps sending raw PCM, which the parser below still accepts.
         secure.send_msg(Msg::new(msg::AUDIO_SYNC, 0, 0, 0), &[])?;
+        // Ask for lossless FLAC records. A server that predates them ignores
+        // this frame and keeps sending LGXA PCM, which the parser below still
+        // accepts.
+        secure.send_msg(Msg::new(msg::AUDIO_FLAC, 0, 0, 0), &[])?;
 
         let mut total = 0u64;
         let mut last = Instant::now();
@@ -417,6 +423,37 @@ pub fn run(
             // A timestamp-aware server prefixes every record with LGXA, the
             // u64 LE timestamp in microseconds and the u32 LE PCM length. A
             // plain PCM record from an old server is played without sync.
+            // A FLAC record carries one self-contained frame: decode it and
+            // hand the PCM to the ring with the same timestamp path as LGXA.
+            if chunk.len() >= 16 && &chunk[..4] == FLAC_MAGIC {
+                let ts = u64::from_le_bytes(chunk[4..12].try_into().unwrap());
+                let len = u32::from_le_bytes(chunk[12..16].try_into().unwrap()) as usize;
+                if len > 0 && 16 + len == chunk.len() {
+                    if let Some(pcm) = decode_flac(&chunk[16..]) {
+                        let pushed = audio_tx.push_slice(&pcm);
+                        if pushed > 0 && ts != 0 {
+                            if !logged_sync {
+                                logged_sync = true;
+                                eprintln!("lgx-client: audio A/V timestamps enabled (FLAC)");
+                            }
+                            if let Ok(mut timeline) = timeline.lock() {
+                                timeline.push(ts, pushed);
+                            }
+                        }
+                        total += pcm.len() as u64;
+                        if last.elapsed() >= Duration::from_secs(5) {
+                            let missed = underruns.swap(0, Ordering::Relaxed);
+                            eprintln!(
+                                "lgx-client: audio {:.1} KiB/s, {missed} underrun(s)",
+                                total as f64 / 1024.0 / last.elapsed().as_secs_f64()
+                            );
+                            total = 0;
+                            last = Instant::now();
+                        }
+                        continue;
+                    }
+                }
+            }
             let (ts_us, pcm) = if chunk.len() >= 16 && &chunk[..4] == AUDIO_MAGIC {
                 let ts = u64::from_le_bytes(chunk[4..12].try_into().unwrap());
                 let len = u32::from_le_bytes(chunk[12..16].try_into().unwrap()) as usize;
@@ -456,4 +493,27 @@ pub fn run(
     let _ = quit.send(());
     let _ = handle.join();
     result
+}
+
+/// Decode one self-contained FLAC frame into interleaved s16le PCM.
+///
+/// A FLAC frame carries its own sample rate, channel count and bit depth, so
+/// each record can be decoded without stream context; that is what keeps the
+/// timestamp per chunk and the A/V sync intact.
+fn decode_flac(frame: &[u8]) -> Option<Vec<u8>> {
+    let mut reader = claxon::frame::FrameReader::new(std::io::Cursor::new(frame));
+    let block = reader.read_next_or_eof(Vec::new()).ok()??;
+    let samples = block.duration() as usize;
+    let channels = block.channels() as usize;
+    if samples == 0 || channels == 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(samples * channels * 2);
+    for i in 0..samples {
+        for c in 0..channels {
+            let v = block.sample(c as u32, i as u32).clamp(-32768, 32767) as i16;
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    Some(out)
 }
