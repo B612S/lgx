@@ -16,12 +16,14 @@ addresses the server's LAN IP and explicit ports.
 ## Layout
 
 ```
+crates/lgx-caps/     runtime DRM/VAAPI/Vulkan/NVENC capability probes + policy
 crates/lgx-proto/    wire protocol (messages, auth)
 crates/lgx-server/   capture, VPP/GL NV12 conversion, VAAPI helper client, input
 crates/lgx-client/   in-process HEVC decoder, Vulkan renderer, input
 crates/lgx-client/src/dec_shim.c   libavcodec C shim (built by build.rs)
 crates/lgx-server-macos/  ScreenCaptureKit/VideoToolbox server for macOS
 helper/lgx-vaenc.c   VAAPI HEVC encoder that exports dma-buf surfaces
+helper/lgx-nvenc.c   NVENC HEVC encoder that takes CPU NV12
 helper/lgx-uinput.c  root helper that creates the uinput devices
 helper/lgx-cginput.c macOS CGEvent input injection
 helper/lgx-frontmost.m frontmost-application PID/bundle ID for the macOS helper
@@ -45,19 +47,63 @@ Commit format: `area: short imperative summary`, for example
 
 - **HEVC only.** Do not add an H.264 path, tile streaming or shared-memory
   transport; they were removed on purpose.
+- **Capture is capability-selected.** `zwlr_screencopy_manager_v1` present
+  (wlroots) -> `capture.rs` with GBM dma-buf; otherwise
+  `org.freedesktop.portal.ScreenCast` -> `portal.rs` with a PipeWire stream.
+  `--capture auto|wlr|portal` (config `video.capture`) overrides the choice.
+  KDE/GNOME never expose wlr-screencopy, so they always take the portal.
+- The portal requests shared-memory (MemFd) BGRx/BGRA buffers and converts
+  them to NV12 on the CPU (parallel over rows). `LGX_PORTAL_DMABUF=1` is an
+  experimental Intel VPP path that advertises an I915 Y-tiled modifier and
+  imports the compositor buffer into the VAAPI helper (plane offset is carried
+  in the `'R'` meta word 7). It is off by default: the idle-keyframe replay
+  has no NV12 cache in that mode and the nested-KWin test could not produce
+  enough damage to confirm the import. Do not enable it by default until it
+  is verified on a real Intel KDE session. The portal is damage-driven: it produces no frames while the
+  desktop is idle, so the wlr 5 s no-packet watchdog must not apply to it.
+  A 100 ms PipeWire timer re-encodes the last NV12 frame as an IDR when a
+  client needs a keyframe on an idle desktop; without it a newly connected
+  client stays black until the next damage event.
+- Ask the portal for the cursor mode it advertises; do not hardcode
+  `CursorMode::EMBEDDED`. KDE supports it, GNOME does not (selecting it makes
+  `SelectSources` fail with "Unavailable cursor mode 2"). Prefer EMBEDDED, then
+  HIDDEN. When the pointer is not embedded, call `Hub::set_cursor_local(true)`
+  so clients draw their own pointer (`CURSOR_LOCAL`); otherwise GNOME sessions
+  would have no visible cursor at all.
+- **Encoder is capability-selected.** `lgx-caps::encoder_for_node` picks
+  NVENC on an NVIDIA capture node (and `helper/lgx-nvenc.c` is spawned),
+  VAAPI elsewhere. NVENC takes system-memory NV12; VAAPI owns its surfaces.
+  `low_power` is the VAAPI VDENC entry point and must be gated on
+  `VaCaps::hevc_encode_low_power` (Mesa/AMD has no `EncSliceLP`; `lgx-vaenc`
+  also retries once with `low_power=0`).
 - `wlr-screencopy` -> GBM dma-buf -> VPP RGB->NV12 -> `lgx-vaenc` (Intel).
-  `LGX_NO_VPP=1` falls back to the `glconv` RGB->NV12 path.
+  `LGX_NO_VPP=1` falls back to the `glconv` RGB->NV12 path. AMD uses the GL
+  path by default because its VPP RGB import is unverified; linear capture
+  buffers are requested there, never the Intel Y-tiled modifier.
 - The helper is a separate process because it owns the VAAPI/VPP surfaces.
   With VPP the server only sends the captured frame fd and metadata; the GL
   fallback renders into the helper's dma-bufs.
-- Encoder: `hevc_vaapi`, profile Main, `low_power=1` (VDENC), `async_depth`
-  default 2, CBR, no B-frames, `AV_CODEC_FLAG_LOW_DELAY`.
+- Encoder: `hevc_vaapi`, profile Main, `low_power=1` (VDENC, Intel only),
+  `async_depth` default 2, CBR, `max_b_frames = 0` requested,
+  `AV_CODEC_FLAG_LOW_DELAY`. VDENC ignores the B-frame request (see below).
+  NVENC uses `hevc_nvenc` preset p1, tune `ull`, CBR, `zerolatency=1`,
+  `delay=0`, `surfaces=4`, `forced-idr=1`. `pict_type=I` alone is NOT an IDR
+  on NVENC (it becomes `FORCEINTRA`/TRAIL_R and the client's NAL 19/20 gate
+  never opens).
 - VPP imports the captured tiled ARGB dma-buf directly (DRM_PRIME_2 + a
   `VASurfaceAttribPixelFormat` attribute is mandatory), converts full-range
   BT.709 RGB->NV12 on the media engine, and the helper encodes that surface.
   The server sends only the frame metadata and fd; no RGB->NV12 GL work.
+  Capture buffers request an explicit `I915_FORMAT_MOD_Y_TILED` modifier
+  (falling back to linear): never trust the implicit modifier from
+  `gbm_bo_create`, because Mesa's GBM can return one that neither iHD nor EGL
+  accepts (mesa 26.3 i915 returns 0xb, which made every VPP import fail with
+  ALLOCATION_FAILED). Linear import works but costs the compositor its tiled
+  blit: capture dropped from 158 to ~140 fps at 1080p160.
 - `LGX_CPU_CONVERT=1` is an experimental linear-capture CPU conversion path.
-  It is slower than VPP and is not the default.
+  It is slower than VPP and is not the default. `LGX_TEST_NO_PACKETS=1` is a
+  test hook: it drops the VPP stream's packets so the 5 s no-packet watchdog
+  and the GL fallback can be exercised; the fallback stream is unaffected.
 - `async_depth > 1` makes the encoder return **more than one packet** for one
   sent frame. The helper sends `u32 count` followed by `count` packets; the
   Rust client reads exactly that many and broadcasts each access unit
@@ -103,7 +149,15 @@ Commit format: `area: short imperative summary`, for example
   the video; focus loss shows the host cursor and excludes the guest cursor.
   `Ctrl+Alt+Shift+G` toggles only the confinement, and `cursor_grab = false`
   starts unconfined. Do not use SDL relative mode for this: it changed the
-  pointer feel. The
+  pointer feel. `Ctrl+Alt+Shift+S` shows a live statistics card (fps, draw
+  p50/p99, decoded, overwritten) for five seconds; `LGX_STATS_OSD=1` keeps it
+  visible. Its font is resolved once and cached: calling `fc-match`/`xrdb`
+  per update stalled the presenter and dropped frames. When the server's
+  capture mode changes, `lgx-resize-qt` (a child process; the client never
+  links Qt) asks `Change` / `Change and save` / `Cancel`; "save" writes
+  width/height to the profile, "cancel" keeps the window and scales the new
+  mode, and the same mode is not asked about twice. `LGX_FAKE_RESIZE=1280x800@60`
+  injects one display change for testing. The
   keydown/keyup is swallowed and modifier key-ups clear the guest state.
   F9/F10/F11/F12 are ordinary keys and must reach the guest. The window
   decoration's close button must be handled as
@@ -140,6 +194,9 @@ Commit format: `area: short imperative summary`, for example
   override. Server settings are `~/.config/lgx/server.conf` (`network`,
   `video`, `audio`, `input`); `network.interface`, `video_port`, `audio_port`
   and `pair_port` determine the bound interface and ports. CLI flags override.
+  `video.drm_node` (or `--drm-node`) pins the DRM render node for GBM, VAAPI
+  and the encoder helper; otherwise the server prefers the Intel render node.
+  The choice is logged at startup, and the helper inherits `LGX_DRM_NODE`.
   `[audio] mute_unfocused = true` discards received audio and outputs silence
   while the window is unfocused (the native PipeWire playback stream stays
   active); the secure audio stream is still drained.
@@ -160,8 +217,16 @@ Commit format: `area: short imperative summary`, for example
 
 - `src/dec_shim.c` is compiled by `build.rs` against the installed FFmpeg
   headers. Do not mirror libavcodec structs in Rust.
-- Backends: software (0), VAAPI (1), CUDA/NVDEC (2). `pick_format` uses
-  `ctx->opaque` to request the matching hardware format.
+- Backends: software (0), VAAPI (1), CUDA/NVDEC (2), Vulkan Video (3).
+  `pick_format` uses `ctx->opaque` to request the matching hardware format.
+- Vulkan Video uses FFmpeg's Vulkan hwaccel (`AV_HWDEVICE_TYPE_VULKAN`,
+  `AV_PIX_FMT_VULKAN`) and is tried first when the renderer's physical device
+  advertises `VK_KHR_video_queue` + `VK_KHR_video_decode_queue` +
+  `VK_KHR_video_decode_h265`. Its frames are downloaded to CPU NV12: FFmpeg's
+  Vulkan -> DRM_PRIME map exports the memory object but no layer planes
+  (`nb_planes = 0`, even with linear tiling or `DISABLE_MULTIPLANE`), so the
+  dma-buf import path cannot consume them. It is not an fps cap: the backend
+  sustains the full 158-160 fps stream. VAAPI/CUDA/software remain fallbacks.
 - The client asks the decoder for dma-buf frames when the Vulkan device
   advertises `VK_KHR_external_memory_fd`, `VK_EXT_external_memory_dma_buf` and
   `VK_EXT_image_drm_format_modifier`; `LGX_NO_DMABUF=1` forces the CPU path.
@@ -191,8 +256,32 @@ Commit format: `area: short imperative summary`, for example
 - Shaders are SPIR-V files committed under `src/shaders/`. Regenerate after
   editing GLSL:
   `glslangValidator -V shaders/video.vert -o shaders/video.vert.spv`.
-- Decoder selection happens **after** Vulkan init, using the Vulkan device
-  name: NVIDIA -> CUDA first, otherwise VAAPI first, software last.
+- Decoder selection happens **after** Vulkan init and uses `lgx-caps`: Vulkan
+  Video first when the driver advertises the H.265 decode extensions, then the
+  backend that matches the renderer's DRM node (CUDA on nvidia-drm, VAAPI on
+  the same node otherwise), then any VAAPI device, software last. `--decoder`
+  forces one backend. Do not go back to matching the GPU marketing name: a
+  hybrid system needs the node match to know whether dma-buf import can work.
+- The native Vulkan Video decoder does not implement the SPS conformance
+  window. NVENC codes 720-line video as 1280x736 plus a 16-line crop, so the
+  client detects `SpsInfo::display_*() != coded size` and falls back to
+  FFmpeg (which crops correctly) instead of presenting 736 lines. Do not
+  remove that check without cropping the DPB views.
+- The VDENC low-power encoder ignores `max_b_frames = 0` and emits
+  hierarchical B-slices: the live 1920x1080@160 stream has `slice_type = 0`
+  (PPS `num_extra_slice_header_bits = 0`). FFmpeg decodes it; a native Vulkan
+  decoder must do POC/DPB reordering, never assume IPPP. `LGX_DUMP_BITSTREAM=<path>`
+  writes the received Annex-B access units for offline decoder tests.
+- `LGX_VULKAN_VIDEO=native` selects the in-tree Vulkan Video H.265 decoder
+  (`lgx-vkvideo::decoder::NativeDecoder`) instead of FFmpeg: it owns its
+  instance/device/video decode queue, builds the session from the in-band
+  VPS/SPS/PPS, keeps a two-slot DPB and returns CPU NV12 frames. It sustains
+  157-159 fps. The DPB images are created with a DRM modifier and exported as
+  dma-buf; the client wraps them in `Pixels::Dmabuf` and the renderer samples
+  them directly, so the native path is zero-copy (no NV12 readback). It is
+  the default when the device supports Vulkan Video and dma-buf import;
+  `LGX_VULKAN_VIDEO=ffmpeg` (or `0`), `--decoder` other than Vulkan, and any
+  native setup/decode error fall back to FFmpeg (Vulkan/VAAPI/software).
 - One decode thread owns libavcodec; the window takes only the newest frame
   from a one-slot mailbox.
 - Gamepad state snapshots go over the same TCP stream; the server's input
@@ -352,16 +441,21 @@ the Vulkan shader converts full-range BT.709, and the HEVC VUI says
   `lgx-macos-audio` reads the default output device's volume/mute and scales
   the samples. When FineTune is running (it re-renders apps through its own
   tap), LGX would capture both the raw app stream and FineTune's copy, which
-  is audible doubling: the helper then captures only the mixer's output and a
-  second mute-only tap silences the raw apps (see `mixerProcesses`). Both
-  topologies are rebuilt when the mixer appears or quits. `LGX_AUDIO_MIXERS`
-  overrides the comma-separated bundle-ID list and `LGX_AUDIO_TAP=global`
-  disables the mixer topology for debugging. FineTune also lists the audio
-  helper itself as `server`: it is a Core Audio client with the app's bundle
-  ID (`dev.b612s.lgx.server`) but no `NSRunningApplication`, so FineTune falls
-  back to the last bundle-ID component. It produces no audible output; hide it
-  with FineTune's ignore (eye) button instead of changing the helper's signing
-  identifier, which TCC relies on.
+  is audible doubling: the helper then captures only the mixer's output plus
+  the system sound daemon (`systemsoundserverd`, which FineTune filters out
+  of its own taps), and a second mute-only tap silences everything else
+  locally. Keep that mute tap: the capture tap alone leaves audio that is
+  not in the capture audible on the Mac. The capture tap mutes the mixer and
+  the sound daemon themselves. Both topologies are rebuilt when the mixer or
+  the sound daemon appears or quits.
+  `LGX_AUDIO_MIXERS` overrides the comma-separated bundle-ID list and
+  `LGX_AUDIO_TAP=global` disables the mixer topology for debugging. FineTune
+  also lists the audio helper itself as `server`: it is a Core Audio client
+  with the app's bundle ID (`dev.b612s.lgx.server`) but no
+  `NSRunningApplication`, so FineTune falls back to the last bundle-ID
+  component. It produces no audible output; hide it with FineTune's ignore
+  (eye) button instead of changing the helper's signing identifier, which
+  TCC relies on.
 
 ## A/V sync
 
@@ -385,8 +479,12 @@ the Vulkan shader converts full-range BT.709, and the HEVC VUI says
 - Timestamps are written by the same host clock: `mach_absolute_time` on
   macOS for video and `DispatchTime.now()` for the audio helper. Do not mix a
   wall-clock epoch into one side only.
-- The Linux server does not timestamp yet; its video timestamp is zero and the
-  client presents immediately.
+- The Linux server stamps video with `CLOCK_MONOTONIC` microseconds in the
+  same `Msg.code`/`Msg.b` fields and frames audio as `LGXA` once the client
+  opts in (one `AUDIO_SYNC` message after the token). Both sides use the same
+  clock. At 1080p160 the audio head trails the video capture by ~50 ms (the
+  8 KiB playout cushion), stable within a few ms; the video hold stays
+  opt-in and capped at 30 ms, so the default presents immediately.
 - `lgx-vtenc` logs `SCK x fps, encoded y fps, encode errors n` every 5 s and
   whether VideoToolbox chose the hardware encoder. A low HEVC fps with a much
   higher SCK rate means the encoder is dropping input; both equal means the
@@ -429,6 +527,11 @@ the Vulkan shader converts full-range BT.709, and the HEVC VUI says
   The client reader sets `Conn::closed`, and the UI/headless loop exits on it.
 - The token is both the auth secret and the transport PSK. Keep the registry
   and client credential files 0600.
+- The macOS app keeps its token in `~/.config/lgx/macos.conf` (0600), never in
+  the LaunchAgent: startup removes a legacy `--token` pair from
+  `ProgramArguments` (launchd caches the plist, so restart the agent once).
+  `--rotate` only rewrites the config; `--token` on the command line is
+  deprecated because it is visible in `ps`.
 
 ## Transport
 
@@ -464,6 +567,7 @@ the Vulkan shader converts full-range BT.709, and the HEVC VUI says
 cargo build --release
 cargo test --workspace   # includes the `tests/` integration suite
 gcc -O2 -o lgx-vaenc helper/lgx-vaenc.c -lavcodec -lavutil -lva -lva-drm
+gcc -O2 -o lgx-nvenc helper/lgx-nvenc.c -lavcodec -lavutil
 scripts/check.sh          # build + tests + both C helpers, run before pushing
 # CI runs the same script in an archlinux:latest container
 ./packaging/build.sh
@@ -479,6 +583,25 @@ Bump `pkgrel` in a PKGBUILD for every rebuild; the build script fails when the
 result would be older than the installed package. `build.sh` also writes a
 temporary PKGBUILD copy with the real `sha256sums` (the tracked one keeps
 `SKIP`), so makepkg verifies the source archive instead of trusting it.
+
+Portal pipeline without a compositor dialog (test hook): the
+`examples/pw_screencast.rs` producer exports a BGRx node and prints its id;
+run the server with `LGX_TEST_PW_NODE=<id>` plus `--capture portal` to exercise
+format negotiation, CPU NV12 conversion and the encoder end to end. The
+producer must announce `SPA_PARAM_Buffers` (including `dataType`) or PipeWire
+never calls its process callback; `LGX_TEST_PW_FREEZE_AFTER=N` stops it after
+N frames so the idle-keyframe path can be tested. `LGX_TEST_PW_NODE` is
+debug-only and is ignored unless set. `LGX_TEST_NO_ENCODER=1` makes the server
+count and log delivered portal frames without creating an encoder, which is how
+the GNOME capture path is checked in a VM without a hardware encoder.
+
+`examples/kde_probe.rs` binds KWin's private `zkde_screencast_unstable_v1`,
+requests the first output and prints the PipeWire node id; it is a diagnostic
+for testing KDE capture without the portal consent dialog and must not become
+a production capture path. Do not try to test the GNOME portal with
+`gnome-shell --headless`: it does not export `org.gnome.Mutter.ScreenCast`, so
+`xdg-desktop-portal-gnome` cannot provide ScreenCast there. Use a real GNOME
+session.
 
 Manual check on the VM:
 
@@ -575,7 +698,20 @@ driver. The server needs libva headers for the helper.
     frame, so the pending capture has no damage to complete on. If this is
     revisited, keep a continuous plain-`copy` window while the pointer is
     moving; do not make the whole stream damage-driven.
-19. HEVC 4:2:0 cannot carry RGB subpixel antialiasing. Guest text rendered
+19. NVENC: `pict_type = I` sets `NV_ENC_PIC_FLAG_FORCEINTRA` and yields a
+    TRAIL_R slice, not an IDR. `forced-idr=1` is required for `K` to produce
+    NAL 19/20. `bf` is not an AVOption on `hevc_nvenc`; use
+    `enc->max_b_frames = 0`. System-memory NV12 input is a host memcpy into a
+    locked NVENC buffer, not a CUDA/PCIe upload; measured 1080p `'F'`
+    throughput is ~597 fps, 4K only ~138 fps, so 4K160 needs a CUDA/fd path.
+20. VAAPI `low_power=1` must only be requested when the driver advertises
+    `VAEntrypointEncSliceLP`; AMD/Mesa rejects it at `avcodec_open2`. The
+    helper retries without VDENC, and the server passes the gated flag.
+21. The portal PipeWire stream is damage-driven and its MemFd buffers are
+    larger than one frame: use `chunk().stride()`/`chunk().offset()`, do not
+    derive the stride from the buffer length, and do not apply the wlr
+    no-packet watchdog to it.
+22. HEVC 4:2:0 cannot carry RGB subpixel antialiasing. Guest text rendered
     with `rgba=rgb` (GTK3 `gtk-xft-rgba=rgb`, KDE sub-pixel rendering) shows
     coloured fringes after encoding, especially in screenshots. The fix is
     grayscale antialiasing in the guest, not a colour-matrix change in the

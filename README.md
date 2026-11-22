@@ -21,15 +21,20 @@ only the newest decoded frame, so a slow window never builds a queue.
 ## Features
 
 - HEVC Main profile, 8-bit 4:2:0, full-range BT.709.
-- **Linux server:** VAAPI encoding with Intel VDENC (`low_power = true`) and
-  asynchronous encoding (`async_depth = 2`); VPP converts RGB to NV12 on the
-  media engine, with a GL fallback.
+- **Linux server:** the encoder is chosen from the capture GPU: NVENC on
+  NVIDIA, VAAPI on Intel and AMD (VDENC/`low_power` only where the driver
+  exposes `VAEntrypointEncSliceLP`). Intel keeps the zero-copy VPP RGB->NV12
+  path; other drivers use the GL or CPU conversion path. Capture is
+  `wlr-screencopy` on wlroots compositors and the desktop portal on KDE
+  Plasma, GNOME and other Wayland desktops.
 - **macOS server:** ScreenCaptureKit capture and VideoToolbox HEVC, including
   120 Hz displays, adaptive bitrate, system audio capture, native clipboard,
   CGEvent input, cursor shapes, media keys and display-synced smooth scrolling.
-- **Client:** Vulkan presentation with letterboxing; automatic decoder
-  selection (NVIDIA -> CUDA/NVDEC, otherwise VAAPI, software fallback);
-  `--decoder` overrides it.
+- **Client:** Vulkan presentation with letterboxing; the decoder is chosen
+  from the machine's real capabilities (Vulkan Video, CUDA/NVDEC, VAAPI,
+  software) and matched to the renderer's DRM node, so the zero-copy dma-buf
+  path is used when the decoder and renderer share a driver. `--decoder`
+  overrides it.
 - Geometry, refresh rate and bitrate follow the selected output. `--fps` is
   only an override.
 - A new client waits for an IDR; delayed packets from a previous client are
@@ -52,12 +57,18 @@ Wayland, SDL3, a Vulkan 1.3 driver (`vulkan-icd-loader` plus NVIDIA/Mesa),
 FFmpeg libavcodec/libavutil headers at build time, `libxkbcommon`,
 `wl-clipboard`, PipeWire (the native `pipewire` client library), and Qt6
 Widgets for the separate reconnect window. On NVIDIA the runtime driver
-provides NVDEC/CUDA; on Intel/AMD VAAPI is used.
+provides NVDEC/CUDA; on Intel and AMD VAAPI is used. `lgx-caps` prints what the
+machine can actually decode, encode and import, and both binaries use the same
+probe instead of guessing from the GPU name.
 
 ### Linux server (Wayland)
 
-A wlroots compositor (Hyprland, Sway, ...), VAAPI with HEVC encode and video
-processing (VPP), FFmpeg and libva for the helper, `wl-clipboard`, and PipeWire.
+A Wayland session: wlroots (Hyprland, Sway, ...) for the direct
+`wlr-screencopy` path, or KDE Plasma / GNOME / any desktop that implements
+`org.freedesktop.portal.ScreenCast`. On Intel and AMD the server needs VAAPI
+with HEVC encode (VPP is used when present); on NVIDIA it needs NVENC. FFmpeg
+and libva are needed for the encoder helpers, plus `wl-clipboard` and
+PipeWire.
 
 ### macOS server
 
@@ -141,6 +152,8 @@ lgx-server --listen 192.168.1.50:5902 --bitrate 40000000
 # --async-depth N    1 = lowest latency, 2 = default throughput
 # --no-low-power      disable Intel VDENC
 # --output NAME       pick an output (hyprctl monitors)
+# --capture BACKEND   auto (default), wlr or portal
+# --drm-node PATH     pin the render node (otherwise auto-detected)
 # --no-audio          disable the audio stream
 ```
 
@@ -442,6 +455,24 @@ the Linux server only; the macOS server does not create virtual gamepads.
   Vulkan device and `LGX_NO_DMABUF=1` forces the upload path. FFmpeg's CUDA
   hwcontext cannot export DRM_PRIME, so NVDEC frames always use the upload
   path.
+- KDE Plasma and GNOME capture goes through
+  `org.freedesktop.portal.ScreenCast`, which hands out shared-memory buffers.
+  They are converted to NV12 on the CPU (parallel over the frame rows), so
+  that path is heavier than the wlroots dma-buf/VPP path: a 3440x1440 KDE
+  desktop reaches about 157 fps on an RTX 4070 SUPER with the conversion
+  taking ~1.3 ms per frame. The portal is damage-driven: an idle desktop
+  produces no frames (a 100 ms timer replays the last frame as an IDR for a
+  newly connected client), and the first capture needs the user to approve
+  the desktop's share dialog; a restore token makes later starts silent.
+- KDE Plasma and GNOME portals are verified end to end: KDE at 3440x1440 with
+  NVENC on NVIDIA and VAAPI on Intel, GNOME in a separate VM (real GDM session,
+  1280x800, capture confirmed; that VM had no hardware encoder). GNOME does not
+  support an embedded cursor, so the portal picks the best advertised cursor
+  mode and tells the client to draw its own pointer (`CURSOR_LOCAL`). Cursor
+  *shape* metadata from the portal is still not implemented.
+- AMD encoding and decoding are implemented through the same VAAPI/GL paths
+  and capability checks, but there was no AMD GPU to verify them on. Intel is
+  tested on the iGPU, NVIDIA on the RTX 4070 SUPER.
 - KMS capture is not supported on the Linux server: without DRM master
   `GETFB2` returns zero handles, so the compositor keeps the
   `wlr-screencopy` path.
