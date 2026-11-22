@@ -57,6 +57,44 @@ const QUEUE_FRAMES: usize = 3;
 mod audio;
 mod config;
 
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct MachTimebaseInfo {
+    numer: u32,
+    denom: u32,
+}
+
+#[cfg(target_os = "macos")]
+extern "C" {
+    fn mach_absolute_time() -> u64;
+    fn mach_timebase_info(info: *mut MachTimebaseInfo) -> i32;
+}
+
+/// Monotonic microseconds, the same mach absolute clock `lgx-vtenc` stamps
+/// every access unit with, so a `PONG` lets the client measure the true
+/// capture-to-present latency. The fallback only exists so the crate links
+/// when the workspace is built on Linux; it is never used there.
+fn monotonic_us() -> u64 {
+    #[cfg(target_os = "macos")]
+    {
+        use std::sync::OnceLock;
+        static FACTOR: OnceLock<(u64, u64)> = OnceLock::new();
+        let (numer, denom) = *FACTOR.get_or_init(|| {
+            let mut info = MachTimebaseInfo { numer: 1, denom: 1 };
+            unsafe { mach_timebase_info(&mut info) };
+            (info.numer as u64, (info.denom as u64).max(1))
+        });
+        let ticks = unsafe { mach_absolute_time() } as u128;
+        return (ticks * numer as u128 / denom as u128 / 1000) as u64;
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        use std::sync::OnceLock;
+        static BASE: OnceLock<std::time::Instant> = OnceLock::new();
+        BASE.get_or_init(std::time::Instant::now).elapsed().as_micros() as u64
+    }
+}
+
 /// Local wall-clock time for log lines; launchd's log has no timestamps.
 fn now_hms() -> String {
     unsafe {
@@ -1057,6 +1095,12 @@ fn write_controls(
             // by the capture pipeline, so the video never carries a cursor and
             // the client's own (instant) pointer is the only one on screen.
             msg::CURSOR => continue,
+            // Clock probe: reply on the same clock the video timestamps use.
+            msg::PING => {
+                let now = monotonic_us();
+                let _ = secure.send_msg(Msg::new(msg::PONG, 0, 8, 0), &now.to_le_bytes());
+                continue;
+            }
             // The client had to drop packets and wants a keyframe now.
             msg::IDR => {
                 need_idr.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1116,7 +1160,6 @@ fn write_controls(
                 }
                 continue;
             }
-            msg::PING => continue,
             // KEYMAP/MODS and gamepads are not handled by this server yet.
             _ => continue,
         };
