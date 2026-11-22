@@ -549,6 +549,21 @@ the Vulkan shader converts full-range BT.709, and the HEVC VUI says
   `lgx-vtenc` now skips a callback whose presentation timestamp equals the
   previous one, so `encoded` always equals `unique`; the encoder's own
   `--selftest` at 1200p sustains 120 fps (7200 frames in 60 s).
+- **Measured on the live desktop (screen in use, 1920x1200):** `lgx-vtenc`
+  encoded 34-90 unique fps (81-90 while windows move, SCK delivered ~100
+  callbacks/s) and the server wrote **0.1-0.6 MiB/s**, with IDR bursts of
+  45-89 KiB/s when a keyframe happened. CPU: `lgx-server-bin` 2-8 %,
+  `lgx-vtenc` 0.6-8.8 %, `lgx-macos-audio` 0.1-1.4 %. That is the same range
+  as the Linux server in CQP (0.3-0.6 MiB/s at 1080p160), so the earlier
+  1.4-1.7 MiB/s figure was a synthetic worst case (a large square moving every
+  8 ms), not normal desktop use.
+- **Periodic keyframes are tunable.** `--vt-keyframe-interval S`
+  (`LGX_VT_KEYFRAME_INTERVAL`, default 10, 0 = VideoToolbox default) sets
+  `MaxKeyFrameInterval`; a constant-quality IDR costs 45-90 KiB at 1200p, so a
+  2 s interval spent a noticeable share of the traffic on keyframes. The client
+  still asks for an IDR explicitly when it needs one. The stats line now reports
+  `IDR x/s y KiB/s` so the share is visible. `--no-vt-speed-over-quality` turns
+  off VideoToolbox's speed hint (more encoder CPU, usually fewer bits).
 - **The client's pre-decode queue is the other half of the pair.** It holds 20
   access units, evicts the oldest when full (newest wins) and then *resyncs to
   the next keyframe*: feeding frames whose references were evicted makes

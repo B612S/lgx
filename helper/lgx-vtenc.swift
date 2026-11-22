@@ -503,8 +503,16 @@ final class Encoder: NSObject, SCStreamOutput, SCStreamDelegate {
         }
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ExpectedFrameRate,
                              value: fps as CFNumber)
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameInterval,
-                             value: (fps * 2) as CFNumber)
+        // Periodic keyframes cost a lot at constant quality: every IDR carries
+        // a full picture. The client asks for an IDR explicitly when it needs
+        // one (new session, lost references), so the timer only limits how
+        // long a broken client can stay broken. Default 10 s, 0 = encoder
+        // default.
+        let keyframeInterval = envInt("LGX_VT_KEYFRAME_INTERVAL", 10)
+        if keyframeInterval > 0 {
+            VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameInterval,
+                                 value: (keyframeInterval * fps) as CFNumber)
+        }
         // Never hold more than one frame inside the encoder and prefer speed
         // over rate-control quality on this interactive stream. Low-latency
         // rate control already forbids lookahead, so the delay cap is only

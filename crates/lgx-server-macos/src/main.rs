@@ -28,6 +28,8 @@
 //! Usage:
 //!   lgx-server-macos [--listen ADDR] [--fps N] [--bitrate BPS] [--display N]
 //!                    [--vt-quality Q] [--vt-max-delay N]
+//!                    [--vt-keyframe-interval S]
+//!                    [--no-vt-speed-over-quality]
 //!                    [--wheel-invert|--no-wheel-invert] [--no-adaptive]
 //!                    [--no-audio] [--audio-listen ADDR]
 //!                    [--helper PATH] [--input-helper PATH] [--audio-helper PATH]
@@ -152,6 +154,12 @@ struct Args {
     /// 0 disables constant quality; 0 < q <= 1 sets `Quality` and drops the
     /// bitrate target.
     vt_quality: f64,
+    /// Seconds between periodic keyframes (`LGX_VT_KEYFRAME_INTERVAL`); 0
+    /// leaves VideoToolbox's default.
+    vt_keyframe_interval: u32,
+    /// VideoToolbox's speed-over-quality hint. Turning it off spends more CPU
+    /// on the encoder and usually saves bits at the same quality.
+    vt_speed_over_quality: bool,
     /// Lower the bitrate when frames are dropped and raise it again when the
     /// link recovers.
     adaptive: bool,
@@ -273,6 +281,14 @@ fn parse_args() -> Args {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(0.0),
+        vt_keyframe_interval: std::env::var("LGX_VT_KEYFRAME_INTERVAL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10),
+        vt_speed_over_quality: std::env::var("LGX_VT_SPEED_OVER_QUALITY")
+            .ok()
+            .map(|v| v != "0")
+            .unwrap_or(true),
         adaptive: cfg.adaptive.unwrap_or(true),
         pair: false,
         pair_name: "macbook".into(),
@@ -311,6 +327,13 @@ fn parse_args() -> Args {
             "--bitrate" => a.bitrate = next(&mut i).parse().unwrap_or(20_000_000),
             "--vt-max-delay" => a.vt_max_delay = next(&mut i).parse().unwrap_or(1),
             "--vt-quality" => a.vt_quality = next(&mut i).parse().unwrap_or(0.0),
+            "--vt-keyframe-interval" => {
+                a.vt_keyframe_interval = next(&mut i).parse().unwrap_or(10)
+            }
+            "--vt-speed-over-quality" => {
+                a.vt_speed_over_quality = next(&mut i) != "0"
+            }
+            "--no-vt-speed-over-quality" => a.vt_speed_over_quality = false,
             "--display" => a.display = next(&mut i).parse().ok(),
             "--helper" => a.helper = next(&mut i),
             "--input-helper" => a.input_helper = next(&mut i),
@@ -462,6 +485,14 @@ fn spawn_capture(args: &Args) -> std::io::Result<(Child, u32, u32, u32, Option<u
         .arg(args.bitrate.to_string())
         .env("LGX_VT_MAX_DELAY", args.vt_max_delay.to_string())
         .env("LGX_VT_QUALITY", format!("{:.3}", args.vt_quality))
+        .env(
+            "LGX_VT_KEYFRAME_INTERVAL",
+            args.vt_keyframe_interval.to_string(),
+        )
+        .env(
+            "LGX_VT_SPEED_OVER_QUALITY",
+            if args.vt_speed_over_quality { "1" } else { "0" },
+        )
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -608,6 +639,33 @@ fn spawn_cursor(
             None
         }
     }
+}
+
+/// True when the access unit carries an HEVC IDR slice (NAL type 19 or 20).
+fn is_idr(au: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 4 < au.len() {
+        if au[i] == 0 && au[i + 1] == 0 {
+            if au[i + 2] == 1 {
+                let t = (au[i + 3] >> 1) & 0x3f;
+                if t == 19 || t == 20 {
+                    return true;
+                }
+                i += 3;
+                continue;
+            }
+            if au[i + 2] == 0 && au[i + 3] == 1 {
+                let t = (au[i + 4] >> 1) & 0x3f;
+                if t == 19 || t == 20 {
+                    return true;
+                }
+                i += 4;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    false
 }
 
 fn spawn_input(path: &str, wheel_invert: bool, display_id: Option<u32>) -> Option<Child> {
@@ -958,6 +1016,9 @@ fn serve(args: &Args, secure: Arc<Secure>) -> std::io::Result<()> {
     let mut last_ping = Instant::now();
     let mut last_idr: Option<Instant> = None;
     let (mut frames, mut bytes) = (0u64, 0u64);
+    // Keyframes are the expensive part of constant-quality video; counting
+    // them separately shows whether the keyframe interval dominates traffic.
+    let (mut keyframes, mut key_bytes) = (0u64, 0u64);
     let mut send_secs = 0.0f64;
     // A frame that is already this old when it reaches the writer is not
     // worth sending: the client would present seconds-old video. Drop it and
@@ -996,17 +1057,21 @@ fn serve(args: &Args, secure: Arc<Secure>) -> std::io::Result<()> {
             let elapsed = t0.elapsed().as_secs_f64();
             let lost = dropped.swap(0, Ordering::Relaxed);
             info!(
-                "HEVC {:.1} fps, {:.1} MiB/s, send {:.2} ms, {} dropped, {} late, max age {} ms, {} kbps",
+                "HEVC {:.1} fps, {:.1} MiB/s, send {:.2} ms, {} dropped, {} late, max age {} ms, IDR {:.1}/s {:.1} KiB/s, {} kbps",
                 frames as f64 / elapsed,
                 bytes as f64 / elapsed / 1_048_576.0,
                 if frames > 0 { send_secs * 1000.0 / frames as f64 } else { 0.0 },
                 lost,
                 late,
                 max_age_ms,
+                keyframes as f64 / elapsed,
+                key_bytes as f64 / elapsed / 1024.0,
                 bitrate / 1000
             );
             late = 0;
             max_age_ms = 0;
+            keyframes = 0;
+            key_bytes = 0;
             // Adaptive bitrate: drops mean the pipe (or the client) cannot take
             // the current rate. Back off quickly, recover slowly.
             if args.adaptive {
@@ -1077,6 +1142,10 @@ fn serve(args: &Args, secure: Arc<Secure>) -> std::io::Result<()> {
                 send_secs += send_started.elapsed().as_secs_f64();
                 if let Err(e) = sent {
                     break Err(e);
+                }
+                if is_idr(&au) {
+                    keyframes += 1;
+                    key_bytes += n as u64;
                 }
                 frames += 1;
                 bytes += n as u64;
