@@ -41,6 +41,8 @@ struct Args {
     audio_listen: String,
     token: Option<String>,
     low_power: bool,
+    /// Send HEVC access units over UDP instead of the TCP control stream.
+    video_udp: bool,
     async_depth: u32,
     vpp: bool,
     /// Explicit DRM render node (`--drm-node`/`video.drm_node`); auto-detected
@@ -141,6 +143,7 @@ fn parse_args() -> Result<Args, String> {
         audio_listen,
         token: None,
         low_power: cfg.get_bool("video.low_power").unwrap_or(true),
+        video_udp: cfg.get_bool("video.udp").unwrap_or(false),
         async_depth: cfg.get_u32("video.async_depth").unwrap_or(2),
         vpp: cfg.get_bool("video.vpp").unwrap_or(true),
         capture: cfg.get("video.capture").unwrap_or("auto").to_string(),
@@ -171,6 +174,7 @@ fn parse_args() -> Result<Args, String> {
             "--output" => a.output = Some(it.next().ok_or("--output")?),
             "--no-input" => a.no_input = true,
             "--no-low-power" => a.low_power = false,
+            "--video-udp" => a.video_udp = true,
             "--async-depth" => {
                 a.async_depth = it.next().ok_or("--async-depth")?.parse().map_err(|_| "--async-depth")?
             }
@@ -496,6 +500,9 @@ impl Stream {
                 capture_errors = 0;
             }
             let force_send = if hub.take_keyframe() {
+                if std::env::var_os("LGX_DEBUG_IDR").is_some() {
+                    eprintln!("lgx-server: forcing an IDR");
+                }
                 if let Err(e) = self.enc.force_keyframe() {
                     eprintln!("lgx-server: vaenc keyframe: {e}");
                 }
@@ -813,6 +820,7 @@ fn main() {
     }
 
     let hub = Hub::new();
+    hub.set_video_udp(args.video_udp);
     {
         let hub = hub.clone();
         std::thread::Builder::new()

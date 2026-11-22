@@ -128,6 +128,7 @@ pub fn connect(
     clipboard: ClipPolicy,
 ) -> std::io::Result<(Arc<Conn>, Hello)> {
     let stream = TcpStream::connect(addr)?;
+    let peer = stream.peer_addr()?;
     let secure = Arc::new(secure::client_handshake_id(stream, client_id, token)?);
     secure.send_msg(
         Msg::new(msg::AUTH, 0, token.len() as i32, 0),
@@ -160,6 +161,11 @@ pub fn connect(
     // server can keep sending them only a video stream with no unknown
     // CURSOR_IMAGE payloads.
     secure.send_msg(Msg::new(msg::CURSOR_SHAPE, 0, 0, 0), &[])?;
+    // Ask for UDP video; the server answers with VIDEO_UDP only when it has
+    // `--video-udp` and only after this message, so old servers ignore it.
+    if std::env::var_os("LGX_NO_UDP").is_none() {
+        secure.send_msg(Msg::new(msg::UDP_VIDEO, 0, 0, 0), &[])?;
+    }
     let last_remote: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
     let lr = last_remote.clone();
     let conn = Arc::new(Conn {
@@ -175,11 +181,183 @@ pub fn connect(
     let conn_for_reader = conn.clone();
     std::thread::Builder::new()
         .name("lgx-reader".into())
-        .spawn(move || reader(secure, conn_for_reader, lr, video, clipboard))
+        .spawn(move || reader(secure, conn_for_reader, lr, video, clipboard, peer))
         .expect("reader thread");
     Ok((conn, hello))
 }
 
+
+/// Raise a UDP socket buffer. The kernel caps this at net.core.{r,w}mem_max;
+/// a lower value is still better than the default.
+fn set_socket_buffer(sock: &std::net::UdpSocket, opt: libc::c_int, bytes: libc::c_int) {
+    use std::os::fd::AsRawFd;
+    unsafe {
+        libc::setsockopt(
+            sock.as_raw_fd(),
+            libc::SOL_SOCKET,
+            opt,
+            &bytes as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
+}
+
+/// Reassemble HEVC access units from video datagrams. A lost fragment drops
+/// the whole access unit and asks the server for an IDR over the control
+/// stream, so the reference chain heals without a retransmission protocol.
+fn udp_video(
+    conn: Arc<Conn>,
+    sock: std::net::UdpSocket,
+    rx: lgx_proto::udp::Rx,
+    video: std::sync::mpsc::SyncSender<Chunk>,
+) {
+    use std::sync::atomic::Ordering;
+
+    struct Partial {
+        id: u32,
+        count: u16,
+        got: u16,
+        parts: Vec<Option<Vec<u8>>>,
+        ts: u64,
+        keyframe: bool,
+        bytes: usize,
+    }
+
+    let mut dump = std::env::var_os("LGX_DUMP_BITSTREAM").map(|path| {
+        let _ = std::fs::File::create(&path);
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .ok()
+    });
+    let mut buf = vec![0u8; lgx_proto::udp::MAX_DATAGRAM];
+    let mut partial: Option<Partial> = None;
+    let mut last_id = 0u32;
+    let mut skipping = false;
+    let mut last_idr: Option<std::time::Instant> = None;
+    let request_idr = |last: &mut Option<std::time::Instant>| {
+        if last.is_none_or(|t| t.elapsed() >= std::time::Duration::from_millis(500)) {
+            *last = Some(std::time::Instant::now());
+            let _ = conn.send(Msg::new(msg::IDR, 0, 0, 0), &[]);
+        }
+    };
+
+    loop {
+        if conn.closed.load(Ordering::Relaxed) {
+            return;
+        }
+        let n = match sock.recv(&mut buf) {
+            Ok(n) => n,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                continue;
+            }
+            Err(_) => return,
+        };
+        let dbg = std::env::var_os("LGX_DEBUG_UDP").is_some();
+        let Some((header, range)) = rx.open(&mut buf[..n]) else {
+            if dbg {
+                eprintln!("lgx-client: udp: bad datagram {n} bytes");
+            }
+            continue;
+        };
+        if dbg {
+            eprintln!(
+                "lgx-client: udp: frame {} frag {}/{} len {}",
+                header.frame_id, header.frag_idx, header.frag_count, range.len()
+            );
+        }
+        if header.frame_id < last_id {
+            // Late fragment of an access unit that was already dropped.
+            continue;
+        }
+        if header.frame_id > last_id {
+            if let Some(p) = partial.take() {
+                if p.got < p.count {
+                    // A P-frame that references the lost one would only feed
+                    // the decoder garbage; wait for an IDR instead.
+                    if std::env::var_os("LGX_DEBUG_UDP").is_some() {
+                        eprintln!(
+                            "lgx-client: udp: frame {} incomplete ({}/{} fragments, {} bytes)",
+                            p.id, p.got, p.count, p.bytes
+                        );
+                    }
+                    skipping = true;
+                    request_idr(&mut last_idr);
+                }
+            }
+            last_id = header.frame_id;
+            partial = Some(Partial {
+                id: header.frame_id,
+                count: header.frag_count,
+                got: 0,
+                parts: (0..header.frag_count).map(|_| None).collect(),
+                ts: header.ts_us,
+                keyframe: header.is_keyframe(),
+                bytes: 0,
+            });
+        }
+        let Some(p) = partial.as_mut() else {
+            continue;
+        };
+        let idx = header.frag_idx as usize;
+        if idx < p.parts.len() && p.parts[idx].is_none() {
+            p.bytes += range.len();
+            p.parts[idx] = Some(buf[range].to_vec());
+            p.got += 1;
+        }
+        if p.got < p.count {
+            continue;
+        }
+        let done = partial.take().expect("partial frame");
+        conn.bytes.fetch_add(done.bytes as u64, Ordering::Relaxed);
+        let mut au = Vec::with_capacity(done.bytes);
+        for part in done.parts.into_iter().flatten() {
+            au.extend_from_slice(&part);
+        }
+        if std::env::var_os("LGX_DEBUG_UDP").is_some() {
+            eprintln!(
+                "lgx-client: udp: frame {last_id} complete, {} bytes, keyframe {}, skipping {skipping}",
+                au.len(),
+                done.keyframe
+            );
+        }
+        if skipping {
+            if !done.keyframe {
+                // Keep asking: a keyframe that loses one fragment is useless,
+                // and the only recovery is another one.
+                request_idr(&mut last_idr);
+                continue;
+            }
+            eprintln!("lgx-client: udp: keyframe received, resuming");
+            skipping = false;
+        }
+        if let Some(Some(file)) = dump.as_mut() {
+            let _ = std::io::Write::write_all(file, &au);
+        }
+        let chunk = Chunk {
+            data: au,
+            off: 0,
+            at: std::time::Instant::now(),
+            capture_us: done.ts,
+        };
+        match video.try_send(chunk) {
+            Ok(()) => {}
+            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                if !skipping {
+                    eprintln!("lgx-client: udp: decoder queue full, waiting for an IDR");
+                }
+                skipping = true;
+                request_idr(&mut last_idr);
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => return,
+        }
+    }
+}
 
 fn reader(
     secure: Arc<Secure>,
@@ -187,7 +365,11 @@ fn reader(
     last_remote: Arc<Mutex<String>>,
     video: std::sync::mpsc::SyncSender<Chunk>,
     clipboard: ClipPolicy,
+    peer: std::net::SocketAddr,
 ) {
+    // Set once the server offered UDP video; the socket lives in its own
+    // thread, this flag only keeps a second offer from starting another one.
+    let mut udp_started = false;
     // Decoded frames are dropped, never queued without bound: a slow decoder
     // used to turn a 120 fps stream into smooth but seconds-old video. When the
     // queue is full the reader skips to the next IDR and asks the server for
@@ -201,7 +383,14 @@ fn reader(
         eprintln!("lgx-client: dumping the bitstream to {}", path.to_string_lossy());
         std::fs::File::create(path)
     });
-    while let Ok((m, payload)) = secure.recv_msg_raw() {
+    loop {
+        let (m, payload) = match secure.recv_msg_raw() {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("lgx-client: reader: {e}");
+                break;
+            }
+        };
         let body = &payload[secure::MSG_HEADER..];
         match m.typ {
             msg::RESIZE => {
@@ -246,6 +435,47 @@ fn reader(
                     }
                     Err(std::sync::mpsc::TrySendError::Disconnected(_)) => break,
                 }
+            }
+            msg::VIDEO_UDP => {
+                if udp_started || std::env::var_os("LGX_NO_UDP").is_some() {
+                    continue;
+                }
+                if body.len() < lgx_proto::udp::KEY_LEN {
+                    eprintln!("lgx-client: short UDP video offer");
+                    continue;
+                }
+                let mut key = [0u8; lgx_proto::udp::KEY_LEN];
+                key.copy_from_slice(&body[..lgx_proto::udp::KEY_LEN]);
+                let addr = std::net::SocketAddr::new(peer.ip(), m.code);
+                let sock = match std::net::UdpSocket::bind(("0.0.0.0", 0)) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("lgx-client: udp socket: {e}");
+                        continue;
+                    }
+                };
+                let rx = match lgx_proto::udp::Rx::new(&key) {
+                    Ok(rx) => rx,
+                    Err(e) => {
+                        eprintln!("lgx-client: udp key: {e}");
+                        continue;
+                    }
+                };
+                // A full keyframe is a few hundred kilobytes and arrives as a
+                // burst of datagrams; the default 200 KiB receive buffer
+                // would drop most of it.
+                set_socket_buffer(&sock, libc::SO_RCVBUF, 8 << 20);
+                // The server cannot know our ephemeral port; one hello from it
+                // tells it where to send, and it keeps using TCP until then.
+                let _ = sock.send_to(b"LGXUhello", addr);
+                let _ = sock.set_read_timeout(Some(std::time::Duration::from_millis(200)));
+                udp_started = true;
+                eprintln!("lgx-client: video over UDP {addr}");
+                let conn2 = conn.clone();
+                let video2 = video.clone();
+                let _ = std::thread::Builder::new()
+                    .name("lgx-udp".into())
+                    .spawn(move || udp_video(conn2, sock, rx, video2));
             }
             msg::CLIP_DATA_HTML => {
                 if !clipboard.allows(body.len()) {

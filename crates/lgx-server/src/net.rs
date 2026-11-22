@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -17,6 +17,8 @@ use lgx_proto::secure::{self, Secure};
 use lgx_proto::{codec, file, msg, Msg};
 
 use crate::clients;
+use std::net::{SocketAddr, UdpSocket};
+
 use crate::clip;
 use crate::input::Cmd;
 
@@ -31,6 +33,131 @@ enum Out {
     ClipHtml(Vec<u8>),
 }
 
+/// One client's UDP video socket. The client's address is learned from the
+/// hello it sends after the server advertises the port; until then (and if it
+/// never arrives) video stays on TCP.
+pub(crate) struct UdpLink {
+    sock: UdpSocket,
+    tx: lgx_proto::udp::Tx,
+    key: [u8; lgx_proto::udp::KEY_LEN],
+    peer: Mutex<Option<SocketAddr>>,
+    next_frame: AtomicU32,
+}
+
+impl UdpLink {
+    fn start(id: u64) -> std::io::Result<Arc<Self>> {
+        let sock = UdpSocket::bind(("0.0.0.0", 0))?;
+        sock.set_read_timeout(Some(Duration::from_secs(2)))?;
+        // One access unit can be several hundred kilobytes of datagrams; the
+        // default send buffer drops the tail of a keyframe burst.
+        unsafe {
+            use std::os::fd::AsRawFd;
+            let bytes: libc::c_int = 8 << 20;
+            libc::setsockopt(
+                sock.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                &bytes as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+        let key = lgx_proto::udp::random_key()?;
+        let link = Arc::new(Self {
+            sock,
+            tx: lgx_proto::udp::Tx::new(&key)?,
+            key,
+            peer: Mutex::new(None),
+            next_frame: AtomicU32::new(1),
+        });
+        let l = link.clone();
+        std::thread::Builder::new()
+            .name(format!("lgx-udp-{id}"))
+            .spawn(move || {
+                let mut buf = [0u8; 32];
+                // The read timeout ends the thread when the client ignores the
+                // negotiation; TCP video keeps working in that case.
+                while let Ok((n, addr)) = l.sock.recv_from(&mut buf) {
+                    if n >= 4 && buf[..4] == *b"LGXU" {
+                        *l.peer.lock().unwrap() = Some(addr);
+                        eprintln!("lgx-server: video over UDP to {addr}");
+                        return;
+                    }
+                }
+            })
+            .ok();
+        Ok(link)
+    }
+
+    fn port(&self) -> u16 {
+        self.sock.local_addr().map(|a| a.port()).unwrap_or(0)
+    }
+
+    fn ready(&self) -> bool {
+        self.peer.lock().unwrap().is_some()
+    }
+
+    /// Fragment and seal one access unit. False when the frame could not be
+    /// sent (no hello yet, or the socket queue is full); the caller then falls
+    /// back to TCP so the picture does not freeze.
+    fn send(&self, chunk: &[u8], ts_us: u64, keyframe: bool) -> bool {
+        let peer = match *self.peer.lock().unwrap() {
+            Some(peer) => peer,
+            None => return false,
+        };
+        let count = chunk.len().div_ceil(lgx_proto::udp::MAX_PAYLOAD);
+        if count == 0 || count > lgx_proto::udp::MAX_FRAGMENTS {
+            return false;
+        }
+        let frame_id = self.next_frame.fetch_add(1, Ordering::Relaxed);
+        let mut datagram = Vec::with_capacity(lgx_proto::udp::MAX_DATAGRAM);
+        for (i, part) in chunk.chunks(lgx_proto::udp::MAX_PAYLOAD).enumerate() {
+            let header = lgx_proto::udp::Header {
+                flags: if keyframe { lgx_proto::udp::FLAG_KEYFRAME } else { 0 },
+                frame_id,
+                frag_idx: i as u16,
+                frag_count: count as u16,
+                ts_us,
+            };
+            if !self.tx.seal(&header, part, &mut datagram) {
+                return false;
+            }
+            if self.sock.send_to(&datagram, peer).is_err() {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Bind a UDP socket for one client and tell it the port and key. Video keeps
+/// flowing over TCP until the client's hello datagram arrives.
+fn udp_offer(secure: &Secure, id: u64) -> Option<Arc<UdpLink>> {
+    let link = match UdpLink::start(id) {
+        Ok(link) => link,
+        Err(e) => {
+            eprintln!("lgx-server: client #{id}: udp: {e}");
+            return None;
+        }
+    };
+    let key = link.key;
+    match secure.send_msg(
+        Msg::new(msg::VIDEO_UDP, link.port(), lgx_proto::udp::KEY_LEN as i32, 0),
+        &key,
+    ) {
+        Ok(()) => {
+            eprintln!(
+                "lgx-server: client #{id}: offering video over UDP port {}",
+                link.port()
+            );
+            Some(link)
+        }
+        Err(e) => {
+            eprintln!("lgx-server: client #{id}: udp offer: {e}");
+            None
+        }
+    }
+}
+
 pub struct Hub {
     clients: Mutex<Vec<Client>>,
     next_id: AtomicU64,
@@ -41,6 +168,9 @@ pub struct Hub {
     /// The server does not composite a pointer into the video (GNOME portal);
     /// clients should draw their own.
     cursor_local: AtomicBool,
+    /// `video.udp`: send HEVC access units as datagrams instead of on the TCP
+    /// control stream.
+    video_udp: AtomicBool,
     dropped: AtomicU64,
 }
 
@@ -55,6 +185,8 @@ struct Client {
     /// A freshly registered client may only see an IDR; delayed packets from
     /// the previous client's encoder state are dropped for it.
     needs_idr: bool,
+    /// Set once UDP video was negotiated; `None` keeps the TCP path.
+    udp: Option<Arc<UdpLink>>,
     secure: Arc<Secure>,
 }
 
@@ -87,6 +219,7 @@ impl Hub {
             last_keyframe_ms: AtomicU64::new(0),
             cursor_overlay: AtomicBool::new(true),
             cursor_local: AtomicBool::new(false),
+            video_udp: AtomicBool::new(false),
             dropped: AtomicU64::new(0),
         })
     }
@@ -124,6 +257,27 @@ impl Hub {
 
     pub fn take_keyframe(&self) -> bool {
         self.keyframe.swap(false, Ordering::Relaxed)
+    }
+
+    /// Switch one client's video to UDP. The next access unit is forced to be
+    /// an IDR so the datagram stream starts from a clean reference.
+    pub(crate) fn attach_udp(&self, id: u64, link: Arc<UdpLink>) {
+        {
+            let mut list = self.clients.lock().unwrap();
+            if let Some(c) = list.iter_mut().find(|c| c.id == id) {
+                c.udp = Some(link);
+                c.needs_idr = true;
+            }
+        }
+        self.request_keyframe();
+    }
+
+    pub fn set_video_udp(&self, on: bool) {
+        self.video_udp.store(on, Ordering::Relaxed);
+    }
+
+    pub fn video_udp(&self) -> bool {
+        self.video_udp.load(Ordering::Relaxed)
     }
 
     pub fn set_cursor_overlay(&self, on: bool) {
@@ -168,11 +322,33 @@ impl Hub {
         let mut list = self.clients.lock().unwrap();
         // Scanning every packet for an IDR is only needed while a newly
         // registered client still waits for its first one.
-        let idr = list.iter().any(|c| c.needs_idr) && is_idr(&chunk);
+        let is_key = crate::net::is_idr(&chunk);
+        let idr = list.iter().any(|c| c.needs_idr) && is_key;
+        if is_key && std::env::var_os("LGX_DEBUG_IDR").is_some() {
+            eprintln!("lgx-server: access unit is an IDR ({} bytes)", chunk.len());
+        }
+        if idr && std::env::var_os("LGX_DEBUG_IDR").is_some() {
+            eprintln!("lgx-server: sending an IDR ({} bytes)", chunk.len());
+        }
         let mut dropped = false;
         list.retain_mut(|c| {
             if c.needs_idr && !idr {
                 return true;
+            }
+            if let Some(link) = c.udp.as_ref() {
+                if link.ready() {
+                    // The datagram header carries the real keyframe flag, not
+                    // just "somebody asked for one": the client uses it to
+                    // resume after losing a frame.
+                    if link.send(&chunk, ts_us, is_key) {
+                        c.needs_idr = false;
+                        return true;
+                    }
+                    // Fall through to TCP: a datagram burst the kernel refused
+                    // must not freeze the picture.
+                    self.dropped.fetch_add(1, Ordering::Relaxed);
+                    dropped = true;
+                }
             }
             match c.tx.try_send(Out::Video(chunk.clone(), ts_us)) {
                 Ok(()) => {
@@ -394,6 +570,7 @@ fn handle(
         token: token_hash,
         tx: tx.clone(),
         needs_idr: true,
+        udp: None,
         secure: secure.clone(),
     });
     hub.request_keyframe();
@@ -445,8 +622,36 @@ fn handle(
             }
         })?;
 
-    while let Ok((m, payload)) = secure.recv_msg() {
+    loop {
+        let (m, payload) = match secure.recv_msg() {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("lgx-server: client #{id}: recv: {e}");
+                break;
+            }
+        };
         match m.typ {
+            msg::IDR => {
+                // The client lost frames (or is behind) and needs a fresh
+                // reference; the capture loop picks this up before the next
+                // access unit.
+                if std::env::var_os("LGX_DEBUG_IDR").is_some() {
+                    eprintln!("lgx-server: client #{id} asked for an IDR");
+                }
+                hub.request_keyframe();
+            }
+            msg::UDP_VIDEO => {
+                // The client opted in. Only now does the server bind a UDP
+                // socket, so an old client that never asks keeps TCP video.
+                if hub.video_udp() {
+                    match udp_offer(&secure, id) {
+                        Some(link) => {
+                            hub.attach_udp(id, link);
+                        }
+                        None => continue,
+                    }
+                }
+            }
             msg::KEYMAP => {
                 let _ = input.send(Cmd::Keymap(payload));
             }
@@ -571,7 +776,7 @@ fn handle(
 }
 
 /// True when an Annex-B chunk contains an HEVC IDR NAL (type 19 or 20).
-fn is_idr(data: &[u8]) -> bool {
+pub(crate) fn is_idr(data: &[u8]) -> bool {
     let mut i = 0;
     while i + 4 < data.len() {
         if data[i] == 0 && data[i + 1] == 0 {
@@ -636,6 +841,7 @@ mod tests {
                 token: [0; 32],
                 tx,
                 needs_idr: false,
+                udp: None,
                 secure,
             }]),
             next_id: AtomicU64::new(2),
@@ -644,6 +850,7 @@ mod tests {
             last_keyframe_ms: AtomicU64::new(0),
             cursor_overlay: AtomicBool::new(false),
             cursor_local: AtomicBool::new(false),
+            video_udp: AtomicBool::new(false),
             dropped: AtomicU64::new(0),
         }
     }

@@ -313,9 +313,21 @@ int main(int argc, char **argv) {
     const char *rm = getenv("LGX_RC_MODE");
     if (rm && atoi(rm) >= 0 && atoi(rm) <= 4) rc_mode = atoi(rm);
     av_opt_set_int(enc->priv_data, "rc_mode", rc_mode, 0);
+    if (rc_mode == 1) {
+        /* CQP: a fixed quantiser keeps the keyframes small and the quality
+         * uniform; LGX_QP overrides it (FFmpeg wants FF_QP2LAMBDA units). */
+        int qp = 24;
+        const char *q = getenv("LGX_QP");
+        if (q && atoi(q) > 0 && atoi(q) < 52) qp = atoi(q);
+        enc->global_quality = qp * 118;
+    }
     if (rc_mode >= 3) {
         enc->rc_max_rate = bitrate;
-        enc->rc_buffer_size = bitrate;
+        /* A 1 s buffer lets the first IDR spend the whole budget: measured
+         * 668 KiB for 1080p, which is 130 ms of the link in one burst. An
+         * eighth of a second keeps a keyframe inside one or two frames of
+         * budget without starving motion. */
+        enc->rc_buffer_size = bitrate / 8;
     }
     /* VDENC (low_power) is the fast path on Gen12+; it is a little less
      * flexible than the default encoder but much cheaper per frame. */

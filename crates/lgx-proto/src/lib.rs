@@ -9,6 +9,8 @@ use std::io::{self, Read, Write};
 
 pub const VERSION: u16 = 2;
 
+pub mod udp;
+
 pub mod msg {
     pub const AUTH: u8 = 1;
     /// Server greeting: `code` = codec, `a` = width, `b` = height.
@@ -53,6 +55,15 @@ pub mod msg {
     /// The capture geometry changed mid-session: `code` = refresh rate (Hz),
     /// `a` = width, `b` = height. The client asks the user whether to resize.
     pub const RESIZE: u8 = 28;
+    /// The server moved video to UDP: payload is the 32-byte session key and
+    /// `code` is the UDP port. The client answers with one hello datagram from
+    /// its own socket, which tells the server where to send. A client that
+    /// ignores this keeps receiving video over TCP.
+    pub const VIDEO_UDP: u8 = 29;
+    /// The client can receive video as UDP datagrams. Sent once after
+    /// `CURSOR_SHAPE`; a server that predates UDP ignores it, and an old
+    /// client never asks, so neither side breaks.
+    pub const UDP_VIDEO: u8 = 30;
     /// Server-side cursor is hidden (for example a video player hides it).
     /// The client must hide its locally drawn pointer until the next
     /// CURSOR_IMAGE.
@@ -195,6 +206,7 @@ pub fn payload_len(m: &Msg) -> usize {
         | msg::FILE_BEGIN
         | msg::FILE_DATA
         | msg::GAMEPAD
+        | msg::VIDEO_UDP
         | msg::CURSOR_IMAGE => m.a.max(0) as usize,
         _ => 0,
     }

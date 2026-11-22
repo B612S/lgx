@@ -26,7 +26,7 @@ fn canonical(key: &str) -> String {
             ("network", key)
         }
         "fps" | "bitrate" | "output" | "low_power" | "async_depth" | "vpp" | "drm_node"
-        | "capture" => ("video", key),
+        | "capture" | "udp" => ("video", key),
         "audio" => ("audio", "enabled"),
         "no_input" => ("input", "enabled"),
         _ => ("misc", key),
@@ -147,6 +147,9 @@ pub fn load_or_create() -> Config {
     cfg.set("network.discovery_port", 5900u32);
     cfg.set("video.fps", "auto");
     cfg.set("video.bitrate", 40_000_000u32);
+    // Video over UDP is opt-in until the loss handling has been measured on a
+    // real link; `--video-udp` turns it on for one run.
+    cfg.set("video.udp", "false");
     cfg.set("video.output", "");
     cfg.set("video.low_power", "true");
     cfg.set("video.async_depth", 2u32);

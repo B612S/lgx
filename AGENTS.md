@@ -97,8 +97,14 @@ Commit format: `area: short imperative summary`, for example
   `rc_buffer_size` at the configured bitrate). CBR pads a static desktop up to
   the target, so an idle 1080p160 session cost 4.7 MiB/s; VBR costs 1.2 MiB/s
   with the same encode time and no fps loss. `LGX_RC_MODE` overrides the mode
-  (0 auto, 1 CQP, 2 CBR, 3 VBR, 4 ICQ). NVENC still requests CBR until its
-  VBR path is verified on NVIDIA hardware.
+  (0 auto, 1 CQP, 2 CBR, 3 VBR, 4 ICQ) and `LGX_QP` sets the CQP quantiser
+  (default 24). Measured at 1080p160 on a desktop that changes every frame:
+  CBR 4.7 MiB/s, VBR 1.2-1.6 MiB/s, CQP qp=24 ~0.1 MiB/s. VBR spends its whole
+  VBV budget on a near-lossless keyframe (527 KiB every second at 1080p) and
+  VDENC ignores `qmin` in VBR, so the quality floor only works as CQP, whose
+  keyframes are ~8 KiB. CQP has no bitrate ceiling: full-screen video would
+  use as much as the link allows. NVENC still requests CBR until its VBR path
+  is verified on NVIDIA hardware.
 - The helper is a separate process because it owns the VAAPI/VPP surfaces.
   With VPP the server only sends the captured frame fd and metadata; the GL
   fallback renders into the helper's dma-bufs.
@@ -570,6 +576,19 @@ the Vulkan shader converts full-range BT.709, and the HEVC VUI says
   records are split into 32 KiB chunks; the length/index/chunk length are
   included in the AEAD associated data. `Secure::close` shuts down a raw clone
   because the reader may hold the recv mutex while blocked in `read_exact`.
+- **Video can leave TCP.** `video.udp` (`--video-udp`) lets the client ask for
+  datagrams with `UDP_VIDEO`; the server then binds an ephemeral socket, sends
+  `VIDEO_UDP` with a random 32-byte key and splits each access unit into
+  datagrams of at most 1200 bytes, each sealed on its own with AES-256-GCM
+  (`lgx_proto::udp`: frame id, fragment index/count, capture timestamp and a
+  keyframe flag in the header, which is also the AAD). The client answers with
+  one `LGXU` hello from its own socket; video stays on TCP until it arrives,
+  and a failed datagram send falls back to TCP for that access unit. Nothing
+  is retransmitted: an incomplete access unit is dropped, the client skips to
+  the next keyframe and keeps re-requesting an IDR (over TCP) until one
+  arrives whole. Both sockets ask for an 8 MiB buffer because one keyframe is
+  hundreds of datagrams. Old clients never send `UDP_VIDEO`, so they keep TCP
+  video, and `LGX_NO_UDP=1` keeps a new client on TCP.
 - One TCP connection per client: 12-byte header + optional payload; `a` is the
   payload length for `AUTH`/`VIDEO`/`KEYMAP`/`CLIP_*`; the header and payload
   are inside a secure record.
