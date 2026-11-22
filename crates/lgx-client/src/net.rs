@@ -75,6 +75,24 @@ impl CursorShape {
     }
 }
 
+/// Round-trip clock synchronisation with the server. The server stamps every
+/// access unit with its own monotonic clock, so a client can only turn that
+/// into a latency once it knows the offset between the two clocks.
+#[derive(Default)]
+pub struct Clock {
+    offset_us: Option<i64>,
+    best_rtt_us: u64,
+    sent_local_us: Option<u64>,
+}
+
+/// Process-relative microseconds, the common time base for the clock sync.
+pub fn local_us() -> u64 {
+    static BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    BASE.get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_micros() as u64
+}
+
 pub struct Conn {
     secure: Arc<Secure>,
     pub last_remote: Arc<Mutex<String>>,
@@ -82,6 +100,7 @@ pub struct Conn {
     /// Set by the reader when the server closes or the stream fails.
     pub closed: std::sync::atomic::AtomicBool,
     /// Server asked for a local cursor (it does not composite the pointer).
+    pub clock: std::sync::Mutex<Clock>,
     pub local_cursor: std::sync::atomic::AtomicBool,
     /// Latest cursor shape for the locally drawn pointer.
     pub cursor: Arc<Mutex<Option<CursorShape>>>,
@@ -94,6 +113,45 @@ pub struct Conn {
 impl Conn {
     pub fn send(&self, m: Msg, payload: &[u8]) -> std::io::Result<()> {
         self.secure.send_msg(m, payload)
+    }
+
+    /// Send one clock probe. Cheap enough to run twice a second; the reply
+    /// carries the server's monotonic microseconds.
+    pub fn ping(&self) {
+        {
+            let mut c = self.clock.lock().unwrap();
+            if c.sent_local_us.is_some() {
+                return;
+            }
+            c.sent_local_us = Some(local_us());
+        }
+        let _ = self.send(Msg::new(msg::PING, 0, 0, 0), &[]);
+    }
+
+    /// Record a PING reply and improve the clock offset. The sample with the
+    /// smallest round trip wins, because it has the least queuing noise.
+    pub fn clock_reply(&self, server_us: u64) {
+        let now = local_us();
+        let mut c = self.clock.lock().unwrap();
+        let Some(sent) = c.sent_local_us.take() else {
+            return;
+        };
+        let rtt = now.saturating_sub(sent);
+        if c.offset_us.is_none() || rtt <= c.best_rtt_us {
+            c.best_rtt_us = rtt;
+            c.offset_us = Some(server_us as i64 - sent as i64 - rtt as i64 / 2);
+        }
+    }
+
+    /// How long ago the server captured the frame, in milliseconds, if the
+    /// clock offset is known.
+    pub fn frame_latency_ms(&self, capture_us: u64) -> Option<f32> {
+        if capture_us == 0 {
+            return None;
+        }
+        let offset = self.clock.lock().unwrap().offset_us?;
+        let local_capture = capture_us as i64 - offset;
+        Some((local_us() as i64 - local_capture) as f32 / 1000.0)
     }
 
     /// Ask for UDP video. Called once the decoder exists: datagrams that
@@ -178,6 +236,7 @@ pub fn connect(
         last_remote,
         bytes: AtomicU64::new(0),
         closed: std::sync::atomic::AtomicBool::new(false),
+        clock: std::sync::Mutex::new(Clock::default()),
         local_cursor: std::sync::atomic::AtomicBool::new(false),
         cursor: Arc::new(Mutex::new(None)),
         cursor_hidden: std::sync::atomic::AtomicBool::new(false),
@@ -240,8 +299,11 @@ fn udp_video(
     let mut last_id = 0u32;
     let mut skipping = false;
     let mut last_idr: Option<std::time::Instant> = None;
+    // A keyframe is itself a burst of datagrams, so it can be lost too. Ask
+    // often (20/s) while recovering: the server answers with one IDR per
+    // request and the extra traffic lasts only until a whole one arrives.
     let request_idr = |last: &mut Option<std::time::Instant>| {
-        if last.is_none_or(|t| t.elapsed() >= std::time::Duration::from_millis(500)) {
+        if last.is_none_or(|t| t.elapsed() >= std::time::Duration::from_millis(50)) {
             *last = Some(std::time::Instant::now());
             let _ = conn.send(Msg::new(msg::IDR, 0, 0, 0), &[]);
         }
@@ -501,6 +563,13 @@ fn reader(
                         if let Err(e) = crate::clip::set_text(&text) {
                             eprintln!("lgx-client: wl-copy: {e}");
                         }
+                    }
+                }
+            }
+            msg::PONG => {
+                if body.len() >= 8 {
+                    if let Ok(bytes) = body[..8].try_into() {
+                        conn.clock_reply(u64::from_le_bytes(bytes));
                     }
                 }
             }

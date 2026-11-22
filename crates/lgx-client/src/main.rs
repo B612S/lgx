@@ -1782,9 +1782,18 @@ fn run_headless(
 ) {
     let t0 = Instant::now();
     let mut frames = 0u64;
+    let mut latencies: Vec<f32> = Vec::new();
+    let mut next_ping = Instant::now();
     loop {
+        if Instant::now() >= next_ping {
+            conn.ping();
+            next_ping = Instant::now() + Duration::from_millis(500);
+        }
         if let Some(f) = sink.take() {
             frames += 1;
+            if let Some(ms) = conn.frame_latency_ms(f.capture_us) {
+                latencies.push(ms);
+            }
             if let Some(path) = screenshot.take() {
                 if let dec::Pixels::Nv12(n) = &f.pixels {
                     let (w, h) = (f.width, f.height);
@@ -1834,8 +1843,22 @@ fn run_headless(
     }
     let dt = t0.elapsed().as_secs_f64();
     if frames > 0 && dt > 0.0 {
+        let extra = if latencies.is_empty() {
+            String::new()
+        } else {
+            latencies.sort_by(f32::total_cmp);
+            let at = |p: f32| {
+                let i = ((latencies.len() - 1) as f32 * p).round() as usize;
+                latencies[i.min(latencies.len() - 1)]
+            };
+            format!(
+                ", capture->present p50/p99 {:.1}/{:.1} ms",
+                at(0.5),
+                at(0.99)
+            )
+        };
         eprintln!(
-            "lgx-client: {frames} frames in {dt:.1} s ({:.1} fps)",
+            "lgx-client: {frames} frames in {dt:.1} s ({:.1} fps){extra}",
             frames as f64 / dt
         );
     }

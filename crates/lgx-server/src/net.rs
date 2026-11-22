@@ -768,7 +768,12 @@ fn handle(
                 }
             }
             msg::CURSOR => hub.set_cursor_overlay(m.code != 0),
-            msg::PING => {}
+            msg::PING => {
+                // Echo the server clock; the client uses it to turn the
+                // capture timestamps into an end-to-end latency.
+                let now = crate::time::monotonic_us();
+                let _ = secure.send_msg(Msg::new(msg::PONG, 0, 8, 0), &now.to_le_bytes());
+            }
             _ => {}
         }
     }

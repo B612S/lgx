@@ -60,6 +60,10 @@ pub mod msg {
     /// its own socket, which tells the server where to send. A client that
     /// ignores this keeps receiving video over TCP.
     pub const VIDEO_UDP: u8 = 29;
+    /// Clock probe reply: payload is the server's monotonic time in
+    /// microseconds (u64 LE). The client turns it into the offset between the
+    /// two clocks and can then report the capture-to-present latency.
+    pub const PONG: u8 = 31;
     /// The client can receive video as UDP datagrams. Sent once after
     /// `CURSOR_SHAPE`; a server that predates UDP ignores it, and an old
     /// client never asks, so neither side breaks.
@@ -207,6 +211,7 @@ pub fn payload_len(m: &Msg) -> usize {
         | msg::FILE_DATA
         | msg::GAMEPAD
         | msg::VIDEO_UDP
+        | msg::PONG
         | msg::CURSOR_IMAGE => m.a.max(0) as usize,
         _ => 0,
     }

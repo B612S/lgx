@@ -590,9 +590,21 @@ the Vulkan shader converts full-range BT.709, and the HEVC VUI says
   and a failed datagram send falls back to TCP for that access unit. Nothing
   is retransmitted: an incomplete access unit is dropped, the client skips to
   the next keyframe and keeps re-requesting an IDR (over TCP) until one
-  arrives whole. Both sockets ask for an 8 MiB buffer because one keyframe is
-  hundreds of datagrams. Old clients never send `UDP_VIDEO`, so they keep TCP
-  video, and `LGX_NO_UDP=1` keeps a new client on TCP.
+  arrives whole. The request is repeated every 50 ms while recovering,
+  because a keyframe is itself a burst that can lose a fragment; the server
+  answers each request with one IDR. Both sockets ask for an 8 MiB buffer
+  because one keyframe is hundreds of datagrams. Old clients never send
+  `UDP_VIDEO`, so they keep TCP video, and `LGX_NO_UDP=1` keeps a new client
+  on TCP. Measured on a clean LAN (1080p160, CQP qp=22): UDP 155 fps at
+  capture->present p50/p99 0.6/4.7 ms, TCP 144 fps at 2.4/5.1 ms. With 0.5 %
+  packet loss and 2 ms delay the trade-off flips: TCP keeps 142 fps at p99
+  10.4 ms (retransmissions), UDP drops to ~108 fps at p99 7.1 ms because one
+  lost fragment discards the whole access unit. A NACK-based retransmission or
+  per-frame FEC would close that gap; do not claim UDP is universally better
+  without re-measuring.
+- `PING` (client) and `PONG` (server, payload = monotonic microseconds) let the
+  client estimate the clock offset and print `capture->present` latency; the
+  `--bench`/`--no-window` summary reports p50/p99 when the offset is known.
 - One TCP connection per client: 12-byte header + optional payload; `a` is the
   payload length for `AUTH`/`VIDEO`/`KEYMAP`/`CLIP_*`; the header and payload
   are inside a secure record.
